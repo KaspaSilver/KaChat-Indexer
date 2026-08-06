@@ -1,6 +1,6 @@
 use crate::models::{
-    ContentRecord, KBroadcastRecord, KPostRecord, KReplyRecord, NotificationContentRecord,
-    PaginationMetadata,
+    BroadcastMessage, ContentRecord, EngagementActor, KBroadcastRecord, KPostRecord, KReplyRecord,
+    NotificationContentRecord, PaginationMetadata,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -169,6 +169,24 @@ pub trait DatabaseInterface: Send + Sync {
         requester_pubkey: &str,
         options: QueryOptions,
     ) -> DatabaseResult<PaginatedResult<NotificationContentRecord>>;
+
+    // Fork addition: per-post actor lists — who upvoted/downvoted/reposted/quoted a post.
+    // engagement_type is one of "upvote" | "downvote" | "repost" | "quote" | "all".
+    async fn get_post_engagement(
+        &self,
+        post_id: &str,
+        engagement_type: &str,
+        options: QueryOptions,
+    ) -> DatabaseResult<PaginatedResult<EngagementActor>>;
+
+    // Fork addition: KaChat broadcasts for a tracked channel, newest-first. Returns the page
+    // of messages plus whether more older rows exist. `before` filters block_time (ms).
+    async fn get_broadcasts(
+        &self,
+        channel: &str,
+        limit: u32,
+        before: Option<i64>,
+    ) -> DatabaseResult<(Vec<BroadcastMessage>, bool)>;
 
     // NEW: k_contents table - Get content by ID using unified content table
     async fn get_content_by_id(

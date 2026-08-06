@@ -7,8 +7,8 @@ use crate::database_trait::{
     DatabaseError, DatabaseInterface, DatabaseResult, PaginatedResult, QueryOptions,
 };
 use crate::models::{
-    ContentRecord, KBroadcastRecord, KPostRecord, KReplyRecord, KVoteRecord,
-    NotificationContentRecord, PaginationMetadata,
+    BroadcastMessage, ContentRecord, EngagementActor, KBroadcastRecord, KPostRecord, KReplyRecord,
+    KVoteRecord, NotificationContentRecord, PaginationMetadata,
 };
 
 pub struct PostgresDbManager {
@@ -191,6 +191,16 @@ impl HasCompoundCursor for ContentRecord {
             ContentRecord::Reply(reply) => reply.id,
             ContentRecord::Vote(vote) => vote.id,
         }
+    }
+}
+
+impl HasCompoundCursor for EngagementActor {
+    fn get_timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    fn get_id(&self) -> i64 {
+        self.id
     }
 }
 
@@ -1995,6 +2005,178 @@ impl DatabaseInterface for PostgresDbManager {
             items: content_records,
             pagination,
         })
+    }
+
+    async fn get_post_engagement(
+        &self,
+        post_id: &str,
+        engagement_type: &str,
+        options: QueryOptions,
+    ) -> DatabaseResult<PaginatedResult<EngagementActor>> {
+        let post_id_bytes = Self::decode_hex_to_bytes(post_id)?;
+        let limit = options.limit.unwrap_or(50) as i64;
+        let offset_limit = limit + 1;
+
+        // Union votes (kind = upvote/downvote) and quote/repost contents (kind = content_type)
+        // referencing this post. `action_tx_id` is the action's own transaction id.
+        let mut query = String::from(
+            r#"
+            SELECT * FROM (
+                SELECT id, block_time, sender_pubkey AS actor_pubkey,
+                       transaction_id AS action_tx_id, vote AS kind
+                FROM k_votes
+                WHERE post_id = $1
+                UNION ALL
+                SELECT id, block_time, sender_pubkey AS actor_pubkey,
+                       transaction_id AS action_tx_id, content_type AS kind
+                FROM k_contents
+                WHERE referenced_content_id = $1 AND content_type IN ('quote', 'repost')
+            ) e
+            WHERE 1 = 1
+            "#,
+        );
+
+        let mut bind_count = 1;
+
+        // Optional kind filter (all -> no filter). kind values are exactly the accepted types.
+        let filter_kind = engagement_type != "all";
+        if filter_kind {
+            bind_count += 1;
+            query.push_str(&format!(" AND e.kind = ${}", bind_count));
+        }
+
+        if let Some(before_cursor) = &options.before {
+            if Self::parse_compound_cursor(before_cursor).is_ok() {
+                bind_count += 2;
+                query.push_str(&format!(
+                    " AND (e.block_time < ${} OR (e.block_time = ${} AND e.id < ${}))",
+                    bind_count - 1,
+                    bind_count - 1,
+                    bind_count
+                ));
+            }
+        }
+
+        if let Some(after_cursor) = &options.after {
+            if Self::parse_compound_cursor(after_cursor).is_ok() {
+                bind_count += 2;
+                query.push_str(&format!(
+                    " AND (e.block_time > ${} OR (e.block_time = ${} AND e.id > ${}))",
+                    bind_count - 1,
+                    bind_count - 1,
+                    bind_count
+                ));
+            }
+        }
+
+        if options.sort_descending {
+            query.push_str(" ORDER BY e.block_time DESC, e.id DESC");
+        } else {
+            query.push_str(" ORDER BY e.block_time ASC, e.id ASC");
+        }
+
+        bind_count += 1;
+        query.push_str(&format!(" LIMIT ${}", bind_count));
+
+        let mut query_builder = sqlx::query(&query).bind(&post_id_bytes);
+
+        if filter_kind {
+            query_builder = query_builder.bind(engagement_type.to_string());
+        }
+
+        if let Some(before_cursor) = &options.before {
+            if let Ok((ts, id)) = Self::parse_compound_cursor(before_cursor) {
+                query_builder = query_builder.bind(ts as i64).bind(id);
+            }
+        }
+
+        if let Some(after_cursor) = &options.after {
+            if let Ok((ts, id)) = Self::parse_compound_cursor(after_cursor) {
+                query_builder = query_builder.bind(ts as i64).bind(id);
+            }
+        }
+
+        query_builder = query_builder.bind(offset_limit);
+
+        let rows = query_builder.fetch_all(&self.pool).await.map_err(|e| {
+            DatabaseError::QueryError(format!("Failed to fetch post engagement: {}", e))
+        })?;
+
+        let mut actors: Vec<EngagementActor> = rows
+            .iter()
+            .map(|row| {
+                let actor_pubkey: Vec<u8> = row.get("actor_pubkey");
+                let action_tx_id: Vec<u8> = row.get("action_tx_id");
+                EngagementActor {
+                    actor_pubkey: Self::encode_bytes_to_hex(&actor_pubkey),
+                    action_tx_id: Self::encode_bytes_to_hex(&action_tx_id),
+                    timestamp: row.get::<i64, _>("block_time") as u64,
+                    kind: row.get("kind"),
+                    id: row.get::<i64, _>("id"),
+                }
+            })
+            .collect();
+
+        let has_more = actors.len() > limit as usize;
+        if has_more {
+            actors.pop();
+        }
+
+        let pagination = self.create_compound_pagination_metadata(&actors, limit as u32, has_more);
+
+        Ok(PaginatedResult {
+            items: actors,
+            pagination,
+        })
+    }
+
+    async fn get_broadcasts(
+        &self,
+        channel: &str,
+        limit: u32,
+        before: Option<i64>,
+    ) -> DatabaseResult<(Vec<BroadcastMessage>, bool)> {
+        let lim = limit as i64;
+        let fetch = lim + 1;
+        let base = "SELECT encode(transaction_id, 'hex') AS tx, channel, sender_address, \
+                    content, block_time FROM kachat_broadcasts WHERE channel = $1";
+
+        let rows = if let Some(b) = before {
+            sqlx::query(&format!(
+                "{base} AND block_time < $2 ORDER BY block_time DESC, id DESC LIMIT $3"
+            ))
+            .bind(channel)
+            .bind(b)
+            .bind(fetch)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(&format!(
+                "{base} ORDER BY block_time DESC, id DESC LIMIT $2"
+            ))
+            .bind(channel)
+            .bind(fetch)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch broadcasts: {}", e)))?;
+
+        let mut messages: Vec<BroadcastMessage> = rows
+            .iter()
+            .map(|row| BroadcastMessage {
+                tx_id: row.get("tx"),
+                channel: row.get("channel"),
+                sender_address: row.get("sender_address"),
+                content: row.get("content"),
+                block_time: row.get("block_time"),
+            })
+            .collect();
+
+        let has_more = messages.len() > lim as usize;
+        if has_more {
+            messages.pop();
+        }
+        Ok((messages, has_more))
     }
 
     async fn get_content_by_id(

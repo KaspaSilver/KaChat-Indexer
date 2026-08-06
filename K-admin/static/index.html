@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KaChat Indexer</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c2330; --border: #2a3040;
+    --text: #e6edf3; --muted: #8b98a9; --accent: #58a6ff; --good: #3fb950;
+    --warn: #d29922; --bad: #f85149; --shadow: 0 1px 3px rgba(0,0,0,.4);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f8fa; --panel: #ffffff; --panel2: #f0f3f6; --border: #d0d7de;
+      --text: #1f2328; --muted: #656d76; --accent: #0969da; --good: #1a7f37;
+      --warn: #9a6700; --bad: #cf222e; --shadow: 0 1px 3px rgba(0,0,0,.08);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 16px 22px;
+    border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.good { background: var(--good); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  nav { display: flex; gap: 4px; padding: 10px 22px 0; border-bottom: 1px solid var(--border); background: var(--panel); }
+  nav button { background: none; border: none; color: var(--muted); padding: 8px 14px; cursor: pointer;
+    font-size: 13px; border-bottom: 2px solid transparent; }
+  nav button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  main { padding: 22px; max-width: 1100px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; box-shadow: var(--shadow); }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 24px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .value.small { font-size: 15px; font-weight: 500; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 26px 0 10px; }
+  .health { display: flex; flex-wrap: wrap; gap: 22px; align-items: center; }
+  .health .big { font-size: 20px; font-weight: 650; text-transform: capitalize; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 20px; font-size: 11px; background: var(--panel2); color: var(--muted); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  input[type=text] { background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 9px 12px; border-radius: 6px; font-family: ui-monospace, monospace; min-width: 320px; flex: 1; }
+  select { background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 10px; border-radius: 6px; font-size: 13px; }
+  button.btn { background: var(--accent); color: #fff; border: none; padding: 9px 16px; border-radius: 6px;
+    cursor: pointer; font-size: 13px; font-weight: 600; }
+  button.btn.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
+  button.btn.danger { background: var(--bad); }
+  button.btn:disabled { opacity: .5; cursor: not-allowed; }
+  .note { color: var(--muted); font-size: 12px; margin: 8px 0; }
+  .result { background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; margin-top: 12px; white-space: pre-wrap; }
+  .scroll { overflow-x: auto; }
+  a { color: var(--accent); text-decoration: none; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <span id="statusDot" class="dot"></span>
+  <div>
+    <h1>KaChat Indexer</h1>
+    <div class="sub" id="statusLine">connecting…</div>
+  </div>
+  <div style="margin-left:auto" class="sub"><a href="http://localhost:9000" target="_blank">Portainer ↗</a></div>
+</header>
+<nav>
+  <button data-tab="dashboard" class="active">Dashboard</button>
+  <button data-tab="kaposts">KaPosts</button>
+  <button data-tab="broadcasts">Broadcasts</button>
+</nav>
+<main>
+  <section id="dashboard">
+    <h2>Pipeline health</h2>
+    <div class="card">
+      <div class="health">
+        <div><span id="hDot" class="dot"></span> <span class="big" id="hStatus">—</span></div>
+        <div><div class="label muted">Node / ingest lag</div><div id="hNodeLag">—</div></div>
+        <div><div class="label muted">Newest transaction</div><div id="hNewestTx" class="mono">—</div></div>
+        <div><div class="label muted">Newest KaChat content</div><div id="hNewestContent" class="mono">—</div></div>
+      </div>
+      <div class="note">Freshness is derived from the <span class="mono">transactions</span> table (node → simply-kaspa). Container up/down status lives in Portainer. KaChat content lags legitimately when nobody has posted recently.</div>
+    </div>
+
+    <h2>Content indexed</h2>
+    <div class="grid" id="statGrid"></div>
+
+    <h2>Activity</h2>
+    <div class="grid" id="activityGrid"></div>
+  </section>
+
+  <section id="kaposts" style="display:none">
+    <h2>KaPosts moderation — remove content by pubkey</h2>
+    <div class="card">
+      <div class="note">Deletes <b>every</b> row authored by a public key (posts, replies, quotes, votes, follows, blocks, broadcasts, mentions). The chain is immutable — this only removes the indexer's copy. Always dry-run first.</div>
+      <div class="row">
+        <input id="pk" type="text" placeholder="66-hex compressed pubkey (02/03…) or 64-hex x-only" />
+        <button class="btn ghost" id="btnPreview">Dry-run preview</button>
+        <button class="btn danger" id="btnRemove" disabled>Remove permanently</button>
+      </div>
+      <div id="modResult" class="result" style="display:none"></div>
+    </div>
+
+    <h2>Recently indexed content</h2>
+    <div class="card scroll">
+      <table>
+        <thead><tr><th>When</th><th>Type</th><th>Author</th><th>Preview</th><th>Tx</th></tr></thead>
+        <tbody id="recentBody"><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="broadcasts" style="display:none">
+    <h2>Broadcast channels</h2>
+    <div class="grid" id="bcastGrid"></div>
+
+    <h2>Recent broadcasts</h2>
+    <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <label class="muted" for="bcastChannel">Channel</label>
+        <select id="bcastChannel">
+          <option value="">all tracked</option>
+          <option value="kaspa">#kaspa</option>
+          <option value="kachat-bugs">#kachat-bugs</option>
+        </select>
+        <button class="btn ghost" id="bcastRefresh">Refresh</button>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>When</th><th>Channel</th><th>Sender</th><th>Message</th><th>Tx</th></tr></thead>
+          <tbody id="bcastBody"><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="note">Only <b>#kaspa</b> and <b>#kachat-bugs</b> are indexed. Content is stored verbatim (text or reply/audio JSON envelopes); the preview shows the first 200 characters.</div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const fmtInt = n => (n ?? 0).toLocaleString();
+function fmtAge(ms) {
+  if (ms == null || ms < 0) return "—";
+  const s = Math.floor(ms/1000);
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s/60) + "m ago";
+  if (s < 86400) return Math.floor(s/3600) + "h ago";
+  return Math.floor(s/86400) + "d ago";
+}
+function fmtTime(ms) { return ms ? new Date(ms).toLocaleString() : "—"; }
+function fmtBytes(b) {
+  if (!b) return "—";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0; let n = b;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(1) + " " + u[i];
+}
+function dotClass(status) {
+  if (status === "healthy") return "good";
+  if (status === "lagging" || status === "starting" || status === "catching_up") return "warn";
+  return "bad";
+}
+const prettyStatus = s => (s || "").replace(/_/g, " ");
+
+// Tabs
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach(x => x.classList.remove("active"));
+  b.classList.add("active");
+  const t = b.dataset.tab;
+  $("#dashboard").style.display = t === "dashboard" ? "" : "none";
+  $("#kaposts").style.display = t === "kaposts" ? "" : "none";
+  $("#broadcasts").style.display = t === "broadcasts" ? "" : "none";
+  if (t === "kaposts") loadRecent();
+  if (t === "broadcasts") loadBroadcasts();
+});
+
+async function loadHealth() {
+  try {
+    const h = await (await fetch("/api/health")).json();
+    const cls = dotClass(h.status);
+    $("#statusDot").className = "dot " + cls;
+    $("#hDot").className = "dot " + cls;
+    $("#hStatus").textContent = prettyStatus(h.status);
+    $("#hNodeLag").textContent = fmtAge(h.node_lag_ms);
+    $("#hNewestTx").textContent = fmtTime(h.newest_transaction_time);
+    $("#hNewestContent").textContent = fmtTime(h.newest_content_time);
+    $("#statusLine").textContent = "pipeline " + prettyStatus(h.status) + " · updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("#statusDot").className = "dot bad";
+    $("#statusLine").textContent = "admin API unreachable";
+  }
+}
+
+async function loadStats() {
+  try {
+    const s = await (await fetch("/api/stats")).json();
+    const stat = [
+      ["Posts", s.posts], ["Replies", s.replies], ["Quotes", s.quotes], ["Reposts", s.reposts],
+      ["Upvotes", s.upvotes], ["Downvotes", s.downvotes], ["Follows", s.follows], ["Blocks", s.blocks],
+      ["Mentions", s.mentions], ["Hashtags", s.hashtags],
+    ];
+    $("#statGrid").innerHTML = stat.map(([l,v]) =>
+      `<div class="card"><div class="label">${l}</div><div class="value">${fmtInt(v)}</div></div>`).join("");
+    const act = [
+      ["Indexed (last 5m)", fmtInt(s.ingest_last_5m)],
+      ["Indexed (last 60m)", fmtInt(s.ingest_last_60m)],
+      ["Newest content", fmtTime(s.newest_content_time)],
+      ["Broadcasts (3d)", fmtInt(s.bcast_total)],
+      ["Database size", fmtBytes(s.db_size_bytes)],
+    ];
+    $("#activityGrid").innerHTML = act.map(([l,v]) =>
+      `<div class="card"><div class="label">${l}</div><div class="value small">${v}</div></div>`).join("");
+  } catch (e) {}
+}
+
+async function loadRecent() {
+  try {
+    const rows = await (await fetch("/api/moderation/recent?limit=25")).json();
+    $("#recentBody").innerHTML = rows.length ? rows.map(r => `
+      <tr>
+        <td class="muted" title="${fmtTime(r.timestamp)}">${fmtAge(Date.now()-r.timestamp)}</td>
+        <td><span class="pill">${r.content_type}</span></td>
+        <td class="mono" title="${r.sender_pubkey}">${r.sender_pubkey.slice(0,12)}…
+          <button class="btn ghost" style="padding:2px 6px;font-size:11px" onclick="pickPubkey('${r.sender_pubkey}')">use</button></td>
+        <td>${escapeHtml(r.preview) || '<span class="muted">—</span>'}</td>
+        <td class="mono">${r.transaction_id.slice(0,10)}…</td>
+      </tr>`).join("") : '<tr><td colspan="5" class="muted">no content indexed yet</td></tr>';
+  } catch (e) {
+    $("#recentBody").innerHTML = '<tr><td colspan="5" class="muted">failed to load</td></tr>';
+  }
+}
+function escapeHtml(s){return (s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+async function loadBroadcasts() {
+  // Count cards from /api/stats
+  try {
+    const s = await (await fetch("/api/stats")).json();
+    const cards = [
+      ["#kaspa", s.bcast_kaspa], ["#kachat-bugs", s.bcast_kachat_bugs], ["Total broadcasts", s.bcast_total],
+    ];
+    $("#bcastGrid").innerHTML = cards.map(([l,v]) =>
+      `<div class="card"><div class="label">${l}</div><div class="value">${fmtInt(v)}</div></div>`).join("");
+  } catch (e) {}
+  // Recent list
+  const ch = $("#bcastChannel").value;
+  const q = ch ? `?channel=${encodeURIComponent(ch)}&limit=50` : "?limit=50";
+  try {
+    const rows = await (await fetch("/api/broadcasts" + q)).json();
+    $("#bcastBody").innerHTML = rows.length ? rows.map(r => `
+      <tr>
+        <td class="muted" title="${fmtTime(r.timestamp)}">${fmtAge(Date.now()-r.timestamp)}</td>
+        <td><span class="pill">#${escapeHtml(r.channel)}</span></td>
+        <td class="mono" title="${escapeHtml(r.sender_address)}">${escapeHtml(r.sender_address.slice(0,18))}…</td>
+        <td>${escapeHtml(r.preview) || '<span class="muted">—</span>'}</td>
+        <td class="mono">${r.tx_id.slice(0,10)}…</td>
+      </tr>`).join("") : '<tr><td colspan="5" class="muted">no broadcasts indexed yet</td></tr>';
+  } catch (e) {
+    $("#bcastBody").innerHTML = '<tr><td colspan="5" class="muted">failed to load</td></tr>';
+  }
+}
+$("#bcastChannel").onchange = loadBroadcasts;
+$("#bcastRefresh").onclick = loadBroadcasts;
+window.pickPubkey = pk => { $("#pk").value = pk; $("#btnRemove").disabled = true; document.querySelector('nav button[data-tab=kaposts]').click(); $("#pk").focus(); };
+
+// Moderation actions
+async function moderate(dryRun) {
+  const pubkey = $("#pk").value.trim();
+  if (!pubkey) return;
+  const res = $("#modResult");
+  res.style.display = "block";
+  res.textContent = dryRun ? "Previewing…" : "Removing…";
+  try {
+    const r = await fetch("/api/moderation/remove", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ pubkey, dry_run: dryRun })
+    });
+    const d = await r.json();
+    if (!r.ok) { res.textContent = "Error: " + (d.error || r.status); return; }
+    const verb = d.dry_run ? "Would delete" : "Deleted";
+    res.textContent =
+`${verb} ${d.total} rows for ${d.pubkey}
+  contents:   ${d.contents}
+  votes:      ${d.votes}
+  follows:    ${d.follows}
+  blocks:     ${d.blocks}
+  broadcasts: ${d.broadcasts}
+  mentions:   ${d.mentions}`;
+    $("#btnRemove").disabled = d.dry_run ? (d.total === 0) : true;
+    if (!d.dry_run) { loadStats(); loadRecent(); }
+  } catch (e) { res.textContent = "Request failed: " + e; }
+}
+$("#btnPreview").onclick = () => moderate(true);
+$("#btnRemove").onclick = () => {
+  if (confirm("Permanently remove all indexed content for this pubkey? This cannot be undone (re-indexing from chain would restore it).")) moderate(false);
+};
+$("#pk").oninput = () => { $("#btnRemove").disabled = true; };
+
+// Poll
+loadHealth(); loadStats();
+setInterval(loadHealth, 10000);
+setInterval(loadStats, 30000);
+</script>
+</body>
+</html>

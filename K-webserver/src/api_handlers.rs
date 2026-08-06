@@ -1,8 +1,8 @@
 use crate::database_trait::{DatabaseInterface, QueryOptions};
 use crate::models::{
-    ApiError, ContentRecord, NotificationPost, PaginatedNotificationsResponse,
-    PaginatedPostsResponse, PaginatedRepliesResponse, PaginatedUsersResponse, PostDetailsResponse,
-    ServerPost, ServerReply, ServerUserPost,
+    ApiError, ContentRecord, NotificationPost, PaginatedEngagementResponse,
+    PaginatedNotificationsResponse, PaginatedPostsResponse, PaginatedRepliesResponse,
+    PaginatedUsersResponse, PostDetailsResponse, ServerPost, ServerReply, ServerUserPost,
 };
 use serde_json;
 use std::sync::Arc;
@@ -1873,6 +1873,79 @@ impl ApiHandlers {
     }
 
     /// Create a standardized error response
+    /// GET /get-post-engagement — actors who upvoted/downvoted/reposted/quoted a post
+    /// (fork addition). `engagement_type` is one of upvote|downvote|repost|quote|all.
+    pub async fn get_post_engagement_paginated(
+        &self,
+        post_id: &str,
+        engagement_type: &str,
+        limit: u32,
+        before: Option<String>,
+        after: Option<String>,
+    ) -> Result<String, String> {
+        // Validate post id (64 hex chars for a Kaspa transaction id)
+        if post_id.len() != 64 || !post_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(self.create_error_response(
+                "Invalid post id. Must be 64 hex characters.",
+                "INVALID_POST_ID",
+            ));
+        }
+
+        // Validate engagement type
+        let engagement_type = engagement_type.to_lowercase();
+        if !matches!(
+            engagement_type.as_str(),
+            "upvote" | "downvote" | "repost" | "quote" | "all"
+        ) {
+            return Err(self.create_error_response(
+                "Invalid type. Must be one of: upvote, downvote, repost, quote, all.",
+                "INVALID_PARAMETER",
+            ));
+        }
+
+        let options = QueryOptions {
+            limit: Some(limit as u64),
+            before,
+            after,
+            sort_descending: true,
+        };
+
+        let result = match self
+            .db
+            .get_post_engagement(post_id, &engagement_type, options)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                log_error!(
+                    "Database error while querying engagement for post {}: {}",
+                    post_id,
+                    err
+                );
+                return Err(self.create_error_response(
+                    "Internal server error during database query",
+                    "DATABASE_ERROR",
+                ));
+            }
+        };
+
+        let response = PaginatedEngagementResponse {
+            engagement: result.items,
+            pagination: result.pagination,
+        };
+
+        match serde_json::to_string(&response) {
+            Ok(json) => Ok(json),
+            Err(err) => {
+                log_error!("Failed to serialize post engagement response: {}", err);
+                Err(self.create_error_response(
+                    "Internal server error during serialization",
+                    "SERIALIZATION_ERROR",
+                ))
+            }
+        }
+    }
+
     fn create_error_response(&self, message: &str, code: &str) -> String {
         let error = ApiError {
             error: message.to_string(),

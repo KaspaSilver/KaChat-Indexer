@@ -20,8 +20,9 @@ use crate::api_handlers::ApiHandlers;
 use crate::config::ServerConfig;
 use crate::database_trait::DatabaseInterface;
 use crate::models::{
-    ApiError, PaginatedNotificationsResponse, PaginatedPostsResponse, PaginatedRepliesResponse,
-    PaginatedUsersResponse, PostDetailsResponse, ServerUserPost, TrendingHashtagsResponse,
+    ApiError, BroadcastsResponse, PaginatedEngagementResponse, PaginatedNotificationsResponse,
+    PaginatedPostsResponse, PaginatedRepliesResponse, PaginatedUsersResponse, PostDetailsResponse,
+    ServerUserPost, TrendingHashtagsResponse,
 };
 
 #[derive(Debug, Clone)]
@@ -62,6 +63,28 @@ struct GetRepliesQuery {
     limit: Option<u32>,
     before: Option<String>, // Changed to String to support compound cursors
     after: Option<String>,  // Changed to String to support compound cursors
+}
+
+/// Fork addition: query for GET /get-broadcasts (KaChat broadcast channel history).
+#[derive(Debug, Deserialize)]
+struct GetBroadcastsQuery {
+    channel: Option<String>,
+    limit: Option<u32>,
+    before: Option<i64>,
+}
+
+/// Fork addition: query for GET /get-post-engagement (per-post actor lists).
+#[derive(Debug, Deserialize)]
+struct GetPostEngagementQuery {
+    #[serde(rename = "postId")]
+    post_id: Option<String>,
+    #[serde(rename = "type")]
+    engagement_type: Option<String>,
+    #[serde(rename = "requesterPubkey")]
+    requester_pubkey: Option<String>,
+    limit: Option<u32>,
+    before: Option<String>,
+    after: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +273,8 @@ impl WebServer {
                 get(handle_get_contents_following),
             )
             .route("/get-replies", get(handle_get_replies))
+            .route("/get-post-engagement", get(handle_get_post_engagement))
+            .route("/get-broadcasts", get(handle_get_broadcasts))
             .route("/get-mentions", get(handle_get_mentions))
             .route("/get-users", get(handle_get_users))
             .route("/get-most-active-users", get(handle_get_most_active_users))
@@ -1321,6 +1346,116 @@ async fn handle_get_contents_following(
                 }
             }
         }
+    }
+}
+
+/// Fork addition: GET /get-broadcasts?channel=&limit=&before= — KaChat broadcast history for a
+/// tracked channel, served on the same host as KaPosts (same indexer URL). Newest-first.
+/// A missing or unknown channel returns 200 with empty messages (per BROADCAST_INDEXER.md).
+async fn handle_get_broadcasts(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<GetBroadcastsQuery>,
+) -> Result<Json<BroadcastsResponse>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+
+    let channel = params.channel.unwrap_or_default().trim().to_lowercase();
+    if channel.is_empty() {
+        return Ok(Json(BroadcastsResponse {
+            messages: Vec::new(),
+            has_more: false,
+        }));
+    }
+    let limit = params.limit.unwrap_or(200).clamp(1, 500);
+
+    match app_state
+        .db
+        .get_broadcasts(&channel, limit, params.before)
+        .await
+    {
+        Ok((messages, has_more)) => Ok(Json(BroadcastsResponse { messages, has_more })),
+        Err(err) => {
+            log_error!("Failed to fetch broadcasts for channel {}: {}", channel, err);
+            let error = ApiError {
+                error: "Internal server error".to_string(),
+                code: "INTERNAL_ERROR".to_string(),
+            };
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)))
+        }
+    }
+}
+
+/// Fork addition: GET /get-post-engagement?postId=&type=&requesterPubkey=&limit=&before=
+/// Returns actors who upvoted/downvoted/reposted/quoted a post. `type` defaults to "all".
+async fn handle_get_post_engagement(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<GetPostEngagementQuery>,
+) -> Result<Json<PaginatedEngagementResponse>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+
+    let post_id = match params.post_id {
+        Some(post_id) => post_id,
+        None => {
+            let error = ApiError {
+                error: "Missing required parameter: postId".to_string(),
+                code: "MISSING_PARAMETER".to_string(),
+            };
+            return Err((StatusCode::BAD_REQUEST, Json(error)));
+        }
+    };
+
+    // limit defaults to 50 and is capped at 100
+    let limit = match params.limit {
+        Some(limit) => {
+            if limit < 1 || limit > 100 {
+                let error = ApiError {
+                    error: "Limit parameter must be between 1 and 100".to_string(),
+                    code: "INVALID_LIMIT".to_string(),
+                };
+                return Err((StatusCode::BAD_REQUEST, Json(error)));
+            }
+            limit
+        }
+        None => 50,
+    };
+
+    let engagement_type = params.engagement_type.unwrap_or_else(|| "all".to_string());
+
+    match app_state
+        .api_handlers
+        .get_post_engagement_paginated(&post_id, &engagement_type, limit, params.before, params.after)
+        .await
+    {
+        Ok(response_json) => match serde_json::from_str::<PaginatedEngagementResponse>(&response_json)
+        {
+            Ok(response) => Ok(Json(response)),
+            Err(err) => {
+                log_error!("Failed to parse post engagement response: {}", err);
+                let error = ApiError {
+                    error: "Internal server error".to_string(),
+                    code: "INTERNAL_ERROR".to_string(),
+                };
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)))
+            }
+        },
+        Err(error_json) => match serde_json::from_str::<ApiError>(&error_json) {
+            Ok(api_error) => {
+                let status_code = match api_error.code.as_str() {
+                    "MISSING_PARAMETER" | "INVALID_POST_ID" | "INVALID_PARAMETER"
+                    | "INVALID_LIMIT" => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                Err((status_code, Json(api_error)))
+            }
+            Err(_) => {
+                let error = ApiError {
+                    error: "Internal server error".to_string(),
+                    code: "INTERNAL_ERROR".to_string(),
+                };
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)))
+            }
+        },
     }
 }
 
