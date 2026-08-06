@@ -1,0 +1,41 @@
+# KaChat Indexer — single app container.
+# Bundles the block ingester (simply-kaspa), the KaChat processor/webserver/admin, and the
+# vendored chat indexer, run under supervisord. Postgres stays in its own container.
+# Build context is the repo root (../..).
+
+# --- Stage 1: build our workspace binaries (processor, webserver, admin) ---
+FROM rust:1.91-alpine AS ourbuild
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
+WORKDIR /src
+COPY Cargo.toml ./
+RUN sed -i '/members = \[/,/\]/c\members = ["K-transaction-processor","K-webserver","K-admin"]' Cargo.toml
+COPY K-transaction-processor ./K-transaction-processor
+COPY K-webserver ./K-webserver
+COPY K-admin ./K-admin
+RUN cargo build --release --bin K-transaction-processor --bin K-webserver --bin K-admin
+
+# --- Stage 2: build the vendored chat (kasia) indexer ---
+FROM rust:1.89.0-alpine3.20 AS chatbuild
+RUN apk add --no-cache pcc-libs-dev musl-dev pkgconfig openssl-dev openssl-libs-static curl
+WORKDIR /src
+COPY kasia-indexer ./
+RUN cargo build --release
+
+# --- Stage 3: runtime with supervisord + all binaries ---
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates libssl3 libcrypto3 libgcc supervisor
+WORKDIR /app
+
+# Block ingester binary lifted from the upstream Alpine image (musl-compatible).
+COPY --from=supertypo/simply-kaspa-indexer:v2.3.0 /usr/local/bin/simply-kaspa-indexer /usr/local/bin/simply-kaspa-indexer
+# Our binaries + the chat indexer.
+COPY --from=ourbuild /src/target/release/K-transaction-processor /app/
+COPY --from=ourbuild /src/target/release/K-webserver /app/
+COPY --from=ourbuild /src/target/release/K-admin /app/
+COPY --from=chatbuild /src/target/release/indexer /app/kachat-chat-indexer
+# Launch scripts + supervisor config.
+COPY docker/kachat/app/ /app/
+COPY docker/kachat/supervisord.conf /etc/supervisord.conf
+RUN chmod +x /app/run-*.sh
+
+ENTRYPOINT ["supervisord", "-c", "/etc/supervisord.conf"]
