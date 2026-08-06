@@ -71,6 +71,13 @@ struct Args {
         help = "Disable the periodic REINDEX of the transactions table indexes"
     )]
     no_reindex: bool,
+
+    #[arg(
+        long,
+        help = "Days to retain KaChat broadcasts before pruning (default 3)",
+        default_value_t = 3
+    )]
+    broadcast_retention_days: u64,
 }
 
 #[tokio::main]
@@ -149,6 +156,36 @@ async fn main() -> Result<()> {
     let reindex_config = config.clone();
     let reindex_handle = tokio::spawn(async move {
         transaction_reindex_service::start_reindex_service(reindex_config, reindex_pool).await;
+    });
+
+    // Broadcast retention pruner: broadcasts are ephemeral channel chatter, so drop rows older
+    // than the retention window (default 3 days). Runs immediately, then hourly. Detached — it
+    // loops forever and only stops at process exit.
+    let prune_pool = database.pool().clone();
+    let retention_days = args.broadcast_retention_days;
+    let _prune_handle = tokio::spawn(async move {
+        let retention_ms: i64 = (retention_days as i64) * 86_400_000;
+        loop {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let cutoff = now_ms - retention_ms;
+            match sqlx::query("DELETE FROM kachat_broadcasts WHERE block_time < $1")
+                .bind(cutoff)
+                .execute(&prune_pool)
+                .await
+            {
+                Ok(r) if r.rows_affected() > 0 => info!(
+                    "Broadcast retention: pruned {} rows older than {} days",
+                    r.rows_affected(),
+                    retention_days
+                ),
+                Ok(_) => {}
+                Err(e) => error!("Broadcast retention prune failed: {}", e),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
     });
 
     let listener_handle = tokio::spawn(async move {

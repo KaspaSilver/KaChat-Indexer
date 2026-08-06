@@ -1,4 +1,20 @@
-# K-indexer
+# KaChat Indexer
+
+**KaChat Indexer** is the KaChat-owned indexer powering KaPosts (social) and KaChat
+broadcasts. It is a fork of [thesheepcat/K-indexer](https://github.com/thesheepcat/K-indexer)
+extended with: server-side KaChat-only exclusivity, text-only content validation, removal
+counter-actions (`unvote`/`unquote`), a per-post engagement endpoint, KaChat broadcast
+indexing (`#kaspa` / `#kachat-bugs`, 3-day retention), and a **KaChat Indexer** admin
+dashboard (`K-admin`) that will grow into the single pane of glass for all of it.
+
+- **What runs it / how to deploy:** [`KAPOSTS.md`](KAPOSTS.md) and
+  [`docker/KAPOSTS/DEPLOY.md`](docker/KAPOSTS/DEPLOY.md).
+- **Upstream lineage** is preserved in git history and the `upstream` remote; the original
+  K-indexer docs follow below.
+
+---
+
+## Upstream: K-indexer
 
 K-indexer is a simplified Kaspa transaction indexer designed specifically for indexing and serving K protocol transactions.
 

@@ -3,7 +3,8 @@ members = [
     "K-transaction-processor",
     "K-webserver",
     "K-database-cleaner",
-    "K-content-remover"
+    "K-content-remover",
+    "K-admin"
 ]
 resolver = "2"
 

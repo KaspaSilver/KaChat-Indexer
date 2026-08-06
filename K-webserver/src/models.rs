@@ -555,6 +555,49 @@ pub struct PaginatedRepliesResponse {
     pub pagination: PaginationMetadata,
 }
 
+/// Fork addition: one actor's engagement action on a post (like/dislike/repost/quote), for
+/// the get-post-engagement endpoint. `action_tx_id` is the ACTION's txid (not the post's) so
+/// rows deep-link to the explorer. `id`/`block_time` back the compound cursor and are not
+/// serialized in the API response (`timestamp` carries the block time in ms).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngagementActor {
+    #[serde(rename = "actorPubkey")]
+    pub actor_pubkey: String,
+    #[serde(rename = "actionTxId")]
+    pub action_tx_id: String,
+    pub timestamp: u64,
+    pub kind: String, // "upvote" | "downvote" | "repost" | "quote"
+    #[serde(skip)]
+    pub id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PaginatedEngagementResponse {
+    pub engagement: Vec<EngagementActor>,
+    pub pagination: PaginationMetadata,
+}
+
+/// Fork addition: a KaChat broadcast (ciph_msg:1:bcast channel message) for the
+/// get-broadcasts endpoint. Field names match the app's `BroadcastIndexerClient`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastMessage {
+    #[serde(rename = "txId")]
+    pub tx_id: String,
+    pub channel: String,
+    #[serde(rename = "senderAddress")]
+    pub sender_address: String,
+    pub content: String,
+    #[serde(rename = "blockTime")]
+    pub block_time: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BroadcastsResponse {
+    pub messages: Vec<BroadcastMessage>,
+    #[serde(rename = "hasMore")]
+    pub has_more: bool,
+}
+
 impl ServerReply {
     // New method to construct from enriched KReplyRecord with blocking status
     pub fn from_enriched_k_reply_record_with_block_status(

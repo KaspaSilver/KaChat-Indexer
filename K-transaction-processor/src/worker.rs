@@ -20,7 +20,7 @@ impl Worker {
         db_pool: DbPool,
         config: AppConfig,
     ) -> Self {
-        let k_processor = KProtocolProcessor::new(db_pool.clone());
+        let k_processor = KProtocolProcessor::new(db_pool.clone(), config.network.clone());
         Self {
             id,
             receiver,
@@ -51,8 +51,10 @@ impl Worker {
                 if let Some(ref payload_hex) = transaction.payload {
                     if let Ok(payload_bytes) = hex::decode(payload_hex) {
                         if let Ok(payload_str) = std::str::from_utf8(&payload_bytes) {
-                            if payload_str.starts_with("k:1:") {
-                                //info!("Worker {} - Processing K protocol transaction: {}", self.id, transaction_id);
+                            if payload_str.starts_with("k:1:")
+                                || payload_str.starts_with("ciph_msg:1:bcast:")
+                            {
+                                //info!("Worker {} - Processing K protocol / broadcast transaction: {}", self.id, transaction_id);
                                 if let Err(k_err) =
                                     self.k_processor.process_k_transaction(&transaction).await
                                 {
@@ -149,8 +151,10 @@ impl Worker {
                     if let Some(ref payload_hex) = transaction.payload {
                         if let Ok(payload_bytes) = hex::decode(payload_hex) {
                             if let Ok(payload_str) = std::str::from_utf8(&payload_bytes) {
-                                if payload_str.starts_with("k:1:") {
-                                    //info!("Worker {} - Processing K protocol transaction on retry: {}", self.id, transaction_id);
+                                if payload_str.starts_with("k:1:")
+                                    || payload_str.starts_with("ciph_msg:1:bcast:")
+                                {
+                                    //info!("Worker {} - Processing K protocol / broadcast transaction on retry: {}", self.id, transaction_id);
                                     if let Err(k_err) =
                                         self.k_processor.process_k_transaction(&transaction).await
                                     {

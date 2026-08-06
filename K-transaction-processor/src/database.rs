@@ -162,6 +162,9 @@ impl KDbClient {
             }
         }
 
+        // Step 1b: idempotently ensure the KaChat broadcast table exists (fork addition).
+        self.create_broadcast_schema().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -175,16 +178,51 @@ impl KDbClient {
         Ok(())
     }
 
+    /// Create the KaChat broadcast table (fork addition). Durable store for `ciph_msg:1:bcast:`
+    /// channel messages; separate from the K `broadcast` action's `k_broadcasts` table.
+    async fn create_broadcast_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_broadcasts (
+                id BIGSERIAL PRIMARY KEY,
+                transaction_id BYTEA UNIQUE NOT NULL,
+                block_time BIGINT NOT NULL,
+                channel VARCHAR(36) NOT NULL,
+                sender_address TEXT NOT NULL,
+                content TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // Drop the earlier index name that collided with the schema verifier's `idx_k_%`
+        // pattern (self-heals any DB created by a pre-fix build).
+        sqlx::query("DROP INDEX IF EXISTS idx_kachat_broadcasts_channel_time")
+            .execute(&self.pool)
+            .await?;
+        // NOTE: index name must NOT match the schema verifier's `idx_k_%` pattern (where `_`
+        // is a SQL single-char wildcard), so it is not miscounted as a K protocol index.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_bcast_channel_time \
+             ON kachat_broadcasts(channel, block_time DESC, id DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Create the notification function and trigger separately to avoid DDL parsing issues
     async fn create_notification_system(&self) -> Result<()> {
         info!("Creating notification function and trigger");
 
-        // Create the function using dollar quoting
+        // Fire on K social payloads ('k:1:' = hex 6b3a313a) and on KaChat broadcast payloads
+        // ('ciph_msg:1:bcast:' = hex 636970685f6d73673a313a62636173743a) (fork addition).
         sqlx::query(
             r#"
             CREATE OR REPLACE FUNCTION notify_transaction() RETURNS TRIGGER AS $$
             BEGIN
-                IF substr(encode(NEW.payload, 'hex'), 1, 8) = '6b3a313a' THEN
+                IF substr(encode(NEW.payload, 'hex'), 1, 8) = '6b3a313a'
+                   OR substr(encode(NEW.payload, 'hex'), 1, 34) = '636970685f6d73673a313a62636173743a' THEN
                     PERFORM pg_notify('transaction_channel', encode(NEW.transaction_id, 'hex'));
                 END IF;
                 RETURN NEW;
