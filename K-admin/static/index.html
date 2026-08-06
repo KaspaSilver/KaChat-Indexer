@@ -78,6 +78,9 @@
 </nav>
 <main>
   <section id="dashboard">
+    <h2>Services</h2>
+    <div class="grid" id="servicesGrid"><div class="card"><div class="muted">loading…</div></div></div>
+
     <h2>Pipeline health</h2>
     <div class="card">
       <div class="health">
@@ -86,7 +89,7 @@
         <div><div class="label muted">Newest transaction</div><div id="hNewestTx" class="mono">—</div></div>
         <div><div class="label muted">Newest KaChat content</div><div id="hNewestContent" class="mono">—</div></div>
       </div>
-      <div class="note">Freshness is derived from the <span class="mono">transactions</span> table (node → simply-kaspa). Container up/down status lives in Portainer. KaChat content lags legitimately when nobody has posted recently.</div>
+      <div class="note">Freshness is derived from the <span class="mono">transactions</span> table (node → block ingest). Per-service status is shown above. KaChat content lags legitimately when nobody has posted recently.</div>
     </div>
 
     <h2>Content indexed</h2>
@@ -345,9 +348,24 @@ async function loadChat() {
   }
 }
 
+async function loadServices() {
+  try {
+    const rows = await (await fetch("/api/services")).json();
+    $("#servicesGrid").innerHTML = rows.map(r => {
+      const cls = r.status === "healthy" ? "good" : r.status === "degraded" ? "warn" : "bad";
+      return `<div class="card"><div class="label">${escapeHtml(r.name)}</div>` +
+        `<div class="value small"><span class="dot ${cls}"></span> ${prettyStatus(r.status)}</div>` +
+        `<div class="muted" style="font-size:11px">${escapeHtml(r.detail)}</div></div>`;
+    }).join("");
+  } catch (e) {
+    $("#servicesGrid").innerHTML = '<div class="card"><div class="muted">failed to load</div></div>';
+  }
+}
+
 // Poll
-loadHealth(); loadStats();
+loadHealth(); loadStats(); loadServices();
 setInterval(loadHealth, 10000);
+setInterval(loadServices, 10000);
 setInterval(loadStats, 30000);
 </script>
 </body>

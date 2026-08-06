@@ -46,6 +46,9 @@ struct Args {
     /// URL of the vendored kasia (chat) indexer's metrics endpoint, proxied to the Chat tab.
     #[arg(long, default_value = "http://127.0.0.1:8600/metrics")]
     chat_metrics_url: String,
+    /// Webserver health URL, probed for the per-service health panel.
+    #[arg(long, default_value = "http://127.0.0.1:3080/health")]
+    webserver_health_url: String,
 }
 
 #[derive(Clone)]
@@ -55,6 +58,7 @@ struct AppState {
     // "catching up" (lag high but advancing) from genuinely "stalled".
     last_tx_sample: std::sync::Arc<std::sync::Mutex<Option<(i64, i64)>>>,
     chat_metrics_url: String,
+    webserver_health_url: String,
 }
 
 fn now_ms() -> i64 {
@@ -90,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         pool,
         last_tx_sample: std::sync::Arc::new(std::sync::Mutex::new(None)),
         chat_metrics_url: args.chat_metrics_url.clone(),
+        webserver_health_url: args.webserver_health_url.clone(),
     };
 
     let app = Router::new()
@@ -100,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/moderation/remove", post(post_remove))
         .route("/api/broadcasts", get(get_broadcasts))
         .route("/api/chat-metrics", get(get_chat_metrics))
+        .route("/api/services", get(get_services))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -520,6 +526,90 @@ async fn post_remove(
         follows,
         total,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// /api/services  (per-service health for the dashboard — replaces needing Portainer)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ServiceHealth {
+    name: String,
+    status: String, // "healthy" | "degraded" | "down"
+    detail: String,
+}
+
+fn svc(name: &str, status: &str, detail: String) -> ServiceHealth {
+    ServiceHealth { name: name.to_string(), status: status.to_string(), detail }
+}
+
+async fn probe_http(name: &str, url: &str) -> ServiceHealth {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return svc(name, "down", "client error".into()),
+    };
+    match client.get(url).send().await {
+        Ok(r) if r.status().is_success() => svc(name, "healthy", "responding".into()),
+        Ok(r) => svc(name, "degraded", format!("HTTP {}", r.status().as_u16())),
+        Err(_) => svc(name, "down", "unreachable".into()),
+    }
+}
+
+async fn get_services(State(state): State<AppState>) -> Json<Vec<ServiceHealth>> {
+    let now = now_ms();
+    let mut out = Vec::new();
+
+    // Database, ingest freshness, and processor heartbeat come from one DB round-trip.
+    match sqlx::query(
+        "SELECT COALESCE((SELECT MAX(block_time) FROM transactions), 0) AS newest_tx, \
+         (SELECT value FROM k_vars WHERE key = 'processor_heartbeat') AS hb",
+    )
+    .fetch_one(&state.pool)
+    .await
+    {
+        Ok(row) => {
+            out.push(svc("Database", "healthy", "connected".into()));
+
+            let newest_tx: i64 = row.get("newest_tx");
+            let lag = if newest_tx == 0 { -1 } else { now - newest_tx };
+            let ingest = if newest_tx == 0 {
+                svc("Ingest (blocks)", "degraded", "no transactions yet".into())
+            } else if lag < 120_000 {
+                svc("Ingest (blocks)", "healthy", format!("{}s behind tip", lag / 1000))
+            } else {
+                svc("Ingest (blocks)", "degraded", format!("{}m behind tip", lag / 60_000))
+            };
+            out.push(ingest);
+
+            let hb: Option<String> = row.get("hb");
+            let proc = match hb.and_then(|v| v.parse::<i64>().ok()) {
+                Some(ts) => {
+                    let age = now - ts;
+                    if age < 90_000 {
+                        svc("Processor", "healthy", format!("heartbeat {}s ago", age / 1000))
+                    } else {
+                        svc("Processor", "down", format!("stale {}s", age / 1000))
+                    }
+                }
+                None => svc("Processor", "degraded", "no heartbeat yet".into()),
+            };
+            out.push(proc);
+        }
+        Err(_) => {
+            out.push(svc("Database", "down", "unreachable".into()));
+            out.push(svc("Ingest (blocks)", "down", "db unreachable".into()));
+            out.push(svc("Processor", "down", "db unreachable".into()));
+        }
+    }
+
+    // Webserver + chat indexer probed over HTTP.
+    out.push(probe_http("Webserver (API)", &state.webserver_health_url).await);
+    out.push(probe_http("Chat indexer", &state.chat_metrics_url).await);
+
+    Json(out)
 }
 
 // ---------------------------------------------------------------------------

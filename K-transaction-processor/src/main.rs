@@ -158,6 +158,26 @@ async fn main() -> Result<()> {
         transaction_reindex_service::start_reindex_service(reindex_config, reindex_pool).await;
     });
 
+    // Liveness heartbeat: write the current time to k_vars every 30s so the admin dashboard
+    // can show per-service health for the processor (which it can't probe over HTTP).
+    let heartbeat_pool = database.pool().clone();
+    let _heartbeat_handle = tokio::spawn(async move {
+        loop {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let _ = sqlx::query(
+                "INSERT INTO k_vars (key, value) VALUES ('processor_heartbeat', $1) \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(now_ms.to_string())
+            .execute(&heartbeat_pool)
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+
     // Broadcast retention pruner: broadcasts are ephemeral channel chatter, so drop rows older
     // than the retention window (default 3 days). Runs immediately, then hourly. Detached — it
     // loops forever and only stops at process exit.

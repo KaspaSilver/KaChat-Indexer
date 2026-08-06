@@ -1,11 +1,17 @@
-# KaPosts indexer (KaChat-owned fork). Builds the K crates from THIS repo so the fork's
-# changes ship, and reuses the mainnet rusty-kaspa node already running on this box.
-# All build contexts are the repo root (../..). No bundled Portainer — one already runs
-# on :9000. Run:  docker compose up -d --build
+# KaChat Indexer stack. Builds the crates from THIS repo and reuses the mainnet rusty-kaspa
+# node already running on this box. All build contexts are the repo root (../..).
+# Per-service health is surfaced in the admin GUI (Dashboard → Services). Run:
+#   docker compose up -d --build
+#
+# NOTE: the Postgres role/database names inside .env (DB_USER/DB_NAME) are internal
+# credentials, never shown in Portainer or used by the app — left as-is so the cutover
+# preserves the existing data without renaming a live database + owning role.
+name: kachat
+
 services:
-  k-indexer-db-kaposts:
+  kachat-db:
     profiles: ["public-indexer"]
-    container_name: k-indexer-db-kaposts
+    container_name: kachat-db
     image: postgres:17-alpine
     restart: unless-stopped
     shm_size: 4G
@@ -17,7 +23,7 @@ services:
     network_mode: "host"
     command: -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.max=10000 -c pg_stat_statements.track=all -c pg_stat_statements.save=on
     volumes:
-      - /var/${DB_NAME}/:/var/lib/postgresql/data/
+      - /var/kachat-db/:/var/lib/postgresql/data/
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
       interval: 10s
@@ -25,15 +31,15 @@ services:
       retries: 5
       start_period: 30s
 
-  simply-kaspa-indexer-kaposts:
+  kachat-ingest:
     profiles: ["public-indexer"]
-    container_name: simply-kaspa-indexer-kaposts
+    container_name: kachat-ingest
     image: supertypo/simply-kaspa-indexer:v2.3.0
     restart: unless-stopped
     network_mode: "host"
     command: -s ws://${KASPA_NODE_ADDRESS}:${KASPA_NODE_PORT} -l localhost:${SKI_PORT} -n ${NETWORK} -d postgres://${DB_USER}:${DB_PASSWORD}@0.0.0.0:${DB_PORT}/${DB_NAME} --prune-db="0 * * * *" --retention=1h --upgrade-db --disable=virtual_chain_processing,transaction_acceptance,blocks_table,block_parent_table,transactions_inputs --exclude-fields=block_accepted_id_merkle_root,block_merge_set_blues_hashes,block_merge_set_reds_hashes,block_selected_parent_hash,block_bits,block_blue_work,block_blue_score,block_daa_score,block_hash_merkle_root,block_nonce,block_pruning_point,block_timestamp,block_utxo_commitment,block_version,tx_subnetwork_id,tx_hash,tx_mass,tx_in_previous_outpoint,tx_in_signature_script,tx_in_sig_op_count,tx_out_amount
     depends_on:
-      k-indexer-db-kaposts:
+      kachat-db:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "netstat -tuln | grep ':${SKI_PORT} ' || exit 1"]
@@ -42,9 +48,9 @@ services:
       retries: 3
       start_period: 60s
 
-  k-transaction-processor-kaposts:
+  kachat-processor:
     profiles: ["public-indexer"]
-    container_name: k-transaction-processor-kaposts
+    container_name: kachat-processor
     build:
       context: ../..
       dockerfile: docker/PROD/Dockerfile.K-transaction-processor
@@ -52,9 +58,9 @@ services:
     network_mode: "host"
     command: --upgrade-db --network ${NETWORK} --db-host localhost --db-port ${DB_PORT} --db-name ${DB_NAME} --db-user ${DB_USER} --db-password ${DB_PASSWORD} --db-max-connections 10 --workers 4 --channel transaction_channel --retry-attempts 3 --retry-delay 1000 --broadcast-retention-days 3
     depends_on:
-      k-indexer-db-kaposts:
+      kachat-db:
         condition: service_healthy
-      simply-kaspa-indexer-kaposts:
+      kachat-ingest:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f K-transaction-processor || exit 1"]
@@ -63,9 +69,9 @@ services:
       retries: 3
       start_period: 60s
 
-  k-webserver-kaposts:
+  kachat-webserver:
     profiles: ["public-indexer"]
-    container_name: k-webserver-kaposts
+    container_name: kachat-webserver
     build:
       context: ../..
       dockerfile: docker/PROD/Dockerfile.K-webserver
@@ -73,14 +79,14 @@ services:
     network_mode: "host"
     # rate-limit here is a COARSE GLOBAL cap: behind nginx-proxy-manager every request's
     # peer IP is NPM's gateway, so per-IP buckets collapse into one. Do PER-CLIENT rate
-    # limiting at NPM (limit_req on the real client IP) — see docker/KAPOSTS/DEPLOY.md.
+    # limiting at NPM (limit_req on the real client IP) — see docker/kachat/DEPLOY.md.
     command: --db-host localhost --db-port ${DB_PORT} --db-name ${DB_NAME} --db-user ${DB_USER} --db-password ${DB_PASSWORD} --bind-address 0.0.0.0:${WEBSERVER_PORT} --worker-threads 6 --db-max-connections 18 --request-timeout 30 --rate-limit 12000
     depends_on:
-      k-indexer-db-kaposts:
+      kachat-db:
         condition: service_healthy
-      simply-kaspa-indexer-kaposts:
+      kachat-ingest:
         condition: service_healthy
-      k-transaction-processor-kaposts:
+      kachat-processor:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:${WEBSERVER_PORT}/health || exit 1"]
@@ -89,19 +95,19 @@ services:
       retries: 3
       start_period: 30s
 
-  k-admin-kaposts:
+  kachat-admin:
     profiles: ["public-indexer"]
-    container_name: k-admin-kaposts
+    container_name: kachat-admin
     build:
       context: ../..
-      dockerfile: docker/KAPOSTS/Dockerfile.K-admin
+      dockerfile: docker/kachat/Dockerfile.K-admin
     restart: unless-stopped
     network_mode: "host"
     # Admin (incl. the unauthenticated delete-by-pubkey endpoint) is bound to LOOPBACK only
     # and never proxied. Reach it via SSH tunnel: ssh -L 3081:localhost:3081 <box>
     command: --db-host localhost --db-port ${DB_PORT} --db-name ${DB_NAME} --db-user ${DB_USER} --db-password ${DB_PASSWORD} --db-max-connections 4 --bind-address 127.0.0.1:${ADMIN_PORT}
     depends_on:
-      k-indexer-db-kaposts:
+      kachat-db:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:${ADMIN_PORT}/api/health || exit 1"]
@@ -110,13 +116,13 @@ services:
       retries: 3
       start_period: 20s
 
-  # Kasia messaging indexer (vendored fork) — indexes encrypted chat (handshakes, contextual
+  # Chat indexer (vendored kasia fork) — indexes encrypted chat (handshakes, contextual
   # messages, payments) directly from the node into its own embedded fjall store, serving an
-  # API on ${CHAT_API_PORT}. Orchestrated alongside the KaPosts/broadcast stack so the KaChat
-  # Indexer is a single stack; the admin GUI surfaces its /metrics.
-  kasia-indexer-kaposts:
+  # API on ${CHAT_API_PORT}. Part of the single KaChat Indexer stack; the admin GUI surfaces
+  # its /metrics.
+  kachat-chat-indexer:
     profiles: ["public-indexer"]
-    container_name: kasia-indexer-kaposts
+    container_name: kachat-chat-indexer
     build:
       context: ../../kasia-indexer
       dockerfile: Dockerfile
@@ -130,4 +136,4 @@ services:
       RUST_LOG: info
       RUST_BACKTRACE: "1"
     volumes:
-      - /var/kasia-indexer-data:/app/data
+      - /var/kachat-chat-data:/app/data
