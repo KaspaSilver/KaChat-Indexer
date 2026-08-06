@@ -74,6 +74,7 @@
   <button data-tab="dashboard" class="active">Dashboard</button>
   <button data-tab="kaposts">KaPosts</button>
   <button data-tab="broadcasts">Broadcasts</button>
+  <button data-tab="chat">Chat</button>
 </nav>
 <main>
   <section id="dashboard">
@@ -140,6 +141,18 @@
     </div>
     <div class="note">Only <b>#kaspa</b> and <b>#kachat-bugs</b> are indexed. Content is stored verbatim (text or reply/audio JSON envelopes); the preview shows the first 200 characters.</div>
   </section>
+
+  <section id="chat" style="display:none">
+    <h2>Chat indexer (Kasia)</h2>
+    <div class="card">
+      <div class="health">
+        <div><span id="chatDot" class="dot"></span> <span class="big" id="chatStatus">—</span></div>
+        <div class="note">Encrypted chat — handshakes, direct messages, payments — indexed straight from the node into an embedded store, served on its own API. Metrics below are proxied live from the vendored kasia-indexer.</div>
+      </div>
+    </div>
+    <h2>Metrics</h2>
+    <div class="grid" id="chatGrid"><div class="card"><div class="muted">loading…</div></div></div>
+  </section>
 </main>
 
 <script>
@@ -175,8 +188,10 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   $("#dashboard").style.display = t === "dashboard" ? "" : "none";
   $("#kaposts").style.display = t === "kaposts" ? "" : "none";
   $("#broadcasts").style.display = t === "broadcasts" ? "" : "none";
+  $("#chat").style.display = t === "chat" ? "" : "none";
   if (t === "kaposts") loadRecent();
   if (t === "broadcasts") loadBroadcasts();
+  if (t === "chat") loadChat();
 });
 
 async function loadHealth() {
@@ -299,6 +314,36 @@ $("#btnRemove").onclick = () => {
   if (confirm("Permanently remove all indexed content for this pubkey? This cannot be undone (re-indexing from chain would restore it).")) moderate(false);
 };
 $("#pk").oninput = () => { $("#btnRemove").disabled = true; };
+
+function flattenMetrics(obj, prefix) {
+  let out = [];
+  for (const [k, v] of Object.entries(obj || {})) {
+    const key = prefix ? prefix + "." + k : k;
+    if (v && typeof v === "object" && !Array.isArray(v)) out = out.concat(flattenMetrics(v, key));
+    else out.push([key, Array.isArray(v) ? v.join(", ") : v]);
+  }
+  return out;
+}
+async function loadChat() {
+  try {
+    const d = await (await fetch("/api/chat-metrics")).json();
+    if (!d.reachable) {
+      $("#chatDot").className = "dot bad";
+      $("#chatStatus").textContent = "unreachable";
+      $("#chatGrid").innerHTML = '<div class="card"><div class="muted">chat indexer not reachable yet (still building or syncing)</div></div>';
+      return;
+    }
+    $("#chatDot").className = "dot good";
+    $("#chatStatus").textContent = "running";
+    const entries = flattenMetrics(d.metrics || {}, "");
+    $("#chatGrid").innerHTML = entries.length
+      ? entries.map(([k, v]) => `<div class="card"><div class="label">${escapeHtml(k)}</div><div class="value small">${escapeHtml(String(v))}</div></div>`).join("")
+      : '<div class="card"><div class="muted">no metrics fields reported</div></div>';
+  } catch (e) {
+    $("#chatDot").className = "dot bad";
+    $("#chatStatus").textContent = "error";
+  }
+}
 
 // Poll
 loadHealth(); loadStats();

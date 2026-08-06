@@ -109,3 +109,25 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
+
+  # Kasia messaging indexer (vendored fork) — indexes encrypted chat (handshakes, contextual
+  # messages, payments) directly from the node into its own embedded fjall store, serving an
+  # API on ${CHAT_API_PORT}. Orchestrated alongside the KaPosts/broadcast stack so the KaChat
+  # Indexer is a single stack; the admin GUI surfaces its /metrics.
+  kasia-indexer-kaposts:
+    profiles: ["public-indexer"]
+    container_name: kasia-indexer-kaposts
+    build:
+      context: ../../kasia-indexer
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    network_mode: "host"
+    environment:
+      KASPA_NODE_WBORSH_URL: ws://${KASPA_NODE_ADDRESS}:${KASPA_NODE_PORT}
+      NETWORK_TYPE: ${NETWORK}
+      KASIA_INDEXER_DB_ROOT: /app/data
+      KASIA_API_BIND: 0.0.0.0:${CHAT_API_PORT}
+      RUST_LOG: info
+      RUST_BACKTRACE: "1"
+    volumes:
+      - /var/kasia-indexer-data:/app/data

@@ -43,6 +43,9 @@ struct Args {
     db_max_connections: u32,
     #[arg(long, default_value = "0.0.0.0:3081")]
     bind_address: String,
+    /// URL of the vendored kasia (chat) indexer's metrics endpoint, proxied to the Chat tab.
+    #[arg(long, default_value = "http://127.0.0.1:8600/metrics")]
+    chat_metrics_url: String,
 }
 
 #[derive(Clone)]
@@ -51,6 +54,7 @@ struct AppState {
     // Last observed (newest_transaction_time, sampled_at_ms) so /api/health can tell
     // "catching up" (lag high but advancing) from genuinely "stalled".
     last_tx_sample: std::sync::Arc<std::sync::Mutex<Option<(i64, i64)>>>,
+    chat_metrics_url: String,
 }
 
 fn now_ms() -> i64 {
@@ -85,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         pool,
         last_tx_sample: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        chat_metrics_url: args.chat_metrics_url.clone(),
     };
 
     let app = Router::new()
@@ -94,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/moderation/recent", get(get_recent))
         .route("/api/moderation/remove", post(post_remove))
         .route("/api/broadcasts", get(get_broadcasts))
+        .route("/api/chat-metrics", get(get_chat_metrics))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -514,6 +520,34 @@ async fn post_remove(
         follows,
         total,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// /api/chat-metrics  (proxy the vendored kasia chat indexer's /metrics)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ChatMetricsResponse {
+    reachable: bool,
+    metrics: Option<serde_json::Value>,
+}
+
+async fn get_chat_metrics(State(state): State<AppState>) -> Json<ChatMetricsResponse> {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Json(ChatMetricsResponse { reachable: false, metrics: None }),
+    };
+    match client.get(&state.chat_metrics_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => Json(ChatMetricsResponse { reachable: true, metrics: Some(v) }),
+            Err(_) => Json(ChatMetricsResponse { reachable: true, metrics: None }),
+        },
+        // Not yet up / still building index / connection refused → reachable:false (normal).
+        _ => Json(ChatMetricsResponse { reachable: false, metrics: None }),
+    }
 }
 
 // ---------------------------------------------------------------------------
