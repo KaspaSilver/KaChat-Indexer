@@ -165,6 +165,9 @@ impl KDbClient {
         // Step 1b: idempotently ensure the KaChat broadcast table exists (fork addition).
         self.create_broadcast_schema().await?;
 
+        // Step 1c: idempotently ensure the KaPosts personal-mode block/mute denylist exists.
+        self.create_denylist_schema().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -205,6 +208,24 @@ impl KDbClient {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_bcast_channel_time \
              ON kachat_broadcasts(channel, block_time DESC, id DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// KaPosts personal-mode denylist: authors (compressed pubkeys) the operator has blocked or
+    /// muted. The processor skips storing any content from these pubkeys, and the admin dashboard
+    /// purges their existing rows when they are added. Empty table = index everyone (default).
+    async fn create_denylist_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_kaposts_denylist (
+                pubkey BYTEA PRIMARY KEY,
+                kind VARCHAR(8) NOT NULL DEFAULT 'block',
+                added_at BIGINT NOT NULL DEFAULT 0
+            )
+            "#,
         )
         .execute(&self.pool)
         .await?;

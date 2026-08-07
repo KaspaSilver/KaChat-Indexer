@@ -28,6 +28,84 @@ pub const KACHAT_MARKER: &str = "\u{2060}";
 /// else on the `ciph_msg:1:bcast:` protocol is dropped.
 pub const BROADCAST_CHANNELS: [&str; 2] = ["kaspa", "kachat-bugs"];
 
+/// Runtime feature switches, refreshed from the `k_vars` table by a background task in
+/// `main.rs` (keys `feature_kaposts` / `feature_broadcasts`, value `off` to disable). Default
+/// ON so a fresh database with no rows indexes everything. When a feature is off the processor
+/// silently drops matching payloads — the chain is unaffected, and turning it back on resumes
+/// indexing new transactions (historical gaps are filled by a re-index, not automatically).
+pub static FEATURE_KAPOSTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub static FEATURE_BROADCASTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// KaPosts personal-mode block/mute denylist: lowercase-hex author pubkeys the operator has
+/// blocked or muted. Refreshed from `kachat_kaposts_denylist` by the flag task in main.rs.
+/// When an author is on this list the processor skips storing ALL of their content (posts,
+/// replies, quotes, votes, follows, blocks) — matching the KaChat app's "hidden = muted ||
+/// blocked" behavior. Empty = index everyone (public default).
+static KAPOSTS_DENYLIST: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Replace the KaPosts block/mute denylist (values must be lowercase hex pubkeys).
+pub fn set_kaposts_denylist(list: Vec<String>) {
+    if let Ok(mut guard) = KAPOSTS_DENYLIST.write() {
+        *guard = list;
+    }
+}
+
+/// Is this author pubkey (hex) blocked/muted, so its content must not be stored?
+pub fn is_kaposts_denied(pubkey_hex: &str) -> bool {
+    let pk = pubkey_hex.to_ascii_lowercase();
+    KAPOSTS_DENYLIST
+        .read()
+        .map(|g| g.iter().any(|p| *p == pk))
+        .unwrap_or(false)
+}
+
+/// Immediately add a pubkey (hex) to the in-memory denylist (used when the operator's own
+/// on-chain block is processed, so the target is skipped without waiting for the DB refresh).
+pub fn add_kaposts_denied(pubkey_hex: &str) {
+    let pk = pubkey_hex.to_ascii_lowercase();
+    if let Ok(mut guard) = KAPOSTS_DENYLIST.write() {
+        if !guard.iter().any(|p| *p == pk) {
+            guard.push(pk);
+        }
+    }
+}
+
+/// Immediately remove a pubkey (hex) from the in-memory denylist (operator on-chain unblock).
+pub fn remove_kaposts_denied(pubkey_hex: &str) {
+    let pk = pubkey_hex.to_ascii_lowercase();
+    if let Ok(mut guard) = KAPOSTS_DENYLIST.write() {
+        guard.retain(|p| *p != pk);
+    }
+}
+
+/// KaPosts "operator" identities as lowercase-hex **x-only** pubkeys (32 bytes / 64 hex) — the
+/// x-coordinate of THIS indexer owner's key, decoded from the kaspa address they entered in the
+/// dashboard. When an author whose pubkey shares this x-coordinate publishes an on-chain
+/// `k:1:block` / `k:1:unblock`, the indexer mirrors it into the personal-mode denylist (block →
+/// deny + purge, unblock → allow again). Refreshed from `k_vars['kaposts_operator_addresses']`
+/// (decoded by main.rs). Empty = feature dormant.
+static KAPOSTS_OPERATORS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Replace the operator x-only set (values must be lowercase 64-hex x-coordinates).
+pub fn set_kaposts_operators(list: Vec<String>) {
+    if let Ok(mut guard) = KAPOSTS_OPERATORS.write() {
+        *guard = list;
+    }
+}
+
+/// Is this author pubkey (hex) one of the configured operators? Compared by x-coordinate: a
+/// compressed pubkey is `02/03 || x` and the address encodes the x-only key, so both reduce to
+/// the trailing 64 hex chars.
+pub fn is_kaposts_operator(pubkey_hex: &str) -> bool {
+    let pk = pubkey_hex.to_ascii_lowercase();
+    let xonly = if pk.len() >= 64 { &pk[pk.len() - 64..] } else { pk.as_str() };
+    KAPOSTS_OPERATORS
+        .read()
+        .map(|g| g.iter().any(|p| p == xonly))
+        .unwrap_or(false)
+}
+
 /// Max characters of broadcast content stored (safety cap; broadcasts may carry voice/reply
 /// JSON envelopes, so this is generous — the on-chain payload size is the real limit).
 pub const MAX_BROADCAST_CONTENT_CHARS: usize = 65_536;
@@ -96,6 +174,22 @@ pub enum KActionType {
     /// (fork addition; mirrors follow/unfollow). Payload: unquote:pubkey:sig:content_id
     Unquote(KUnquote),
     Unknown(String),
+}
+
+/// The author pubkey (hex) of a parsed K action, used by the personal-mode block/mute gate.
+/// `Unknown` actions carry no identity and are never gated here.
+fn action_sender_pubkey(action: &KActionType) -> Option<&str> {
+    match action {
+        KActionType::Broadcast(k) => Some(&k.sender_pubkey),
+        KActionType::Post(k) => Some(&k.sender_pubkey),
+        KActionType::Reply(k) => Some(&k.sender_pubkey),
+        KActionType::Vote(k) => Some(&k.sender_pubkey),
+        KActionType::Block(k) => Some(&k.sender_pubkey),
+        KActionType::Quote(k) => Some(&k.sender_pubkey),
+        KActionType::Follow(k) => Some(&k.sender_pubkey),
+        KActionType::Unquote(k) => Some(&k.sender_pubkey),
+        KActionType::Unknown(_) => None,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -621,7 +715,15 @@ impl KProtocolProcessor {
         // protocol family from `k:1:` — route it before K parsing, and store the content
         // verbatim from the RAW payload (not the control-char-cleaned one).
         if let Some(rest) = payload_str.strip_prefix("ciph_msg:1:bcast:") {
+            if !FEATURE_BROADCASTS.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(()); // broadcast indexing disabled in settings
+            }
             return self.process_broadcast(transaction, rest).await;
+        }
+
+        // Feature gate: skip all `k:1:` (KaPosts) parsing/storage when disabled in settings.
+        if !FEATURE_KAPOSTS.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
         }
 
         // Clean the payload string by removing null bytes and other control characters
@@ -632,7 +734,18 @@ impl KProtocolProcessor {
 
         // Parse K protocol payload
         match self.parse_k_protocol_payload(&cleaned_payload) {
-            Ok(action_type) => match action_type {
+            Ok(action_type) => {
+            // Personal-mode block/mute: drop everything authored by a denylisted pubkey.
+            if let Some(pk) = action_sender_pubkey(&action_type) {
+                if is_kaposts_denied(pk) {
+                    tracing::debug!(
+                        "Skipping KaPosts content from blocked/muted author {} (tx {})",
+                        pk, transaction_id
+                    );
+                    return Ok(());
+                }
+            }
+            match action_type {
                 KActionType::Broadcast(k_broadcast) => {
                     self.save_k_broadcast_to_database(transaction, k_broadcast)
                         .await?;
@@ -667,7 +780,8 @@ impl KProtocolProcessor {
                         action, transaction_id
                     );
                 }
-            },
+            }
+            }
             Err(err) => {
                 error!(
                     "Failed to parse K protocol payload for transaction {}: {}",
@@ -1590,6 +1704,33 @@ impl KProtocolProcessor {
     }
 
     /// Process K block action (block/unblock) in database
+    /// Personal-mode helper: record a denylist entry for `pubkey_bytes` and purge all of that
+    /// author's already-indexed content. Invoked when the operator blocks someone on-chain.
+    async fn operator_block_target(&self, pubkey_bytes: &[u8], added_at: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO kachat_kaposts_denylist (pubkey, kind, added_at) VALUES ($1, 'block', $2) \
+             ON CONFLICT (pubkey) DO UPDATE SET kind = 'block'",
+        )
+        .bind(pubkey_bytes)
+        .bind(added_at)
+        .execute(&self.db_pool)
+        .await?;
+        sqlx::query(
+            r#"
+            WITH d1 AS (DELETE FROM k_mentions WHERE sender_pubkey = $1 RETURNING id),
+                 d2 AS (DELETE FROM k_contents WHERE sender_pubkey = $1 RETURNING id),
+                 d3 AS (DELETE FROM k_votes    WHERE sender_pubkey = $1 RETURNING id),
+                 d4 AS (DELETE FROM k_blocks   WHERE sender_pubkey = $1 RETURNING id),
+                 d5 AS (DELETE FROM k_follows  WHERE sender_pubkey = $1 RETURNING id)
+            SELECT 1
+            "#,
+        )
+        .bind(pubkey_bytes)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn process_k_block_in_database(
         &self,
         transaction: &Transaction,
@@ -1661,6 +1802,18 @@ impl KProtocolProcessor {
                         hex::encode(&blocked_user_pubkey_bytes)
                     );
                 }
+
+                // Personal mode: if the blocker is THIS indexer's operator, mirror the block
+                // into the denylist — purge the target's content and stop storing it.
+                if is_kaposts_operator(&k_block.sender_pubkey) {
+                    self.operator_block_target(&blocked_user_pubkey_bytes, block_time)
+                        .await?;
+                    add_kaposts_denied(&k_block.blocked_user_pubkey);
+                    info!(
+                        "Operator on-chain block: denylisted + purged author {}",
+                        k_block.blocked_user_pubkey
+                    );
+                }
             }
             "unblock" => {
                 // Delete any existing "block" record for the same sender and blocked user
@@ -1683,6 +1836,20 @@ impl KProtocolProcessor {
                     hex::encode(&blocked_user_pubkey_bytes),
                     delete_result.rows_affected()
                 );
+
+                // Personal mode: operator's on-chain unblock removes the target from the denylist
+                // (their future content is indexed again; re-indexing backfills what was skipped).
+                if is_kaposts_operator(&k_block.sender_pubkey) {
+                    sqlx::query("DELETE FROM kachat_kaposts_denylist WHERE pubkey = $1")
+                        .bind(&blocked_user_pubkey_bytes)
+                        .execute(&self.db_pool)
+                        .await?;
+                    remove_kaposts_denied(&k_block.blocked_user_pubkey);
+                    info!(
+                        "Operator on-chain unblock: removed author {} from denylist",
+                        k_block.blocked_user_pubkey
+                    );
+                }
             }
             _ => {
                 error!("Invalid blocking_action: {}", k_block.blocking_action);

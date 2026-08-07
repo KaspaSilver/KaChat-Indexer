@@ -14,6 +14,7 @@ pub mod messages;
 pub mod metadata;
 pub mod migration;
 pub mod processing;
+pub mod push;
 
 pub const EMPTY_VERSION: u8 = 0; // used when we don't know address at all
 
@@ -32,6 +33,21 @@ impl Default for AddressPayload {
             inverse_version: EMPTY_VERSION,
             payload: [0u8; 33],
         }
+    }
+}
+
+impl AddressPayload {
+    pub fn from_xonly_pubkey(pubkey: [u8; 32]) -> Self {
+        let mut payload = [0u8; 33];
+        payload[..32].copy_from_slice(&pubkey);
+        Self {
+            inverse_version: u8::MAX - Version::PubKey as u8,
+            payload,
+        }
+    }
+
+    pub fn matches_xonly_pubkey(&self, pubkey: &[u8; 32]) -> bool {
+        self.inverse_version == u8::MAX - Version::PubKey as u8 && self.payload[..32] == pubkey[..]
     }
 }
 
@@ -148,4 +164,13 @@ pub enum PartitionId {
     PendingSenders = 14,
     SelfStashByOwner = 15,
     TxIDToSelfStash = 16,
+
+    GroupMessageByBlindedGroupId = 17,
+    TxIdToGroupMessage = 18,
+    // Reserved for compatibility with databases created by the original group-chat PR.
+    GroupInviteByTag = 19,
+    TxIdToGroupInvite = 20,
+    GroupControlBySender = 21,
+    TxIdToGroupControl = 22,
+    GroupControlByRecipient = 23,
 }

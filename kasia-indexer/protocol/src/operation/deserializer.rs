@@ -1,6 +1,6 @@
 use crate::operation::{
-    SealedContextualMessageV1, SealedHandshakeV2, SealedMessageOrSealedHandshakeVNone,
-    SealedOperation, SealedPaymentV1, SealedSelfStashV1,
+    SealedContextualMessageV1, SealedGroupControlV1, SealedGroupMessageV1, SealedHandshakeV2,
+    SealedMessageOrSealedHandshakeVNone, SealedOperation, SealedPaymentV1, SealedSelfStashV1,
 };
 use tracing::warn;
 
@@ -20,6 +20,9 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
                 sealed_hex: payload_without_protocol,
             },
         )),
+        Some([b'p', b'a', b'y', b':', sealed_hex @ ..]) => {
+            Some(SealedOperation::PaymentV1(SealedPaymentV1 { sealed_hex }))
+        }
         Some(
             [
                 b'p',
@@ -94,10 +97,75 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
                 })),
             }
         }
+        Some([b'g', b'c', b'o', b'm', b'm', b':', remaining @ ..]) => {
+            let full = remaining;
+            let fields: Vec<&[u8]> = remaining.split(|byte| *byte == b':').collect();
+            let [
+                blinded_group_id,
+                epoch,
+                sender_id,
+                sender_pub,
+                msg_id,
+                ciphertext,
+                signature,
+            ] = fields.as_slice()
+            else {
+                return None;
+            };
+            if !is_fixed_hex(blinded_group_id, 32)
+                || epoch.is_empty()
+                || !epoch.iter().all(u8::is_ascii_digit)
+                || std::str::from_utf8(epoch).ok()?.parse::<u64>().is_err()
+                || !is_fixed_hex(sender_id, 32)
+                || !is_fixed_hex(sender_pub, 32)
+                || !is_fixed_hex(msg_id, 24)
+                || !is_nonempty_hex(ciphertext)
+                || !is_fixed_hex(signature, 64)
+            {
+                return None;
+            }
+
+            Some(SealedOperation::GroupMessageV1(SealedGroupMessageV1 {
+                blinded_group_id,
+                epoch,
+                sender_id,
+                sender_pub,
+                msg_id,
+                ciphertext,
+                signature,
+                sealed_hex: full,
+            }))
+        }
+        Some([b'g', b'c', b't', b'l', b':', remaining @ ..]) => {
+            let fields: Vec<&[u8]> = remaining.split(|byte| *byte == b':').collect();
+            let (recipient_pubkey, encrypted_payload) = match fields.as_slice() {
+                [encrypted_payload] if is_nonempty_hex(encrypted_payload) => {
+                    (None, *encrypted_payload)
+                }
+                [recipient_pubkey, encrypted_payload]
+                    if is_fixed_hex(recipient_pubkey, 32) && is_nonempty_hex(encrypted_payload) =>
+                {
+                    (Some(*recipient_pubkey), *encrypted_payload)
+                }
+                _ => return None,
+            };
+            Some(SealedOperation::GroupControlV1(SealedGroupControlV1 {
+                recipient_pubkey,
+                encrypted_payload,
+            }))
+        }
         Some(msg_type_and_content) => {
             let msg_type_and_content = faster_hex::hex_string(msg_type_and_content);
             warn!("Unknown operation type: {msg_type_and_content}");
             None
         }
     }
+}
+
+fn is_fixed_hex(value: &[u8], byte_len: usize) -> bool {
+    value.len() == byte_len * 2 && value.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn is_nonempty_hex(value: &[u8]) -> bool {
+    !value.is_empty() && value.len().is_multiple_of(2) && value.iter().all(u8::is_ascii_hexdigit)
 }
