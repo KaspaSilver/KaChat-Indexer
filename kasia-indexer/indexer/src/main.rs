@@ -1,5 +1,8 @@
 use crate::config::get_indexer_config;
 use crate::context::{IndexerContext, get_indexer_context};
+use crate::push::{
+    PUSH_REGISTRY_COMMAND_CAPACITY, PushDispatcher, PushRegistry, PushRegistryActor,
+};
 use dotenv::dotenv;
 use fjall::Config;
 use futures_util::TryFutureExt;
@@ -16,6 +19,12 @@ use indexer_db::headers::daa_index::DaaIndexPartition;
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
 };
+use indexer_db::messages::group_control::{
+    GroupControlByRecipientPartition, GroupControlBySenderPartition, TxIdToGroupControlPartition,
+};
+use indexer_db::messages::group_message::{
+    GroupMessageByBlindedGroupIdPartition, GroupSenderBindingPartition, TxIdToGroupMessagePartition,
+};
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, TxIdToHandshakePartition,
 };
@@ -28,6 +37,10 @@ use indexer_db::migration::apply_migrations;
 use indexer_db::processing::accepting_block_to_txs::AcceptingBlockToTxIDPartition;
 use indexer_db::processing::pending_senders::PendingSenderResolutionPartition;
 use indexer_db::processing::tx_id_to_acceptance::TxIDToAcceptancePartition;
+use indexer_db::push::{
+    DeviceRegistrationPartition, PrimaryAddressPartition, WatchedAddressPartition,
+    WatchedGroupIdPartition,
+};
 use kaspa_rpc_core::RpcBlueWorkType;
 use kaspa_wrpc_client::client::{ConnectOptions, ConnectStrategy};
 use kaspa_wrpc_client::prelude::NetworkType;
@@ -44,7 +57,46 @@ use workflow_core::channel::Channel;
 mod api;
 mod config;
 mod context;
+mod push;
 mod signals;
+
+/// Load the personal-mode address allowlist (KaChat fork). The admin dashboard writes one
+/// address per line to `KASIA_PERSONAL_FILE` (default `/app/data/personal_addresses.txt`) and
+/// restarts this process; an absent/empty file means personal mode is off (index everything).
+fn load_personal_addresses() {
+    let path = std::env::var("KASIA_PERSONAL_FILE")
+        .unwrap_or_else(|_| "/app/data/personal_addresses.txt".to_string());
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => {
+            indexer_actors::set_personal_addresses(Vec::new());
+            return;
+        }
+    };
+    let mut addrs = Vec::new();
+    for token in content.split(['\n', '\r', ',', ' ', '\t']) {
+        let t = token.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match kaspa_rpc_core::RpcAddress::try_from(t.to_string())
+            .ok()
+            .and_then(|rpc| indexer_db::AddressPayload::try_from(&rpc).ok())
+        {
+            Some(ap) => addrs.push(ap),
+            None => tracing::warn!("Personal mode: skipping unparseable address '{t}'"),
+        }
+    }
+    if addrs.is_empty() {
+        info!("Personal indexing mode OFF (no addresses configured) — indexing all chat data");
+    } else {
+        info!(
+            "Personal indexing mode ON — restricting chat storage to {} address(es)",
+            addrs.len()
+        );
+    }
+    indexer_actors::set_personal_addresses(addrs);
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -59,6 +111,8 @@ async fn main() -> anyhow::Result<()> {
     let _g = init_logs(&context)?;
 
     info!("Using DB Path: {}", context.db_path.to_string_lossy());
+
+    load_personal_addresses();
 
     let config = Config::new(context.clone().db_path).max_write_buffer_size(512 * 1024 * 1024);
     let tx_keyspace = config.open_transactional()?;
@@ -79,6 +133,13 @@ async fn main() -> anyhow::Result<()> {
     let tx_id_to_payment_partition = TxIdToPaymentPartition::new(&tx_keyspace)?;
     let self_stash_by_owner_partition = SelfStashByOwnerPartition::new(&tx_keyspace)?;
     let tx_id_to_self_stash_partition = TxIdToSelfStashPartition::new(&tx_keyspace)?;
+    let group_message_by_blinded_group_id_partition =
+        GroupMessageByBlindedGroupIdPartition::new(&tx_keyspace)?;
+    let tx_id_to_group_message_partition = TxIdToGroupMessagePartition::new(&tx_keyspace)?;
+    let group_sender_binding_partition = GroupSenderBindingPartition::new(&tx_keyspace)?;
+    let group_control_by_sender_partition = GroupControlBySenderPartition::new(&tx_keyspace)?;
+    let group_control_by_recipient_partition = GroupControlByRecipientPartition::new(&tx_keyspace)?;
+    let tx_id_to_group_control_partition = TxIdToGroupControlPartition::new(&tx_keyspace)?;
     let tx_id_to_acceptance_partition = TxIDToAcceptancePartition::new(&tx_keyspace)?;
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
     let acceptance_to_tx_id_partition = AcceptingBlockToTxIDPartition::new(&tx_keyspace)?;
@@ -87,11 +148,17 @@ async fn main() -> anyhow::Result<()> {
     let payment_by_sender_partition = PaymentBySenderPartition::new(&tx_keyspace)?;
     let block_gaps_partition = BlockGapsPartition::new(&tx_keyspace)?;
     let block_daa_index_partition = DaaIndexPartition::new(&tx_keyspace)?;
+    let device_registration_partition = DeviceRegistrationPartition::new(&tx_keyspace)?;
+    let watched_address_partition = WatchedAddressPartition::new(&tx_keyspace)?;
+    let watched_group_id_partition = WatchedGroupIdPartition::new(&tx_keyspace)?;
+    let primary_address_partition = PrimaryAddressPartition::new(&tx_keyspace)?;
 
     let gaps = block_gaps_partition
         .get_all_gaps()
         .collect::<Result<Vec<_>, _>>()?;
     print_gaps(&gaps);
+
+    let push_registered_devices = device_registration_partition.approximate_len() as u64;
 
     let metrics = create_shared_metrics_from_snapshot(IndexerMetricsSnapshot {
         handshakes_by_sender: handshake_by_sender_partition.approximate_len() as u64,
@@ -99,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
         payments_by_sender: payment_by_sender_partition.approximate_len() as u64,
         uniq_payments_by_receiver: tx_id_to_payment_partition.approximate_len() as u64,
         contextual_messages: contextual_message_partition.len()? as u64,
+        group_messages: group_message_by_blinded_group_id_partition.approximate_len() as u64,
+        group_controls: tx_id_to_group_control_partition.approximate_len() as u64,
         blocks_processed: block_compact_header_partition.len()? as u64,
         latest_block: metadata_partition
             .get_latest_block_cursor_rtx(&tx_keyspace.read_tx())?
@@ -112,7 +181,44 @@ async fn main() -> anyhow::Result<()> {
         unknown_sender_entries: pending_sender_resolution_partition.len()? as u64,
         resolved_senders: 0,
         pruned_blocks: 0,
+        push_registered_devices,
+        push_register_calls_total: 0,
+        push_update_calls_total: 0,
+        push_unregister_calls_total: 0,
+        push_fast_path_skips_total: 0,
+        push_events_total: 0,
+        push_tokens_looked_up_total: 0,
+        push_filtered_alias_total: 0,
+        push_filtered_primary_total: 0,
+        push_dedup_dropped_total: 0,
+        push_sent_ok_total: 0,
+        push_send_failed_total: 0,
+        push_unregistered_removed_total: 0,
+        push_invalid_token_total: 0,
+        db_read_ops_total: 0,
+        db_write_ops_total: 0,
+        db_read_time_ms_total: 0,
+        db_write_time_ms_total: 0,
+        db_commit_conflicts_total: 0,
+        db_errors_total: 0,
     });
+
+    let push_registry = PushRegistry::new(
+        tx_keyspace.clone(),
+        device_registration_partition,
+        watched_address_partition,
+        watched_group_id_partition,
+        primary_address_partition,
+        metrics.clone(),
+    );
+    let (push_registry_actor, push_registry) =
+        PushRegistryActor::new(push_registry, PUSH_REGISTRY_COMMAND_CAPACITY);
+    let _push_registry_actor_handle = std::thread::Builder::new()
+        .name("push-registry".to_string())
+        .spawn(move || push_registry_actor.process())?;
+    let (push_tx, push_rx) = flume::bounded(2048);
+    let push_dispatcher = PushDispatcher::new(push_rx, push_registry.clone(), &context);
+    let _push_handle = tokio::spawn(push_dispatcher.run());
     let (block_intake_tx, block_intake_rx) = flume::bounded(4096);
     let (vcc_intake_tx, vcc_intake_rx) = flume::bounded(4096);
     let (gap_result_tx, gap_result_rx) = flume::bounded(1024);
@@ -152,8 +258,17 @@ async fn main() -> anyhow::Result<()> {
         .self_stash_by_owner_partition(self_stash_by_owner_partition.clone())
         .tx_id_to_self_stash_partition(tx_id_to_self_stash_partition.clone())
         .tx_id_to_payment_partition(tx_id_to_payment_partition.clone())
+        .group_message_by_blinded_group_id_partition(
+            group_message_by_blinded_group_id_partition.clone(),
+        )
+        .tx_id_to_group_message_partition(tx_id_to_group_message_partition.clone())
+        .group_sender_binding_partition(group_sender_binding_partition.clone())
+        .group_control_by_sender_partition(group_control_by_sender_partition.clone())
+        .group_control_by_recipient_partition(group_control_by_recipient_partition.clone())
+        .tx_id_to_group_control_partition(tx_id_to_group_control_partition.clone())
         .tx_id_to_acceptance_partition(tx_id_to_acceptance_partition.clone())
         .shared_metrics(metrics.clone())
+        .push_tx(push_tx.clone())
         .build();
     let mut virtual_processor = VirtualProcessor::builder()
         .synced_capacity(3_000_000)
@@ -173,7 +288,20 @@ async fn main() -> anyhow::Result<()> {
         .payment_by_receiver_partition(payment_by_receiver_partition.clone())
         .payment_by_sender_partition(payment_by_sender_partition.clone())
         .self_stash_by_owner_partition(self_stash_by_owner_partition.clone())
+        .tx_id_to_payment_partition(tx_id_to_payment_partition.clone())
+        .tx_id_to_handshake_partition(tx_id_to_handshake_partition.clone())
+        .tx_id_to_contextual_message_partition(tx_id_to_contextual_message_partition.clone())
+        .tx_id_to_self_stash_partition(tx_id_to_self_stash_partition.clone())
+        .group_message_by_blinded_group_id_partition(
+            group_message_by_blinded_group_id_partition.clone(),
+        )
+        .tx_id_to_group_message_partition(tx_id_to_group_message_partition.clone())
+        .group_sender_binding_partition(group_sender_binding_partition)
+        .group_control_by_sender_partition(group_control_by_sender_partition.clone())
+        .group_control_by_recipient_partition(group_control_by_recipient_partition.clone())
+        .tx_id_to_group_control_partition(tx_id_to_group_control_partition.clone())
         .runtime(tokio::runtime::Handle::current())
+        .push_tx(push_tx.clone())
         .build();
 
     let mut ticker = Ticker::new(
@@ -243,14 +371,24 @@ async fn main() -> anyhow::Result<()> {
         tx_id_to_payment_partition,
         self_stash_by_owner_partition,
         tx_id_to_self_stash_partition,
+        group_message_by_blinded_group_id_partition,
+        tx_id_to_group_message_partition,
+        group_control_by_sender_partition,
+        group_control_by_recipient_partition,
+        tx_id_to_group_control_partition,
         metrics.clone(),
+        api::v1::push::PushApi::new(
+            push_registry.clone(),
+            context.network_type,
+            context.config.push_auth_mode,
+            context.config.apns_team_id.clone(),
+            context.config.apns_topic.clone(),
+        ),
         context.clone(),
     );
     let (api_shutdown_tx, api_shutdown_rx) = tokio::sync::mpsc::channel(2);
-    // API bind is configurable (KaChat Indexer fork) so it can share a host with the KaPosts
-    // stack without colliding on :8080. Defaults to the upstream 0.0.0.0:8080. Leaked to
-    // &'static str because serve() borrows it into the spawned ('static) task, matching the
-    // original string-literal lifetime.
+    // API bind is configurable (KaChat Indexer fork) so it can share a host without colliding
+    // on :8080. Defaults to the upstream 0.0.0.0:8080. Leaked to &'static for the spawned task.
     let api_bind: &'static str = Box::leak(
         std::env::var("KASIA_API_BIND")
             .unwrap_or_else(|_| "0.0.0.0:8080".to_string())

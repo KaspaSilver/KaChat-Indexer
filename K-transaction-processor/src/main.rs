@@ -80,6 +80,29 @@ struct Args {
     broadcast_retention_days: u64,
 }
 
+/// Decode a kaspa address to its x-only pubkey as lowercase hex (64 chars) for personal-mode
+/// operator matching. Returns None for blank/invalid/non-pubkey input.
+fn operator_address_to_xonly(token: &str) -> Option<String> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    match kaspa_addresses::Address::try_from(t.to_string()) {
+        Ok(addr) if addr.payload.len() == 32 => Some(hex::encode(addr.payload)),
+        Ok(addr) => {
+            tracing::warn!(
+                "Personal mode: address '{t}' has a {}-byte payload (not an x-only pubkey), skipping",
+                addr.payload.len()
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Personal mode: could not decode operator address '{t}': {e}");
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing with default INFO level
@@ -175,6 +198,59 @@ async fn main() -> Result<()> {
             .execute(&heartbeat_pool)
             .await;
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+
+    // Feature-flag refresher: honor the admin dashboard's indexing toggles. Reads the
+    // `feature_kaposts` / `feature_broadcasts` keys from k_vars every 15s and flips the runtime
+    // switches the processor consults per transaction. Absent key = default ON.
+    let flags_pool = database.pool().clone();
+    let _flags_handle = tokio::spawn(async move {
+        use sqlx::Row;
+        loop {
+            if let Ok(rows) = sqlx::query(
+                "SELECT key, value FROM k_vars WHERE key IN ('feature_kaposts', 'feature_broadcasts', 'kaposts_operator_addresses')",
+            )
+            .fetch_all(&flags_pool)
+            .await
+            {
+                for row in &rows {
+                    let key: String = row.get("key");
+                    let value: String = row.get("value");
+                    match key.as_str() {
+                        "feature_kaposts" => k_protocol::FEATURE_KAPOSTS.store(
+                            value.trim().to_lowercase() != "off",
+                            std::sync::atomic::Ordering::Relaxed,
+                        ),
+                        "feature_broadcasts" => k_protocol::FEATURE_BROADCASTS.store(
+                            value.trim().to_lowercase() != "off",
+                            std::sync::atomic::Ordering::Relaxed,
+                        ),
+                        "kaposts_operator_addresses" => {
+                            // Decode each kaspa address to its x-only pubkey (hex) for matching.
+                            let ops: Vec<String> = value
+                                .split(['\n', '\r', ',', ' ', '\t'])
+                                .filter_map(operator_address_to_xonly)
+                                .collect();
+                            k_protocol::set_kaposts_operators(ops);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // KaPosts personal-mode block/mute denylist (author pubkeys to never store).
+            if let Ok(rows) =
+                sqlx::query("SELECT encode(pubkey, 'hex') AS pk FROM kachat_kaposts_denylist")
+                    .fetch_all(&flags_pool)
+                    .await
+            {
+                let list: Vec<String> = rows
+                    .iter()
+                    .map(|r| r.get::<String, _>("pk").to_lowercase())
+                    .collect();
+                k_protocol::set_kaposts_denylist(list);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }
     });
 

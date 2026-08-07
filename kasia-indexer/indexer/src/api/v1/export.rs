@@ -24,6 +24,13 @@ pub const EXPORT_PARTITIONS: &[&str] = &[
     "tx_id_to_payment",
     "self_stash_by_owner",
     "tx-id-to-self-stash",
+    // Group chat partitions (added with the group+push branch).
+    "group_message_by_blinded_group_id",
+    "tx-id-to-group-message",
+    "group_sender_binding",
+    "group_control_by_sender",
+    "group_control_by_recipient",
+    "tx-id-to-group-control",
 ];
 
 #[derive(Clone)]
@@ -139,6 +146,45 @@ pub async fn import_file(State(state): State<ExportApi>, body: Bytes) -> impl In
         )
             .into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"import failed\"}").into_response(),
+    }
+}
+
+/// POST /personal/purge-all — wipe every stored chat record from all message partitions.
+/// Used by the admin dashboard's personal-mode purge: clear the shared store, then let
+/// personal mode re-accumulate only the operator's own data (and backfill via import-by-address).
+pub async fn purge_all(State(state): State<ExportApi>) -> impl IntoResponse {
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        let mut removed = 0usize;
+        for name in EXPORT_PARTITIONS {
+            let part = state
+                .tx_keyspace
+                .open_partition(name, PartitionCreateOptions::default())?;
+            let keys: Vec<Vec<u8>> = {
+                let rtx = state.tx_keyspace.read_tx();
+                rtx.iter(&part)
+                    .filter_map(|kv| kv.ok().map(|(k, _)| k.to_vec()))
+                    .collect()
+            };
+            let mut wtx = state.tx_keyspace.write_tx()?;
+            for k in keys {
+                wtx.remove(&part, k);
+                removed += 1;
+            }
+            if wtx.commit()?.is_err() {
+                anyhow::bail!("commit conflict during purge");
+            }
+        }
+        Ok(removed)
+    })
+    .await;
+
+    match res {
+        Ok(Ok(removed)) => (
+            StatusCode::OK,
+            format!("{{\"removed\":{removed}}}"),
+        )
+            .into_response(),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"purge failed\"}").into_response(),
     }
 }
 

@@ -64,7 +64,7 @@ with:
 
 #### Payment (tx sent to someone's address)
 
-`ciph_msg:1:payment:{{SealedPayment_as_json_string_as_hex}}`
+`ciph_msg:1:pay:{{SealedPayment_as_json_string_as_hex}}` or `ciph_msg:1:payment:{{SealedPayment_as_json_string_as_hex}}`
 
 with:
 
@@ -85,3 +85,20 @@ The encrypted `part` is a JSON string of the following object:
 ### Limitations
 
 - **Handshake and Message Differentiation**: The current protocol does not differentiate between handshakes and messages. Both are represented as `SealedMessageOrSealedHandshake` in the `SealedOperation` enum. This limitation means that the deserializer cannot distinguish between handshakes and messages based on the payload alone.
+
+### Group chat
+
+Group messages use:
+
+`ciph_msg:1:gcomm:{blinded_group_id}:{epoch}:{sender_id}:{sender_pub}:{msg_id}:{ciphertext}:{signature}`
+
+Legacy group control remains supported:
+
+`ciph_msg:1:gctl:{encrypted_payload}`
+
+New clients should address group control to a recipient:
+
+`ciph_msg:1:gctl:{recipient_xonly_pubkey}:{encrypted_payload}`
+
+See `../../docs/GROUP_CHAT_API.md` for field validation, HTTP APIs, compatibility, and client
+integration details.

@@ -4,6 +4,7 @@ use crate::BlockGap;
 use crate::block_gap_filler::BlockGapFiller;
 use crate::data_source::Command;
 use crate::metrics::SharedMetrics;
+use crate::push::{PushEvent, PushEventKind, parse_self_stash_alias};
 use crate::util::{ToHex, ToHex64};
 use crate::virtual_chain_processor::CompactHeader;
 use fjall::{TxKeyspace, WriteTransaction};
@@ -13,6 +14,14 @@ use indexer_db::headers::daa_index::DaaIndexPartition;
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderKey, ContextualMessageBySenderPartition,
     TxIdToContextualMessagePartition,
+};
+use indexer_db::messages::group_control::{
+    GroupControlByRecipientPartition, GroupControlBySenderPartition, GroupControlKeyByRecipient,
+    GroupControlKeyBySender, TxIdToGroupControlPartition,
+};
+use indexer_db::messages::group_message::{
+    BLINDED_GROUP_ID_LEN, GroupMessageByBlindedGroupIdPartition, GroupMessageKeyByBlindedGroupId,
+    GroupSenderBindingPartition, TxIdToGroupMessagePartition,
 };
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, HandshakeKeyByReceiver,
@@ -31,12 +40,12 @@ use indexer_db::processing::tx_id_to_acceptance::{
 };
 use indexer_db::{AddressPayload, IntoBytes, PartitionId};
 use kaspa_consensus_core::tx::Transaction;
-use kaspa_rpc_core::{RpcBlock, RpcHeader, RpcTransaction, RpcTransactionId};
+use kaspa_rpc_core::{RpcBlock, RpcHeader, RpcTransaction, RpcTransactionId, RpcTransactionOutput};
 pub use message::*;
 use protocol::operation::deserializer::parse_sealed_operation;
 use protocol::operation::{
-    SealedContextualMessageV1, SealedHandshakeV2, SealedMessageOrSealedHandshakeVNone,
-    SealedOperation, SealedPaymentV1, SealedSelfStashV1,
+    SealedContextualMessageV1, SealedGroupControlV1, SealedGroupMessageV1, SealedHandshakeV2,
+    SealedMessageOrSealedHandshakeVNone, SealedOperation, SealedPaymentV1, SealedSelfStashV1,
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -66,8 +75,15 @@ pub struct BlockProcessor {
     payment_by_receiver_partition: PaymentByReceiverPartition,
     payment_by_sender_partition: PaymentBySenderPartition,
     tx_id_to_payment_partition: TxIdToPaymentPartition,
+    group_message_by_blinded_group_id_partition: GroupMessageByBlindedGroupIdPartition,
+    tx_id_to_group_message_partition: TxIdToGroupMessagePartition,
+    group_sender_binding_partition: GroupSenderBindingPartition,
+    group_control_by_sender_partition: GroupControlBySenderPartition,
+    group_control_by_recipient_partition: GroupControlByRecipientPartition,
+    tx_id_to_group_control_partition: TxIdToGroupControlPartition,
     tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
     shared_metrics: SharedMetrics,
+    push_tx: Option<flume::Sender<PushEvent>>,
     #[builder(default)]
     gaps_filling_in_progress: usize,
 }
@@ -339,6 +355,14 @@ impl BlockProcessor {
         Ok(())
     }
 
+    fn emit_push(&self, event: PushEvent) {
+        if let Some(push_tx) = &self.push_tx
+            && let Err(err) = push_tx.try_send(event)
+        {
+            warn!(?err, "Dropping push event; queue is full");
+        }
+    }
+
     fn handle_transaction(
         &self,
         wtx: &mut WriteTransaction,
@@ -358,13 +382,6 @@ impl BlockProcessor {
             return Ok(());
         };
 
-        let (amount, receiver) = tx
-            .outputs
-            .first()
-            .map(|o| AddressPayload::try_from(&o.script_public_key).map(|addr| (o.value, addr)))
-            .transpose()?
-            .unwrap_or_default();
-        debug!(receiver=?receiver, "Handling transaction");
         let sender_outpoint = tx.inputs.first().unwrap().previous_outpoint;
         let sender = if sender_outpoint.index == 0
             && let Some(acceptance_key) = self
@@ -375,7 +392,15 @@ impl BlockProcessor {
         } else {
             None
         };
+        let (amount, receiver) = resolve_primary_receiver(&tx.outputs, sender)?;
+        debug!(receiver=?receiver, "Handling transaction");
         let mut entries: SmallVec<[_; 1]> = SmallVec::new();
+        // Personal indexing mode: when a personal-address allowlist is configured, only store
+        // chat content for transactions that involve one of those addresses. The acceptance
+        // record below is still written unconditionally so sender resolution for OTHER (personal)
+        // transactions that spend these outputs keeps working.
+        let store_content = crate::personal_allows(sender.as_ref(), &receiver);
+        if store_content {
         iter::once(op).try_for_each(|op| match op {
             SealedOperation::SealedMessageOrSealedHandshakeVNone(hk) => {
                 self.handle_handshake(&mut entries, wtx, block_header, tx_id, hk, receiver, sender)
@@ -423,7 +448,14 @@ impl BlockProcessor {
                 );
                 Ok(())
             }
+            SealedOperation::GroupMessageV1(gm) => {
+                self.handle_group_message(&mut entries, wtx, block_header, tx_id, gm, sender)
+            }
+            SealedOperation::GroupControlV1(gc) => {
+                self.handle_group_control(&mut entries, wtx, sender, block_header, tx_id, gc)
+            }
         })?;
+        }
         self.tx_id_to_acceptance_partition.insert_wtx(
             wtx,
             &AcceptanceKey {
@@ -528,6 +560,20 @@ impl BlockProcessor {
             trace!(sender = ?sender, "Inserting handshake by sender");
             self.handshake_by_sender_partition
                 .insert_wtx(wtx, &by_sender_key);
+            self.emit_push(PushEvent {
+                kind: PushEventKind::Handshake,
+                watched_address: receiver,
+                sender,
+                receiver,
+                alias: None,
+                tx_id: tx_id.as_bytes(),
+                amount: None,
+                payload: Some(String::from_utf8_lossy(op.sealed_hex).to_string()),
+                timestamp: block.timestamp,
+                daa_score: block.daa_score,
+                blinded_group_id: None,
+                group_control_recipient: None,
+            });
         } else {
             trace!("No sender resolved for handshake");
             entries.push(InsertionEntry {
@@ -578,6 +624,20 @@ impl BlockProcessor {
             trace!(sender = ?sender, "Inserting handshake v2 by sender");
             self.handshake_by_sender_partition
                 .insert_wtx(wtx, &by_sender_key);
+            self.emit_push(PushEvent {
+                kind: PushEventKind::Handshake,
+                watched_address: receiver,
+                sender,
+                receiver,
+                alias: None,
+                tx_id: tx_id.as_bytes(),
+                amount: None,
+                payload: Some(String::from_utf8_lossy(op.sealed_hex).to_string()),
+                timestamp: block.timestamp,
+                daa_score: block.daa_score,
+                blinded_group_id: None,
+                group_control_recipient: None,
+            });
         } else {
             trace!("No sender resolved for handshake v2");
             entries.push(InsertionEntry {
@@ -605,6 +665,7 @@ impl BlockProcessor {
         receiver: AddressPayload,
     ) {
         debug!(%tx_id, sender = ?sender, receiver = ?receiver, alias = %cm.alias.to_hex(), "Handling contextual message");
+        let alias_string = String::from_utf8_lossy(cm.alias).to_string();
         let mut alias = [0u8; 16];
         let len = cm.alias.len().min(16);
         alias[..len].copy_from_slice(&cm.alias[..len]);
@@ -622,6 +683,22 @@ impl BlockProcessor {
         if sender.is_some() {
             self.contextual_message_by_sender_partition
                 .insert(wtx, &cmk);
+            if let Some(sender) = sender {
+                self.emit_push(PushEvent {
+                    kind: PushEventKind::Contextual,
+                    watched_address: sender,
+                    sender,
+                    receiver,
+                    alias: Some(alias_string),
+                    tx_id: tx_id.as_bytes(),
+                    amount: None,
+                    payload: Some(String::from_utf8_lossy(cm.sealed_hex).to_string()),
+                    timestamp: header.timestamp,
+                    daa_score: header.daa_score,
+                    blinded_group_id: None,
+                    group_control_recipient: None,
+                });
+            }
         } else {
             entries.push(InsertionEntry {
                 partition_id: PartitionId::ContextualMessageBySender,
@@ -666,6 +743,24 @@ impl BlockProcessor {
             trace!(sender = ?sender, "Inserting payment by sender");
             self.payment_by_sender_partition
                 .insert_wtx(wtx, &by_sender_key);
+            if sender != receiver {
+                self.emit_push(PushEvent {
+                    kind: PushEventKind::Payment,
+                    watched_address: receiver,
+                    sender,
+                    receiver,
+                    alias: None,
+                    tx_id: tx_id.as_bytes(),
+                    amount: Some(amount),
+                    payload: Some(String::from_utf8_lossy(pm.sealed_hex).to_string()),
+                    timestamp: header.timestamp,
+                    daa_score: header.daa_score,
+                    blinded_group_id: None,
+                    group_control_recipient: None,
+                });
+            } else {
+                trace!(sender = ?sender, "Skipping payment push: receiver matches sender");
+            }
         } else {
             trace!("No sender resolved for payment");
             entries.push(InsertionEntry {
@@ -692,6 +787,7 @@ impl BlockProcessor {
         sss: SealedSelfStashV1,
         _receiver: AddressPayload,
     ) {
+        let self_stash_alias = sss.key.and_then(parse_self_stash_alias);
         self.tx_id_to_self_stash_partition
             .insert_wtx(wtx, tx_id.as_ref(), sss.sealed_hex);
         let key = SelfStashKeyByOwner {
@@ -704,6 +800,22 @@ impl BlockProcessor {
         };
         if sender.is_some() {
             self.self_stash_by_owner_partition.insert_wtx(wtx, &key);
+            if let Some(sender) = sender {
+                self.emit_push(PushEvent {
+                    kind: PushEventKind::SelfStash,
+                    watched_address: sender,
+                    sender,
+                    receiver: AddressPayload::default(),
+                    alias: self_stash_alias,
+                    tx_id: tx_id.as_bytes(),
+                    amount: None,
+                    payload: Some(String::from_utf8_lossy(sss.sealed_hex).to_string()),
+                    timestamp: block_header.timestamp,
+                    daa_score: block_header.daa_score,
+                    blinded_group_id: None,
+                    group_control_recipient: None,
+                });
+            }
         } else {
             entries.push(InsertionEntry {
                 partition_id: PartitionId::SelfStashByOwner,
@@ -712,6 +824,179 @@ impl BlockProcessor {
             });
         }
     }
+
+    fn handle_group_message<const ENTRIES_LEN: usize, const KEY_SIZE: usize>(
+        &self,
+        entries: &mut SmallVec<[InsertionEntry<KEY_SIZE>; ENTRIES_LEN]>,
+        wtx: &mut WriteTransaction,
+        block: &RpcHeader,
+        tx_id: RpcTransactionId,
+        op: SealedGroupMessageV1,
+        sender: Option<AddressPayload>,
+    ) -> anyhow::Result<()> {
+        debug!(%tx_id, sender = ?sender, "Handling group message transaction");
+        let blinded_group_id = decode_fixed_hex::<BLINDED_GROUP_ID_LEN>(op.blinded_group_id)?;
+        let sender_pubkey = decode_fixed_hex::<32>(op.sender_pub)?;
+        let key = GroupMessageKeyByBlindedGroupId {
+            blinded_group_id,
+            block_time: block.timestamp.into(),
+            block_hash: block.hash.as_bytes(),
+            version: 1,
+            tx_id: tx_id.as_bytes(),
+        };
+
+        if let Some(sender) = sender {
+            if !sender.matches_xonly_pubkey(&sender_pubkey) {
+                warn!(%tx_id, "Rejecting group message: embedded sender_pub does not match transaction sender");
+                return Ok(());
+            }
+            if !self.group_sender_binding_partition.check_or_bind_wtx(
+                wtx,
+                &blinded_group_id,
+                &sender_pubkey,
+            )? {
+                warn!(%tx_id, "Rejecting group message: blinded group id is already bound to another sender");
+                return Ok(());
+            }
+        }
+
+        self.tx_id_to_group_message_partition
+            .insert_wtx(wtx, tx_id.as_ref(), op.sealed_hex);
+        self.group_message_by_blinded_group_id_partition
+            .insert_wtx(wtx, &key, sender)?;
+        if let Some(sender) = sender {
+            self.emit_push(PushEvent {
+                kind: PushEventKind::GroupMessage,
+                watched_address: AddressPayload::default(),
+                sender,
+                receiver: AddressPayload::default(),
+                alias: None,
+                tx_id: tx_id.as_bytes(),
+                amount: None,
+                payload: Some(String::from_utf8_lossy(op.sealed_hex).to_string()),
+                timestamp: block.timestamp,
+                daa_score: block.daa_score,
+                blinded_group_id: Some(blinded_group_id),
+                group_control_recipient: None,
+            });
+        } else {
+            trace!("No sender resolved for group message");
+            entries.push(InsertionEntry {
+                partition_id: PartitionId::GroupMessageByBlindedGroupId,
+                action: Action::UpdateValueSender,
+                partition_key: SmallVec::from_slice(key.as_bytes()),
+            });
+        }
+        Ok(())
+    }
+
+    fn handle_group_control<const ENTRIES_LEN: usize, const KEY_SIZE: usize>(
+        &self,
+        entries: &mut SmallVec<[InsertionEntry<KEY_SIZE>; ENTRIES_LEN]>,
+        wtx: &mut WriteTransaction,
+        sender: Option<AddressPayload>,
+        block_header: &RpcHeader,
+        tx_id: RpcTransactionId,
+        gc: SealedGroupControlV1,
+    ) -> anyhow::Result<()> {
+        debug!(%tx_id, sender = ?sender, "Handling group control transaction");
+        let recipient = gc
+            .recipient_pubkey
+            .map(decode_fixed_hex::<32>)
+            .transpose()?
+            .map(AddressPayload::from_xonly_pubkey);
+        self.tx_id_to_group_control_partition
+            .insert_wtx(wtx, tx_id.as_ref(), gc.encrypted_payload);
+        let key = GroupControlKeyBySender {
+            sender: sender.unwrap_or_default(),
+            block_time: block_header.timestamp.into(),
+            block_hash: block_header.hash.as_bytes(),
+            version: 1,
+            tx_id: tx_id.as_bytes(),
+            recipient: recipient.unwrap_or_default(),
+        };
+        if let Some(recipient) = recipient {
+            let recipient_key = GroupControlKeyByRecipient {
+                recipient,
+                block_time: key.block_time,
+                block_hash: key.block_hash,
+                version: key.version,
+                tx_id: key.tx_id,
+            };
+            self.group_control_by_recipient_partition
+                .insert_wtx(wtx, &recipient_key, sender)?;
+            if sender.is_none() {
+                entries.push(InsertionEntry {
+                    partition_id: PartitionId::GroupControlByRecipient,
+                    action: Action::UpdateValueSender,
+                    partition_key: SmallVec::from_slice(recipient_key.as_bytes()),
+                });
+            }
+        }
+
+        if let Some(sender) = sender {
+            self.group_control_by_sender_partition.insert_wtx(wtx, &key);
+            self.emit_push(PushEvent {
+                kind: PushEventKind::GroupControl,
+                watched_address: sender,
+                sender,
+                receiver: recipient.unwrap_or_default(),
+                alias: None,
+                tx_id: tx_id.as_bytes(),
+                amount: None,
+                payload: Some(String::from_utf8_lossy(gc.encrypted_payload).to_string()),
+                timestamp: block_header.timestamp,
+                daa_score: block_header.daa_score,
+                blinded_group_id: None,
+                group_control_recipient: recipient,
+            });
+        } else {
+            trace!("No sender resolved for group control");
+            entries.push(InsertionEntry {
+                partition_id: PartitionId::GroupControlBySender,
+                action: Action::InsertByKeySender,
+                partition_key: SmallVec::from_slice(key.as_bytes()),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn decode_fixed_hex<const N: usize>(hex_bytes: &[u8]) -> anyhow::Result<[u8; N]> {
+    if hex_bytes.len() != N * 2 {
+        anyhow::bail!(
+            "unexpected hex field length: expected {}, got {}",
+            N * 2,
+            hex_bytes.len()
+        );
+    }
+    let mut out = [0u8; N];
+    faster_hex::hex_decode(hex_bytes, &mut out)?;
+    Ok(out)
+}
+
+fn resolve_primary_receiver(
+    outputs: &[RpcTransactionOutput],
+    sender: Option<AddressPayload>,
+) -> anyhow::Result<(u64, AddressPayload)> {
+    let mut parsed = Vec::new();
+    for output in outputs {
+        if let Ok(addr) = AddressPayload::try_from(&output.script_public_key) {
+            parsed.push((output.value, addr));
+        }
+    }
+
+    if parsed.is_empty() {
+        return Ok((0, AddressPayload::default()));
+    }
+
+    if let Some(sender_addr) = sender
+        && let Some((amount, addr)) = parsed.iter().find(|(_, addr)| *addr != sender_addr)
+    {
+        return Ok((*amount, *addr));
+    }
+
+    Ok(parsed[0])
 }
 
 impl Drop for BlockProcessor {

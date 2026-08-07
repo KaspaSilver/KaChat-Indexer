@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use indexer_actors::metrics::SharedMetrics;
 use indexer_db::AddressPayload;
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderKey, ContextualMessageBySenderPartition,
@@ -26,6 +27,7 @@ pub struct ContextualMessageApi {
     contextual_message_by_sender_partition: ContextualMessageBySenderPartition,
     tx_id_to_contextual_message_partition: TxIdToContextualMessagePartition,
     tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
+    metrics: SharedMetrics,
     context: IndexerContext,
 }
 
@@ -35,6 +37,7 @@ impl ContextualMessageApi {
         contextual_message_by_sender_partition: ContextualMessageBySenderPartition,
         tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
         tx_id_to_contextual_message_partition: TxIdToContextualMessagePartition,
+        metrics: SharedMetrics,
         context: IndexerContext,
     ) -> Self {
         Self {
@@ -42,6 +45,7 @@ impl ContextualMessageApi {
             contextual_message_by_sender_partition,
             tx_id_to_contextual_message_partition,
             tx_id_to_acceptance_partition,
+            metrics,
             context,
         }
     }
@@ -53,42 +57,15 @@ impl ContextualMessageApi {
     }
 }
 
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct ContextualMessagePaginationParams {
-    pub limit: Option<usize>,
-    pub block_time: Option<u64>,
-    pub address: String,
-    pub alias: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ContextualMessageResponse {
-    pub tx_id: String,
-    pub sender: String,
-    pub alias: String,
-    pub block_time: u64,
-    pub accepting_block: Option<String>,
-    pub accepting_daa_score: Option<u64>,
-    pub message_payload: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ErrorResponse {
-    pub error: String,
-}
-
-// --- KaChat Indexer fork: contextual-message import (chat-history backfill) ---
-// The admin importer pages a block explorer for an address and POSTs the resulting
-// transactions here; we parse each on-chain payload and store the contextual (DM) messages.
-// Contextual messages are self-sends, so sender == receiver == the first output's address.
+// --- KaChat fork: contextual-message import (explorer-sourced DM backfill) ---
 
 #[derive(Debug, Deserialize)]
 pub struct ImportTx {
-    pub tx_id: String,      // 64-hex transaction id
-    pub payload: String,    // hex of the on-chain payload
-    pub block_time: u64,    // milliseconds
-    pub block_hash: String, // 64-hex containing block hash
-    pub address: String,    // kaspa: address of the author (first output)
+    pub tx_id: String,
+    pub payload: String,
+    pub block_time: u64,
+    pub block_hash: String,
+    pub address: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,7 +74,7 @@ pub struct ImportResult {
     pub skipped: usize,
 }
 
-fn hex_to_array<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
+fn import_hex_array<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
     if s.len() != N * 2 {
         anyhow::bail!("expected {} hex chars, got {}", N * 2, s.len());
     }
@@ -106,9 +83,9 @@ fn hex_to_array<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
     Ok(out)
 }
 
-fn hex_to_vec(s: &str) -> anyhow::Result<Vec<u8>> {
+fn import_hex_vec(s: &str) -> anyhow::Result<Vec<u8>> {
     if s.len() % 2 != 0 {
-        anyhow::bail!("odd hex length");
+        anyhow::bail!("odd hex");
     }
     let mut out = vec![0u8; s.len() / 2];
     faster_hex::hex_decode(s.as_bytes(), &mut out)?;
@@ -124,7 +101,7 @@ async fn import_contextual_messages(
         let mut skipped = 0usize;
         let mut wtx = state.tx_keyspace.write_tx()?;
         for t in &txs {
-            let Ok(payload) = hex_to_vec(&t.payload) else {
+            let Ok(payload) = import_hex_vec(&t.payload) else {
                 skipped += 1;
                 continue;
             };
@@ -145,9 +122,10 @@ async fn import_contextual_messages(
                     continue;
                 }
             };
-            let (Ok(tx_id), Ok(block_hash)) =
-                (hex_to_array::<32>(&t.tx_id), hex_to_array::<32>(&t.block_hash))
-            else {
+            let (Ok(tx_id), Ok(block_hash)) = (
+                import_hex_array::<32>(&t.tx_id),
+                import_hex_array::<32>(&t.block_hash),
+            ) else {
                 skipped += 1;
                 continue;
             };
@@ -178,14 +156,32 @@ async fn import_contextual_messages(
 
     match outcome {
         Ok(Ok(r)) => (StatusCode::OK, Json(r)).into_response(),
-        _ => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "import failed".to_string(),
-            }),
-        )
-            .into_response(),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "import failed").into_response(),
     }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ContextualMessagePaginationParams {
+    pub limit: Option<usize>,
+    pub block_time: Option<u64>,
+    pub address: String,
+    pub alias: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ContextualMessageResponse {
+    pub tx_id: String,
+    pub sender: String,
+    pub alias: String,
+    pub block_time: u64,
+    pub accepting_block: Option<String>,
+    pub accepting_daa_score: Option<u64>,
+    pub message_payload: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
 }
 
 #[utoipa::path(
@@ -256,6 +252,8 @@ async fn get_contextual_messages_by_sender(
 
     let alias = params.alias;
 
+    let metrics = state.metrics.clone();
+    let db_read_started = std::time::Instant::now();
     let result = spawn_blocking(move || {
         let rtx = state.tx_keyspace.read_tx();
 
@@ -313,6 +311,13 @@ async fn get_contextual_messages_by_sender(
             .flatten()
     })
     .await;
+    metrics.increment_db_read_ops_total(1);
+    metrics.increment_db_read_time_ms_total(
+        db_read_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    );
+    if result.as_ref().is_err() || matches!(&result, Ok(Err(_))) {
+        metrics.increment_db_errors_total();
+    }
 
     match result {
         Ok(Ok(messages)) => Ok(Json(messages)),
