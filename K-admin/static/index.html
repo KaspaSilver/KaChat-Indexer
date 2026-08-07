@@ -165,6 +165,17 @@
       </div>
       <div id="chatImportResult" class="result" style="display:none"></div>
     </div>
+
+    <h2>Bulk export / import (file)</h2>
+    <div class="card">
+      <div class="note">Dump this indexer's <b>entire chat store</b> (handshakes, DMs, payments, self-stash) to one file, or restore from a file another indexer exported — byte-for-byte, no re-parsing. The simplest way to move all history between indexers.</div>
+      <div class="row">
+        <button class="btn ghost" id="chatExportBtn">⬇ Export all</button>
+        <input type="file" id="chatImportFile" style="display:none">
+        <button class="btn" id="chatImportFileBtn">⬆ Import file…</button>
+      </div>
+      <div id="chatFileResult" class="result" style="display:none"></div>
+    </div>
   </section>
 </main>
 
@@ -390,6 +401,22 @@ $("#chatImportBtn").onclick = async () => {
     if (!d.error) loadChat();
   } catch (e) { res.textContent = "Request failed: " + e; }
   $("#chatImportBtn").disabled = false;
+};
+
+$("#chatExportBtn").onclick = () => { window.location = "/api/chat-export"; };
+$("#chatImportFileBtn").onclick = () => $("#chatImportFile").click();
+$("#chatImportFile").onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const res = $("#chatFileResult");
+  res.style.display = "block";
+  res.textContent = `Uploading ${file.name} (${(file.size / 1048576).toFixed(1)} MB) and restoring…`;
+  try {
+    const r = await fetch("/api/chat-import-file", { method: "POST", body: file });
+    res.textContent = "Import result: " + (await r.text());
+    loadChat();
+  } catch (err) { res.textContent = "Upload failed: " + err; }
+  e.target.value = "";
 };
 
 // Poll
