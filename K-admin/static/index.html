@@ -74,7 +74,9 @@
   <button data-tab="dashboard" class="active">Dashboard</button>
   <button data-tab="kaposts">KaPosts</button>
   <button data-tab="broadcasts">Broadcasts</button>
-  <button data-tab="chat">Chat</button>
+  <button data-tab="chats">Chats</button>
+  <button data-tab="groupchats">Group chats</button>
+  <button data-tab="exportimport">Export / Import</button>
 </nav>
 <main>
   <section id="dashboard">
@@ -145,27 +147,29 @@
     <div class="note">Only <b>#kaspa</b> and <b>#kachat-bugs</b> are indexed. Content is stored verbatim (text or reply/audio JSON envelopes); the preview shows the first 200 characters.</div>
   </section>
 
-  <section id="chat" style="display:none">
-    <h2>Chat indexer (Kasia)</h2>
+  <section id="chats" style="display:none">
+    <h2>Direct chats (1:1)</h2>
     <div class="card">
       <div class="health">
         <div><span id="chatDot" class="dot"></span> <span class="big" id="chatStatus">—</span></div>
-        <div class="note">Encrypted chat — handshakes, direct messages, payments — indexed straight from the node into an embedded store, served on its own API. Metrics below are proxied live from the vendored kasia-indexer.</div>
+        <div class="note">Encrypted 1:1 messaging — handshakes, direct messages, payments — indexed straight from the node into an embedded store. Stats below are proxied live from the chat indexer.</div>
       </div>
     </div>
-    <h2>Metrics</h2>
+    <h2>Stats</h2>
     <div class="grid" id="chatGrid"><div class="card"><div class="muted">loading…</div></div></div>
+  </section>
 
-    <h2>Import chat history</h2>
+  <section id="groupchats" style="display:none">
+    <h2>Group chats</h2>
     <div class="card">
-      <div class="note">Backfill a wallet's <b>direct-message (DM) history</b> from the block explorer into this indexer — for messages older than the node's pruning window. Import your own address and your contacts' addresses to rebuild both sides of a conversation. (Contextual messages only in this pass; handshakes/payments are a follow-up.)</div>
-      <div class="row">
-        <input id="chatImportAddr" type="text" placeholder="kaspa:… address to import" />
-        <button class="btn" id="chatImportBtn">Import</button>
+      <div class="health">
+        <div><span class="dot warn"></span> <span class="big">not indexed yet</span></div>
+        <div class="note">This indexer currently covers <b>1:1 messaging only</b> (see the Chats tab). Group chats use a separate on-chain protocol and endpoints that the vendored chat indexer doesn't parse yet — so there are no group stats to show. Adding group-chat indexing (protocol parsing + storage + API) is a follow-up project.</div>
       </div>
-      <div id="chatImportResult" class="result" style="display:none"></div>
     </div>
+  </section>
 
+  <section id="exportimport" style="display:none">
     <h2>Bulk export / import (file)</h2>
     <div class="card">
       <div class="note">Dump this indexer's <b>entire chat store</b> (handshakes, DMs, payments, self-stash) to one file, or restore from a file another indexer exported — byte-for-byte, no re-parsing. The simplest way to move all history between indexers.</div>
@@ -175,6 +179,16 @@
         <button class="btn" id="chatImportFileBtn">⬆ Import file…</button>
       </div>
       <div id="chatFileResult" class="result" style="display:none"></div>
+    </div>
+
+    <h2>Import chat history (by address)</h2>
+    <div class="card">
+      <div class="note">Backfill a wallet's <b>direct-message (DM) history</b> from the block explorer into this indexer — for messages older than the node's pruning window. Import your own address and your contacts' addresses to rebuild both sides of a conversation. (Contextual messages only; handshakes/payments are a follow-up.)</div>
+      <div class="row">
+        <input id="chatImportAddr" type="text" placeholder="kaspa:… address to import" />
+        <button class="btn" id="chatImportBtn">Import</button>
+      </div>
+      <div id="chatImportResult" class="result" style="display:none"></div>
     </div>
   </section>
 </main>
@@ -212,10 +226,12 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   $("#dashboard").style.display = t === "dashboard" ? "" : "none";
   $("#kaposts").style.display = t === "kaposts" ? "" : "none";
   $("#broadcasts").style.display = t === "broadcasts" ? "" : "none";
-  $("#chat").style.display = t === "chat" ? "" : "none";
+  $("#chats").style.display = t === "chats" ? "" : "none";
+  $("#groupchats").style.display = t === "groupchats" ? "" : "none";
+  $("#exportimport").style.display = t === "exportimport" ? "" : "none";
   if (t === "kaposts") loadRecent();
   if (t === "broadcasts") loadBroadcasts();
-  if (t === "chat") loadChat();
+  if (t === "chats") loadChat();
 });
 
 async function loadHealth() {
