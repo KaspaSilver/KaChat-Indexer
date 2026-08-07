@@ -155,6 +155,16 @@
     </div>
     <h2>Metrics</h2>
     <div class="grid" id="chatGrid"><div class="card"><div class="muted">loading…</div></div></div>
+
+    <h2>Import chat history</h2>
+    <div class="card">
+      <div class="note">Backfill a wallet's <b>direct-message (DM) history</b> from the block explorer into this indexer — for messages older than the node's pruning window. Import your own address and your contacts' addresses to rebuild both sides of a conversation. (Contextual messages only in this pass; handshakes/payments are a follow-up.)</div>
+      <div class="row">
+        <input id="chatImportAddr" type="text" placeholder="kaspa:… address to import" />
+        <button class="btn" id="chatImportBtn">Import</button>
+      </div>
+      <div id="chatImportResult" class="result" style="display:none"></div>
+    </div>
   </section>
 </main>
 
@@ -361,6 +371,26 @@ async function loadServices() {
     $("#servicesGrid").innerHTML = '<div class="card"><div class="muted">failed to load</div></div>';
   }
 }
+
+$("#chatImportBtn").onclick = async () => {
+  const addr = $("#chatImportAddr").value.trim();
+  if (!addr) return;
+  const res = $("#chatImportResult");
+  res.style.display = "block";
+  res.textContent = "Importing… paging the block explorer, this can take a bit.";
+  $("#chatImportBtn").disabled = true;
+  try {
+    const d = await (await fetch("/api/chat-import", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address: addr })
+    })).json();
+    res.textContent = d.error
+      ? `Error: ${d.error}\n(scanned ${d.scanned} txs, imported ${d.imported})`
+      : `Scanned ${d.scanned} txs across ${d.pages} pages\nForwarded ${d.forwarded} message txs to the indexer\nImported ${d.imported}, skipped ${d.skipped}`;
+    if (!d.error) loadChat();
+  } catch (e) { res.textContent = "Request failed: " + e; }
+  $("#chatImportBtn").disabled = false;
+};
 
 // Poll
 loadHealth(); loadStats(); loadServices();

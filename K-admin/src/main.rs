@@ -49,6 +49,12 @@ struct Args {
     /// Webserver health URL, probed for the per-service health panel.
     #[arg(long, default_value = "http://127.0.0.1:3080/health")]
     webserver_health_url: String,
+    /// Chat indexer's contextual-message import endpoint (chat-history backfill target).
+    #[arg(long, default_value = "http://127.0.0.1:8600/contextual-messages/import")]
+    chat_import_url: String,
+    /// Block explorer base URL used to page an address's full transaction history.
+    #[arg(long, default_value = "https://api.kaspa.org")]
+    explorer_url: String,
 }
 
 #[derive(Clone)]
@@ -59,6 +65,8 @@ struct AppState {
     last_tx_sample: std::sync::Arc<std::sync::Mutex<Option<(i64, i64)>>>,
     chat_metrics_url: String,
     webserver_health_url: String,
+    chat_import_url: String,
+    explorer_url: String,
 }
 
 fn now_ms() -> i64 {
@@ -95,6 +103,8 @@ async fn main() -> anyhow::Result<()> {
         last_tx_sample: std::sync::Arc::new(std::sync::Mutex::new(None)),
         chat_metrics_url: args.chat_metrics_url.clone(),
         webserver_health_url: args.webserver_health_url.clone(),
+        chat_import_url: args.chat_import_url.clone(),
+        explorer_url: args.explorer_url.clone(),
     };
 
     let app = Router::new()
@@ -106,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/broadcasts", get(get_broadcasts))
         .route("/api/chat-metrics", get(get_chat_metrics))
         .route("/api/services", get(get_services))
+        .route("/api/chat-import", post(post_chat_import))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -526,6 +537,154 @@ async fn post_remove(
         follows,
         total,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// /api/chat-import  (backfill DM history: page a block explorer, forward to the chat indexer)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ChatImportRequest {
+    address: String,
+}
+
+#[derive(Serialize)]
+struct ChatImportResponse {
+    scanned: usize,
+    forwarded: usize,
+    imported: usize,
+    skipped: usize,
+    pages: usize,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExplorerOutput {
+    script_public_key_address: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExplorerTx {
+    transaction_id: String,
+    payload: Option<String>,
+    block_time: Option<i64>,
+    // A transaction can appear in multiple blocks, so the explorer returns an array.
+    block_hash: Option<Vec<String>>,
+    outputs: Option<Vec<ExplorerOutput>>,
+}
+
+#[derive(Serialize)]
+struct ImportTx {
+    tx_id: String,
+    payload: String,
+    block_time: u64,
+    block_hash: String,
+    address: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ImportResultDto {
+    imported: usize,
+    skipped: usize,
+}
+
+async fn post_chat_import(
+    State(state): State<AppState>,
+    Json(req): Json<ChatImportRequest>,
+) -> Json<ChatImportResponse> {
+    // "ciph_msg:" as hex — the on-chain prefix for all Kasia messaging payloads.
+    const CIPH_PREFIX: &str = "636970685f6d73673a";
+    let address = req.address.trim().to_string();
+    let mut resp = ChatImportResponse {
+        scanned: 0,
+        forwarded: 0,
+        imported: 0,
+        skipped: 0,
+        pages: 0,
+        error: None,
+    };
+    if !address.starts_with("kaspa:") {
+        resp.error = Some("address must start with kaspa:".into());
+        return Json(resp);
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            resp.error = Some("http client error".into());
+            return Json(resp);
+        }
+    };
+
+    let mut to_import: Vec<ImportTx> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let url = format!(
+            "{}/addresses/{}/full-transactions?limit=500&offset={}&resolve_previous_outpoints=no",
+            state.explorer_url, address, offset
+        );
+        let txs: Vec<ExplorerTx> = match client.get(&url).send().await {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    resp.error = Some(format!("explorer parse error: {e}"));
+                    break;
+                }
+            },
+            Err(e) => {
+                resp.error = Some(format!("explorer request error: {e}"));
+                break;
+            }
+        };
+        let n = txs.len();
+        resp.scanned += n;
+        resp.pages += 1;
+        for tx in txs {
+            let Some(payload) = tx.payload.filter(|p| p.starts_with(CIPH_PREFIX)) else {
+                continue;
+            };
+            let addr = tx
+                .outputs
+                .as_ref()
+                .and_then(|o| o.first())
+                .and_then(|o| o.script_public_key_address.clone());
+            let bh = tx.block_hash.as_ref().and_then(|v| v.first()).cloned();
+            let (Some(bt), Some(bh), Some(addr)) = (tx.block_time, bh, addr) else {
+                continue;
+            };
+            to_import.push(ImportTx {
+                tx_id: tx.transaction_id,
+                payload,
+                block_time: bt as u64,
+                block_hash: bh,
+                address: addr,
+            });
+        }
+        if n < 500 || resp.pages >= 40 {
+            break;
+        }
+        offset += 500;
+    }
+
+    resp.forwarded = to_import.len();
+    for chunk in to_import.chunks(200) {
+        match client.post(&state.chat_import_url).json(&chunk).send().await {
+            Ok(r) => {
+                let dto: ImportResultDto = r.json().await.unwrap_or_default();
+                resp.imported += dto.imported;
+                resp.skipped += dto.skipped;
+            }
+            Err(e) => {
+                resp.error = Some(format!("chat indexer import error: {e}"));
+                break;
+            }
+        }
+    }
+
+    Json(resp)
 }
 
 // ---------------------------------------------------------------------------
