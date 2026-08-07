@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     http::StatusCode,
-    response::Html,
+    response::{Html, IntoResponse},
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
@@ -55,6 +55,12 @@ struct Args {
     /// Block explorer base URL used to page an address's full transaction history.
     #[arg(long, default_value = "https://api.kaspa.org")]
     explorer_url: String,
+    /// Chat indexer export endpoint (full dump download).
+    #[arg(long, default_value = "http://127.0.0.1:8600/export")]
+    chat_export_url: String,
+    /// Chat indexer import-file endpoint (restore a dump).
+    #[arg(long, default_value = "http://127.0.0.1:8600/import-file")]
+    chat_import_file_url: String,
 }
 
 #[derive(Clone)]
@@ -67,6 +73,8 @@ struct AppState {
     webserver_health_url: String,
     chat_import_url: String,
     explorer_url: String,
+    chat_export_url: String,
+    chat_import_file_url: String,
 }
 
 fn now_ms() -> i64 {
@@ -105,6 +113,8 @@ async fn main() -> anyhow::Result<()> {
         webserver_health_url: args.webserver_health_url.clone(),
         chat_import_url: args.chat_import_url.clone(),
         explorer_url: args.explorer_url.clone(),
+        chat_export_url: args.chat_export_url.clone(),
+        chat_import_file_url: args.chat_import_file_url.clone(),
     };
 
     let app = Router::new()
@@ -117,6 +127,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/chat-metrics", get(get_chat_metrics))
         .route("/api/services", get(get_services))
         .route("/api/chat-import", post(post_chat_import))
+        .route("/api/chat-export", get(get_chat_export))
+        .route("/api/chat-import-file", post(post_chat_import_file))
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -685,6 +698,64 @@ async fn post_chat_import(
     }
 
     Json(resp)
+}
+
+// ---------------------------------------------------------------------------
+// /api/chat-export + /api/chat-import-file  (full-file dump / restore, proxied to the chat indexer)
+// ---------------------------------------------------------------------------
+
+async fn get_chat_export(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::header;
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "client error").into_response(),
+    };
+    match client.get(&state.chat_export_url).send().await {
+        Ok(r) if r.status().is_success() => {
+            let bytes = r.bytes().await.unwrap_or_default();
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"kachat-chat-export.txt\"",
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        _ => (StatusCode::BAD_GATEWAY, "chat indexer unreachable").into_response(),
+    }
+}
+
+async fn post_chat_import_file(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1200))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "client error").into_response(),
+    };
+    match client
+        .post(&state.chat_import_file_url)
+        .body(body.to_vec())
+        .send()
+        .await
+    {
+        Ok(r) => {
+            let txt = r.text().await.unwrap_or_default();
+            (StatusCode::OK, txt).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("import failed: {e}")).into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

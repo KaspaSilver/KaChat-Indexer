@@ -3,9 +3,9 @@ use crate::api::v1::handshakes::HandshakeApi;
 use crate::api::v1::payments::PaymentApi;
 use crate::api::v1::self_stash::SelfStashApi;
 use crate::context::IndexerContext;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use indexer_actors::metrics::{IndexerMetricsSnapshot, SharedMetrics};
 use indexer_db::messages::contextual_message::{
@@ -25,6 +25,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub mod contextual_messages;
+pub mod export;
 pub mod handshakes;
 pub mod payments;
 pub mod self_stash;
@@ -55,6 +56,7 @@ pub struct Api {
     contextual_message_api: ContextualMessageApi,
     payment_api: PaymentApi,
     self_stash_api: SelfStashApi,
+    export_api: export::ExportApi,
     metrics: SharedMetrics,
 }
 
@@ -76,6 +78,8 @@ impl Api {
         metrics: SharedMetrics,
         context: IndexerContext,
     ) -> Self {
+        let export_api = export::ExportApi::new(tx_keyspace.clone());
+
         let handshake_api = HandshakeApi::new(
             tx_keyspace.clone(),
             handshake_by_sender_partition,
@@ -115,6 +119,7 @@ impl Api {
             contextual_message_api,
             payment_api,
             self_stash_api,
+            export_api,
             metrics,
         }
     }
@@ -159,6 +164,16 @@ impl Api {
                 "/metrics",
                 get(get_metrics).with_state(self.metrics.clone()),
             )
+            .route(
+                "/export",
+                get(export::export_all).with_state(self.export_api.clone()),
+            )
+            .route(
+                "/import-file",
+                post(export::import_file).with_state(self.export_api.clone()),
+            )
+            // Allow large export/import files (default axum limit is 2 MB).
+            .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
             .layer(CorsLayer::permissive())
     }
 }
