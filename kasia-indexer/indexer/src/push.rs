@@ -1539,7 +1539,11 @@ impl PushDispatcher {
             registry,
             apns,
             network_type: context.network_type,
-            sent_cache: SentTxCache::new(Duration::from_secs(60)),
+            // Dedup window across BOTH the block-processor (real-time) and virtual-chain
+            // (acceptance) emits, plus any reprocessing. 60s was too short — if acceptance landed
+            // >60s after the real-time push the same message pushed twice. A tx is globally unique,
+            // so an hour-long window is always safe and kills the duplicates.
+            sent_cache: SentTxCache::new(Duration::from_secs(3600)),
             invalid_token_counts: HashMap::new(),
         }
     }
@@ -1572,6 +1576,16 @@ impl PushDispatcher {
     }
 
     async fn handle_extension_event(&mut self, event: ExtensionPushEvent) -> anyhow::Result<()> {
+        // Dedup by tx id (same 60s window as chat pushes) so a broadcast/KaPosts action that the
+        // processor happens to reprocess doesn't fire a second push.
+        let event_tx_id = match &event {
+            ExtensionPushEvent::Broadcast { tx_id, .. } => tx_id.clone(),
+            ExtensionPushEvent::KaPosts { tx_id, .. } => tx_id.clone(),
+        };
+        if !self.sent_cache.mark_seen(&event_tx_id) {
+            self.metrics.increment_push_dedup_dropped_total();
+            return Ok(());
+        }
         let apns = match &self.apns {
             Some(apns) => apns,
             None => return Ok(()),

@@ -342,6 +342,15 @@ async fn register_device(
     State(state): State<PushApi>,
     Json(payload): Json<PushRegistrationRequest>,
 ) -> impl IntoResponse {
+    tracing::info!(
+        "[Push] register watched={} groups={} bcast_channels={:?} kaposts_pubkey={} primary={} auth={}",
+        payload.watched_addresses.len(),
+        payload.watched_group_ids.as_ref().map(|g| g.len()).unwrap_or(0),
+        payload.watched_broadcast_channels,
+        payload.kaposts_pubkey.is_some(),
+        payload.primary_address.is_some(),
+        payload.auth.is_some(),
+    );
     let verified_auth = match authenticate_push_request(
         &state,
         "POST",
