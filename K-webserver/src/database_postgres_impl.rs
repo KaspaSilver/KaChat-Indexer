@@ -3317,6 +3317,15 @@ impl DatabaseInterface for PostgresDbManager {
             let notification_id: i64 = row.get("notification_id");
             let block_time: i64 = row.get("block_time");
 
+            // KaChat fork: this fork intentionally drops non-KaChat content (U+2060 marker filter)
+            // and purges blocklisted authors, so a k_mentions row can reference content that is no
+            // longer in k_contents. The joined content columns (id, base64, …) are then NULL.
+            // Upstream unwraps them and panics, crashing the whole /get-notifications response.
+            // Skip such orphaned notifications instead.
+            if row.try_get::<Option<i64>, _>("id").ok().flatten().is_none() {
+                continue;
+            }
+
             if content_type == "post" {
                 let post_record = KPostRecord {
                     id: row.get::<i64, _>("id"),
