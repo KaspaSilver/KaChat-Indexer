@@ -1,7 +1,8 @@
 use crate::config::PushAuthMode;
 use crate::push::{DeviceKeyBinding, GROUP_V1_CAPABILITY, PushRegistryHandle, WalletBinding};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use indexer_actors::push::ExtensionPushEvent;
 use axum::response::IntoResponse;
 use axum::routing::{delete, post, put};
 use axum::{Json, Router};
@@ -36,6 +37,10 @@ pub struct PushApi {
     auth_mode: PushAuthMode,
     network_type: RpcNetworkType,
     nonces: Arc<StdMutex<NonceStore>>,
+    /// KaChat fork: channel to inject broadcast/KaPosts pushes (fed by the internal endpoint).
+    ext_push_tx: flume::Sender<ExtensionPushEvent>,
+    /// Optional shared secret guarding the internal endpoints (env INTERNAL_PUSH_SECRET).
+    internal_secret: Option<String>,
 }
 
 impl PushApi {
@@ -45,12 +50,19 @@ impl PushApi {
         auth_mode: PushAuthMode,
         _app_attest_team_id: Option<String>,
         _app_attest_bundle_id: Option<String>,
+        ext_push_tx: flume::Sender<ExtensionPushEvent>,
     ) -> Self {
+        let internal_secret = std::env::var("INTERNAL_PUSH_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         Self {
             registry,
             auth_mode,
             network_type,
             nonces: Arc::new(StdMutex::new(NonceStore::default())),
+            ext_push_tx,
+            internal_secret,
         }
     }
 
@@ -60,6 +72,14 @@ impl PushApi {
             .route("/register", post(register_device))
             .route("/update", put(update_registration))
             .route("/unregister", delete(unregister_device))
+    }
+
+    /// Internal-only routes (mounted at /internal/push, NOT publicly proxied). The broadcast +
+    /// KaPosts indexers on the same box POST here when they ingest a push-worthy event.
+    pub fn internal_router() -> Router<Self> {
+        Router::new()
+            .route("/broadcast", post(internal_broadcast_push))
+            .route("/kaposts", post(internal_kaposts_push))
     }
 }
 
@@ -80,6 +100,17 @@ pub struct PushRegistrationRequest {
     pub primary_address: Option<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    // KaChat fork: broadcast + KaPosts push. Unsigned (not covered by the auth preimage), so
+    // #[serde(default)] keeps old clients working. See PUSH_EXTENSIONS.md.
+    #[serde(default)]
+    #[serde(rename = "watched_broadcast_channels")]
+    pub watched_broadcast_channels: Vec<String>,
+    #[serde(default)]
+    #[serde(rename = "hidden_broadcast_senders")]
+    pub hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    #[serde(rename = "kaposts_pubkey")]
+    pub kaposts_pubkey: Option<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -100,6 +131,15 @@ pub struct PushUpdateRequest {
     pub primary_address: Option<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(default)]
+    #[serde(rename = "watched_broadcast_channels")]
+    pub watched_broadcast_channels: Vec<String>,
+    #[serde(default)]
+    #[serde(rename = "hidden_broadcast_senders")]
+    pub hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    #[serde(rename = "kaposts_pubkey")]
+    pub kaposts_pubkey: Option<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -146,6 +186,77 @@ pub struct PushAuthRequest {
     #[serde(default)]
     #[serde(rename = "device_auth")]
     pub device_auth: Option<PushDeviceAuthRequest>,
+}
+
+// KaChat fork: internal push-injection payloads (from the K-processor).
+#[derive(Debug, Deserialize)]
+pub struct InternalBroadcastPush {
+    pub channel: String,
+    pub sender_address: String,
+    pub subtitle: String,
+    pub body: String,
+    pub tx_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InternalKaPostsPush {
+    pub target_pubkey: String,
+    pub actor_pubkey: String,
+    pub subtitle: String,
+    pub body: String,
+    #[serde(default)]
+    pub post_id: Option<String>,
+    pub tx_id: String,
+}
+
+impl PushApi {
+    fn internal_authorized(&self, headers: &HeaderMap) -> bool {
+        match &self.internal_secret {
+            None => true, // no secret configured -> allow (same-box only by deployment)
+            Some(secret) => headers
+                .get("x-internal-secret")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == secret)
+                .unwrap_or(false),
+        }
+    }
+}
+
+async fn internal_broadcast_push(
+    State(state): State<PushApi>,
+    headers: HeaderMap,
+    Json(payload): Json<InternalBroadcastPush>,
+) -> impl IntoResponse {
+    if !state.internal_authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let _ = state.ext_push_tx.try_send(ExtensionPushEvent::Broadcast {
+        channel: payload.channel,
+        sender_address: payload.sender_address,
+        subtitle: payload.subtitle,
+        body: payload.body,
+        tx_id: payload.tx_id,
+    });
+    (StatusCode::OK, "ok")
+}
+
+async fn internal_kaposts_push(
+    State(state): State<PushApi>,
+    headers: HeaderMap,
+    Json(payload): Json<InternalKaPostsPush>,
+) -> impl IntoResponse {
+    if !state.internal_authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let _ = state.ext_push_tx.try_send(ExtensionPushEvent::KaPosts {
+        target_pubkey: payload.target_pubkey,
+        actor_pubkey: payload.actor_pubkey,
+        subtitle: payload.subtitle,
+        body: payload.body,
+        post_id: payload.post_id,
+        tx_id: payload.tx_id,
+    });
+    (StatusCode::OK, "ok")
 }
 
 #[derive(Debug, Deserialize, ToSchema, Clone)]
@@ -260,6 +371,9 @@ async fn register_device(
             verified_auth.capabilities,
             payload.primary_address,
             payload.aliases,
+            payload.watched_broadcast_channels,
+            payload.hidden_broadcast_senders,
+            payload.kaposts_pubkey,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )
@@ -321,6 +435,9 @@ async fn update_registration(
             verified_auth.capabilities,
             payload.primary_address,
             payload.aliases,
+            payload.watched_broadcast_channels,
+            payload.hidden_broadcast_senders,
+            payload.kaposts_pubkey,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )

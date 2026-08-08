@@ -3,6 +3,7 @@ mod database;
 mod hashtag_extractor;
 mod k_protocol;
 mod listener;
+mod push_notify;
 mod queue;
 mod transaction_reindex_service;
 mod worker;

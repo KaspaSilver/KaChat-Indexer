@@ -106,14 +106,18 @@ pub fn is_kaposts_operator(pubkey_hex: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Max characters of broadcast content stored (safety cap; broadcasts may carry voice/reply
-/// JSON envelopes, so this is generous — the on-chain payload size is the real limit).
-pub const MAX_BROADCAST_CONTENT_CHARS: usize = 65_536;
+/// Max characters of a TEXT/reply broadcast stored (safety cap). Aligned with the KaPosts limit.
+pub const MAX_BROADCAST_CONTENT_CHARS: usize = 25_000;
 
-/// Max characters allowed in a KaChat message body (after the marker). Generous for text but
-/// far below what an embedded media blob needs — a second line of defence against base64
-/// payloads slipping in disguised as "text".
-pub const MAX_KACHAT_MESSAGE_CHARS: usize = 4096;
+/// Higher cap for AUDIO broadcasts, whose content is a base64 voice envelope
+/// (`{"type":"file",…,"content":"data:audio/…;base64,…"}`) that legitimately runs large. The
+/// on-chain transaction size is the real bound; this is just a generous safety ceiling.
+pub const MAX_BROADCAST_AUDIO_CHARS: usize = 1_000_000;
+
+/// Max characters allowed in a KaChat message body (after the marker). Matches X Premium's
+/// long-post ceiling. Media is blocked by the data-URI/base64 signature checks below (not by
+/// this length), so long-form text is fine while embedded blobs are still rejected.
+pub const MAX_KACHAT_MESSAGE_CHARS: usize = 25_000;
 
 /// Validate that a base64-encoded message is acceptable KaChat content and gate every content
 /// insert (post / reply / quote / repost) on it. KaPosts is text-only; this enforces that
@@ -821,10 +825,18 @@ impl KProtocolProcessor {
             return Ok(());
         }
 
-        if content.chars().count() > MAX_BROADCAST_CONTENT_CHARS {
+        // Audio broadcasts (base64 voice envelopes) get a much larger cap than text/reply ones.
+        let is_audio = content.to_ascii_lowercase().contains("data:audio");
+        let max_content = if is_audio {
+            MAX_BROADCAST_AUDIO_CHARS
+        } else {
+            MAX_BROADCAST_CONTENT_CHARS
+        };
+        if content.chars().count() > max_content {
             info!(
-                "Broadcast {} exceeds max content length, skipping",
-                transaction_id
+                "Broadcast {} exceeds max content length ({} cap), skipping",
+                transaction_id,
+                if is_audio { "audio" } else { "text" }
             );
             return Ok(());
         }
@@ -874,8 +886,25 @@ impl KProtocolProcessor {
                 "Saved KaChat broadcast {} on #{} from {}",
                 transaction_id, channel, sender_address
             );
+            // Fire-and-forget push notify (push service filters to bell-on / non-hidden devices).
+            let body = crate::push_notify::broadcast_preview(content);
+            crate::push_notify::notify_broadcast(&channel, &sender_address, body, transaction_id);
         }
         Ok(())
+    }
+
+    /// KaPosts push helper: resolve the author (compressed pubkey hex) of an indexed content id.
+    async fn content_author_pubkey(&self, content_id_hex: &str) -> Option<String> {
+        let bytes = hex::decode(content_id_hex.trim()).ok()?;
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT sender_pubkey FROM k_contents WHERE transaction_id = $1 LIMIT 1",
+        )
+        .bind(&bytes)
+        .fetch_optional(&self.db_pool)
+        .await
+        .ok()
+        .flatten()
+        .map(hex::encode)
     }
 
     /// Save K post to database
@@ -1299,6 +1328,23 @@ impl KProtocolProcessor {
                 }
             }
         }
+        // KaPosts push: notify the parent post's author of the reply.
+        if let Some(target) = self.content_author_pubkey(&k_reply.post_id).await {
+            let snippet =
+                crate::push_notify::kachat_snippet(&k_reply.base64_encoded_message).unwrap_or_default();
+            let body = if snippet.is_empty() {
+                "replied to your post".to_string()
+            } else {
+                format!("replied to your post: {snippet}")
+            };
+            crate::push_notify::notify_kaposts(
+                &target,
+                &k_reply.sender_pubkey,
+                body,
+                Some(k_reply.post_id.clone()),
+                transaction_id,
+            );
+        }
         Ok(())
     }
 
@@ -1438,6 +1484,23 @@ impl KProtocolProcessor {
                     mentioned_pubkey_for_log
                 );
             }
+        }
+        // KaPosts push: notify the quoted post's author of the quote/repost.
+        if let Some(target) = self.content_author_pubkey(&k_quote.content_id).await {
+            let snippet =
+                crate::push_notify::kachat_snippet(&k_quote.base64_encoded_message).unwrap_or_default();
+            let body = if snippet.is_empty() {
+                "reposted your post".to_string()
+            } else {
+                format!("quoted your post: {snippet}")
+            };
+            crate::push_notify::notify_kaposts(
+                &target,
+                &k_quote.sender_pubkey,
+                body,
+                Some(k_quote.content_id.clone()),
+                transaction_id,
+            );
         }
         Ok(())
     }
@@ -1642,6 +1705,23 @@ impl KProtocolProcessor {
                 "Saved K vote: {} -> {} ({})",
                 transaction_id, post_id_for_log, vote_for_log
             );
+        }
+        // KaPosts push: notify the post's author of an up/down vote (skip unvote).
+        let vote_body = match vote_for_log.as_str() {
+            "upvote" => Some("liked your post"),
+            "downvote" => Some("disliked your post"),
+            _ => None,
+        };
+        if let Some(vote_body) = vote_body {
+            if let Some(target) = self.content_author_pubkey(&post_id_for_log).await {
+                crate::push_notify::notify_kaposts(
+                    &target,
+                    &k_vote.sender_pubkey,
+                    vote_body.to_string(),
+                    Some(post_id_for_log.clone()),
+                    transaction_id,
+                );
+            }
         }
         Ok(())
     }
@@ -1953,6 +2033,14 @@ impl KProtocolProcessor {
                         "Saved K follow: {} followed {}",
                         hex::encode(&sender_pubkey_bytes),
                         hex::encode(&followed_user_pubkey_bytes)
+                    );
+                    // KaPosts push: notify the followed user.
+                    crate::push_notify::notify_kaposts(
+                        &k_follow.followed_user_pubkey,
+                        &k_follow.sender_pubkey,
+                        "followed you".to_string(),
+                        None,
+                        transaction_id,
                     );
                 }
             }

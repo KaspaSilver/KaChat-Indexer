@@ -24,5 +24,7 @@ kaspa-wallet-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", featu
 # Kaspa address decoding for personal-mode operator identity (address -> x-only pubkey).
 # No tag so Cargo unifies it to the same rev as kaspa-wallet-core above.
 kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa.git" }
+# Fire-and-forget internal HTTP calls to the push service (localhost, http-only -> no TLS).
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 secp256k1 = "0.29"
 base64ct = "1.8.0"
