@@ -3,7 +3,7 @@ use crate::config::ApnsEnvironment;
 use crate::context::IndexerContext;
 use futures_util::{StreamExt, stream};
 use indexer_actors::metrics::SharedMetrics;
-use indexer_actors::push::{PushEvent, PushEventKind};
+use indexer_actors::push::{ExtensionPushEvent, PushEvent, PushEventKind};
 use indexer_actors::util::ToHex;
 use indexer_db::AddressPayload;
 use indexer_db::push::{
@@ -83,6 +83,7 @@ impl PushRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &mut self,
         token: String,
@@ -92,6 +93,9 @@ impl PushRegistry {
         capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
+        watched_broadcast_channels: Vec<String>,
+        hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
+        kaposts_pubkey: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -115,6 +119,9 @@ impl PushRegistry {
             .as_deref()
             .map(address_to_payload)
             .transpose()?;
+        let normalized_broadcast_channels = normalize_broadcast_channels(watched_broadcast_channels);
+        let normalized_hidden_senders = normalize_hidden_broadcast_senders(hidden_broadcast_senders);
+        let normalized_kaposts_pubkey = normalize_kaposts_pubkey(kaposts_pubkey);
         if addresses.is_empty() && group_ids.is_empty() {
             anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
         }
@@ -184,6 +191,14 @@ impl PushRegistry {
                     && reg.device_key_counter == effective_device_counter
             })
             .unwrap_or(false);
+        let broadcast_prefs_unchanged = existing
+            .as_ref()
+            .map(|reg| {
+                reg.watched_broadcast_channels == normalized_broadcast_channels
+                    && reg.hidden_broadcast_senders == normalized_hidden_senders
+                    && reg.kaposts_pubkey == normalized_kaposts_pubkey
+            })
+            .unwrap_or(false);
         if addresses_unchanged
             && group_ids_unchanged
             && capabilities_unchanged
@@ -192,6 +207,7 @@ impl PushRegistry {
             && primary_unchanged
             && wallet_binding_unchanged
             && device_binding_unchanged
+            && broadcast_prefs_unchanged
             && !last_seen_refresh
         {
             // Fast path: payload unchanged and heartbeat refresh is not due yet.
@@ -215,6 +231,9 @@ impl PushRegistry {
             device_key_id: effective_device_key_id,
             device_key_public_key_b64: effective_device_public_key,
             device_key_counter: effective_device_counter,
+            watched_broadcast_channels: normalized_broadcast_channels,
+            hidden_broadcast_senders: normalized_hidden_senders,
+            kaposts_pubkey: normalized_kaposts_pubkey,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -343,6 +362,7 @@ impl PushRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         token: String,
@@ -351,6 +371,9 @@ impl PushRegistry {
         capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
+        watched_broadcast_channels: Vec<String>,
+        hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
+        kaposts_pubkey: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -373,6 +396,9 @@ impl PushRegistry {
             .as_deref()
             .map(address_to_payload)
             .transpose()?;
+        let normalized_broadcast_channels = normalize_broadcast_channels(watched_broadcast_channels);
+        let normalized_hidden_senders = normalize_hidden_broadcast_senders(hidden_broadcast_senders);
+        let normalized_kaposts_pubkey = normalize_kaposts_pubkey(kaposts_pubkey);
         if addresses.is_empty() && group_ids.is_empty() {
             anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
         }
@@ -442,6 +468,14 @@ impl PushRegistry {
                     && reg.device_key_counter == effective_device_counter
             })
             .unwrap_or(false);
+        let broadcast_prefs_unchanged = existing
+            .as_ref()
+            .map(|reg| {
+                reg.watched_broadcast_channels == normalized_broadcast_channels
+                    && reg.hidden_broadcast_senders == normalized_hidden_senders
+                    && reg.kaposts_pubkey == normalized_kaposts_pubkey
+            })
+            .unwrap_or(false);
         if addresses_unchanged
             && group_ids_unchanged
             && capabilities_unchanged
@@ -449,6 +483,7 @@ impl PushRegistry {
             && primary_unchanged
             && wallet_binding_unchanged
             && device_binding_unchanged
+            && broadcast_prefs_unchanged
             && !last_seen_refresh
         {
             self.metrics.increment_push_fast_path_skips_total();
@@ -471,6 +506,9 @@ impl PushRegistry {
             device_key_id: effective_device_key_id,
             device_key_public_key_b64: effective_device_public_key,
             device_key_counter: effective_device_counter,
+            watched_broadcast_channels: normalized_broadcast_channels,
+            hidden_broadcast_senders: normalized_hidden_senders,
+            kaposts_pubkey: normalized_kaposts_pubkey,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -771,6 +809,68 @@ impl PushRegistry {
         result
     }
 
+    /// KaChat fork: devices to push a broadcast to — those watching `channel` with the bell on,
+    /// minus the sender's own device(s) and any device that hid this sender in that channel.
+    /// Iterates all registrations (broadcasts are infrequent vs chat, so no reverse index).
+    pub fn tokens_for_broadcast(
+        &self,
+        channel: &str,
+        sender_address: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let channel = channel.trim().to_lowercase();
+        let rtx = self.tx_keyspace.read_tx();
+        let mut tokens = Vec::new();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let value = entry?;
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            if !reg.watched_broadcast_channels.iter().any(|c| c == &channel) {
+                continue;
+            }
+            // Skip the sender's own device (matched by its authenticated primary address).
+            if reg.primary_address.as_deref() == Some(sender_address) {
+                continue;
+            }
+            // Skip devices that hid this sender in this channel.
+            if reg
+                .hidden_broadcast_senders
+                .get(&channel)
+                .is_some_and(|hidden| hidden.iter().any(|a| a == sender_address))
+            {
+                continue;
+            }
+            tokens.push(reg.device_token);
+        }
+        Ok(tokens)
+    }
+
+    /// KaChat fork: devices to push a KaPosts action to — those registered with `target_pubkey`,
+    /// skipping any device registered as the actor (no self-pings).
+    pub fn tokens_for_kaposts(
+        &self,
+        target_pubkey: &str,
+        actor_pubkey: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let target = target_pubkey.trim().to_lowercase();
+        let actor = actor_pubkey.trim().to_lowercase();
+        let rtx = self.tx_keyspace.read_tx();
+        let mut tokens = Vec::new();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let value = entry?;
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            let Some(pk) = reg.kaposts_pubkey.as_deref() else {
+                continue;
+            };
+            if pk == target && pk != actor {
+                tokens.push(reg.device_token);
+            }
+        }
+        Ok(tokens)
+    }
+
     pub fn prune_address_watchers(&self, address: &AddressPayload) -> anyhow::Result<()> {
         self.metrics.increment_db_read_ops_total(1);
         let db_read_started = Instant::now();
@@ -987,6 +1087,9 @@ enum PushRegistryCommand {
         capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
+        watched_broadcast_channels: Vec<String>,
+        hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
+        kaposts_pubkey: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -998,6 +1101,9 @@ enum PushRegistryCommand {
         capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
+        watched_broadcast_channels: Vec<String>,
+        hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
+        kaposts_pubkey: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1025,6 +1131,16 @@ enum PushRegistryCommand {
     MatchGroupControlTokens {
         sender: AddressPayload,
         recipient: Option<AddressPayload>,
+        response: RegistryResponse<Vec<String>>,
+    },
+    MatchBroadcastTokens {
+        channel: String,
+        sender_address: String,
+        response: RegistryResponse<Vec<String>>,
+    },
+    MatchKaPostsTokens {
+        target_pubkey: String,
+        actor_pubkey: String,
         response: RegistryResponse<Vec<String>>,
     },
 }
@@ -1059,6 +1175,9 @@ impl PushRegistryActor {
                     capabilities,
                     primary_address,
                     aliases,
+                    watched_broadcast_channels,
+                    hidden_broadcast_senders,
+                    kaposts_pubkey,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1071,6 +1190,9 @@ impl PushRegistryActor {
                         capabilities,
                         primary_address,
                         aliases,
+                        watched_broadcast_channels,
+                        hidden_broadcast_senders,
+                        kaposts_pubkey,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1083,6 +1205,9 @@ impl PushRegistryActor {
                     capabilities,
                     primary_address,
                     aliases,
+                    watched_broadcast_channels,
+                    hidden_broadcast_senders,
+                    kaposts_pubkey,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1094,6 +1219,9 @@ impl PushRegistryActor {
                         capabilities,
                         primary_address,
                         aliases,
+                        watched_broadcast_channels,
+                        hidden_broadcast_senders,
+                        kaposts_pubkey,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1143,6 +1271,22 @@ impl PushRegistryActor {
                         .matching_tokens_for_group_control(&sender, recipient.as_ref());
                     let _ = response.send(result);
                 }
+                PushRegistryCommand::MatchBroadcastTokens {
+                    channel,
+                    sender_address,
+                    response,
+                } => {
+                    let result = self.registry.tokens_for_broadcast(&channel, &sender_address);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::MatchKaPostsTokens {
+                    target_pubkey,
+                    actor_pubkey,
+                    response,
+                } => {
+                    let result = self.registry.tokens_for_kaposts(&target_pubkey, &actor_pubkey);
+                    let _ = response.send(result);
+                }
             }
         }
         info!("[PushRegistry] actor stopped");
@@ -1180,6 +1324,9 @@ impl PushRegistryHandle {
         capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
+        watched_broadcast_channels: Vec<String>,
+        hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
+        kaposts_pubkey: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1191,6 +1338,9 @@ impl PushRegistryHandle {
             capabilities,
             primary_address,
             aliases,
+            watched_broadcast_channels,
+            hidden_broadcast_senders,
+            kaposts_pubkey,
             wallet_binding,
             device_key_binding,
             response,
@@ -1207,6 +1357,9 @@ impl PushRegistryHandle {
         capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
+        watched_broadcast_channels: Vec<String>,
+        hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
+        kaposts_pubkey: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1217,6 +1370,9 @@ impl PushRegistryHandle {
             capabilities,
             primary_address,
             aliases,
+            watched_broadcast_channels,
+            hidden_broadcast_senders,
+            kaposts_pubkey,
             wallet_binding,
             device_key_binding,
             response,
@@ -1280,6 +1436,32 @@ impl PushRegistryHandle {
         .await
     }
 
+    pub async fn matching_tokens_for_broadcast(
+        &self,
+        channel: String,
+        sender_address: String,
+    ) -> anyhow::Result<Vec<String>> {
+        self.request(|response| PushRegistryCommand::MatchBroadcastTokens {
+            channel,
+            sender_address,
+            response,
+        })
+        .await
+    }
+
+    pub async fn matching_tokens_for_kaposts(
+        &self,
+        target_pubkey: String,
+        actor_pubkey: String,
+    ) -> anyhow::Result<Vec<String>> {
+        self.request(|response| PushRegistryCommand::MatchKaPostsTokens {
+            target_pubkey,
+            actor_pubkey,
+            response,
+        })
+        .await
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
     }
@@ -1308,6 +1490,13 @@ pub struct DeviceRegistration {
     pub device_key_public_key_b64: Option<String>,
     #[serde(default)]
     pub device_key_counter: Option<u64>,
+    // KaChat fork: broadcast + KaPosts push prefs (unsigned; stored on the value only).
+    #[serde(default)]
+    pub watched_broadcast_channels: Vec<String>,
+    #[serde(default)]
+    pub hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub kaposts_pubkey: Option<String>,
     #[serde(default)]
     pub app_attest_key_id: Option<String>,
     #[serde(default)]
@@ -1320,6 +1509,7 @@ pub struct DeviceRegistration {
 
 pub struct PushDispatcher {
     rx: flume::Receiver<PushEvent>,
+    ext_rx: flume::Receiver<ExtensionPushEvent>,
     registry: PushRegistryHandle,
     metrics: SharedMetrics,
     apns: Option<ApnsClient>,
@@ -1331,6 +1521,7 @@ pub struct PushDispatcher {
 impl PushDispatcher {
     pub fn new(
         rx: flume::Receiver<PushEvent>,
+        ext_rx: flume::Receiver<ExtensionPushEvent>,
         registry: PushRegistryHandle,
         context: &IndexerContext,
     ) -> Self {
@@ -1343,6 +1534,7 @@ impl PushDispatcher {
         };
         Self {
             rx,
+            ext_rx,
             metrics: registry.metrics(),
             registry,
             apns,
@@ -1353,13 +1545,135 @@ impl PushDispatcher {
     }
 
     pub async fn run(mut self) {
-        while let Ok(event) = self.rx.recv_async().await {
-            self.metrics.increment_push_events_total();
-            if self.apns.is_none() {
-                continue;
+        loop {
+            tokio::select! {
+                event = self.rx.recv_async() => {
+                    let Ok(event) = event else { break };
+                    self.metrics.increment_push_events_total();
+                    if self.apns.is_none() {
+                        continue;
+                    }
+                    if let Err(err) = self.handle_event(event).await {
+                        warn!("[Push] Failed to handle event: {err}");
+                    }
+                }
+                ext = self.ext_rx.recv_async() => {
+                    let Ok(event) = ext else { break };
+                    self.metrics.increment_push_events_total();
+                    if self.apns.is_none() {
+                        continue;
+                    }
+                    if let Err(err) = self.handle_extension_event(event).await {
+                        warn!("[Push] Failed to handle extension event: {err}");
+                    }
+                }
             }
-            if let Err(err) = self.handle_event(event).await {
-                warn!("[Push] Failed to handle event: {err}");
+        }
+    }
+
+    async fn handle_extension_event(&mut self, event: ExtensionPushEvent) -> anyhow::Result<()> {
+        let apns = match &self.apns {
+            Some(apns) => apns,
+            None => return Ok(()),
+        };
+        match event {
+            ExtensionPushEvent::Broadcast {
+                channel,
+                sender_address,
+                subtitle,
+                body,
+                tx_id,
+            } => {
+                let mut tokens = self
+                    .registry
+                    .matching_tokens_for_broadcast(channel.clone(), sender_address)
+                    .await?;
+                tokens.sort_unstable();
+                tokens.dedup();
+                if tokens.is_empty() {
+                    return Ok(());
+                }
+                if tokens.len() > MAX_PUSH_FANOUT {
+                    tokens.truncate(MAX_PUSH_FANOUT);
+                }
+                let payload = ExtensionPayload {
+                    aps: ExtensionAps {
+                        alert: ExtensionAlert {
+                            title: format!("#{channel}"),
+                            subtitle: Some(subtitle),
+                            body,
+                        },
+                        sound: "default",
+                        thread_id: format!("broadcast:{channel}"),
+                    },
+                    post_id: None,
+                };
+                self.deliver_extension(apns, tokens, &payload, &tx_id).await;
+                Ok(())
+            }
+            ExtensionPushEvent::KaPosts {
+                target_pubkey,
+                actor_pubkey,
+                subtitle,
+                body,
+                post_id,
+                tx_id,
+            } => {
+                let mut tokens = self
+                    .registry
+                    .matching_tokens_for_kaposts(target_pubkey, actor_pubkey)
+                    .await?;
+                tokens.sort_unstable();
+                tokens.dedup();
+                if tokens.is_empty() {
+                    return Ok(());
+                }
+                if tokens.len() > MAX_PUSH_FANOUT {
+                    tokens.truncate(MAX_PUSH_FANOUT);
+                }
+                let payload = ExtensionPayload {
+                    aps: ExtensionAps {
+                        alert: ExtensionAlert {
+                            title: "KaPosts".to_string(),
+                            subtitle: Some(subtitle),
+                            body,
+                        },
+                        sound: "default",
+                        thread_id: "kaposts".to_string(),
+                    },
+                    post_id,
+                };
+                self.deliver_extension(apns, tokens, &payload, &tx_id).await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn deliver_extension(
+        &self,
+        apns: &ApnsClient,
+        tokens: Vec<String>,
+        payload: &ExtensionPayload,
+        collapse_id: &str,
+    ) {
+        let results = stream::iter(tokens.into_iter().map(|token| async move {
+            let result = apns.send_collapsible(&token, payload, Some(collapse_id)).await;
+            (token, result)
+        }))
+        .buffer_unordered(APNS_SEND_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for (token, result) in results {
+            match result {
+                Ok(()) => self.metrics.increment_push_sent_ok_total(),
+                Err(ApnsError::Unregistered) | Err(ApnsError::InvalidToken) => {
+                    self.metrics.increment_push_send_failed_total();
+                    let _ = self.registry.unregister(token).await;
+                }
+                Err(err) => {
+                    self.metrics.increment_push_send_failed_total();
+                    warn!("[Push] extension delivery failed: {err}");
+                }
             }
         }
     }
@@ -1577,6 +1891,31 @@ impl PushAlert {
     }
 }
 
+// KaChat fork: plain-alert payloads for broadcast/KaPosts (public content — no mutable-content,
+// no encrypted body). thread-id routes taps in the app; `postId` is a top-level custom key.
+#[derive(Debug, Serialize)]
+struct ExtensionPayload {
+    aps: ExtensionAps,
+    #[serde(rename = "postId", skip_serializing_if = "Option::is_none")]
+    post_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExtensionAps {
+    alert: ExtensionAlert,
+    sound: &'static str,
+    #[serde(rename = "thread-id")]
+    thread_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ExtensionAlert {
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subtitle: Option<String>,
+    body: String,
+}
+
 const MAX_PUSH_PAYLOAD_BYTES: usize = 3_500;
 
 fn payload_within_limit(payload: String) -> Option<String> {
@@ -1737,18 +2076,33 @@ impl ApnsClient {
     }
 
     async fn send<T: Serialize>(&self, token: &str, payload: &T) -> Result<(), ApnsError> {
+        self.send_collapsible(token, payload, None).await
+    }
+
+    async fn send_collapsible<T: Serialize>(
+        &self,
+        token: &str,
+        payload: &T,
+        collapse_id: Option<&str>,
+    ) -> Result<(), ApnsError> {
         let auth_token = self
             .auth_token()
             .await
             .map_err(|err| ApnsError::Auth(err.to_string()))?;
         let url = format!("{}/3/device/{}", self.endpoint, token);
-        let resp = self
+        let mut req = self
             .client
             .post(url)
             .header("authorization", format!("bearer {}", auth_token))
             .header("apns-topic", &self.topic)
             .header("apns-push-type", "alert")
-            .header("apns-priority", "10")
+            .header("apns-priority", "10");
+        if let Some(collapse_id) = collapse_id {
+            // APNs caps collapse-id at 64 bytes.
+            let trimmed = &collapse_id[..collapse_id.len().min(64)];
+            req = req.header("apns-collapse-id", trimmed);
+        }
+        let resp = req
             .json(payload)
             .send()
             .await
@@ -2102,6 +2456,46 @@ fn normalize_primary_address(address: Option<String>) -> Option<String> {
     RpcAddress::try_from(address.trim())
         .ok()
         .map(|rpc| rpc.to_string())
+}
+
+// KaChat fork: normalizers for the broadcast/KaPosts push prefs. Deterministic (trim, lowercase
+// channels/pubkey, dedup, sort) so the fast-path "unchanged" comparison is stable.
+fn normalize_broadcast_channels(channels: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = channels
+        .into_iter()
+        .map(|c| c.trim().to_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn normalize_hidden_broadcast_senders(
+    map: std::collections::HashMap<String, Vec<String>>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    map.into_iter()
+        .map(|(channel, senders)| {
+            let mut s: Vec<String> = senders
+                .into_iter()
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+            s.sort_unstable();
+            s.dedup();
+            (channel.trim().to_lowercase(), s)
+        })
+        .filter(|(channel, senders)| !channel.is_empty() && !senders.is_empty())
+        .collect()
+}
+
+fn normalize_kaposts_pubkey(pubkey: Option<String>) -> Option<String> {
+    let pk = pubkey?.trim().to_lowercase();
+    if pk.is_empty() {
+        None
+    } else {
+        Some(pk)
+    }
 }
 
 const LAST_SEEN_BASE_REFRESH_SECS: u64 = 3 * 24 * 60 * 60;

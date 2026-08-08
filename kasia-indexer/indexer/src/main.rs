@@ -217,7 +217,10 @@ async fn main() -> anyhow::Result<()> {
         .name("push-registry".to_string())
         .spawn(move || push_registry_actor.process())?;
     let (push_tx, push_rx) = flume::bounded(2048);
-    let push_dispatcher = PushDispatcher::new(push_rx, push_registry.clone(), &context);
+    // KaChat fork: broadcast/KaPosts pushes injected by the K-processor over HTTP.
+    let (ext_push_tx, ext_push_rx) = flume::bounded(1024);
+    let push_dispatcher =
+        PushDispatcher::new(push_rx, ext_push_rx, push_registry.clone(), &context);
     let _push_handle = tokio::spawn(push_dispatcher.run());
     let (block_intake_tx, block_intake_rx) = flume::bounded(4096);
     let (vcc_intake_tx, vcc_intake_rx) = flume::bounded(4096);
@@ -383,6 +386,7 @@ async fn main() -> anyhow::Result<()> {
             context.config.push_auth_mode,
             context.config.apns_team_id.clone(),
             context.config.apns_topic.clone(),
+            ext_push_tx.clone(),
         ),
         context.clone(),
     );

@@ -10,6 +10,34 @@ pub enum PushEventKind {
     GroupControl,
 }
 
+/// KaChat fork: broadcast + KaPosts pushes. These are injected by the K-processor over an
+/// internal HTTP endpoint (not derived from the chat block stream), already carrying display-ready
+/// text, so they ride a separate channel into the same dispatcher/APNs path.
+#[derive(Debug, Clone)]
+pub enum ExtensionPushEvent {
+    Broadcast {
+        channel: String,
+        /// Sender's kaspa address — used to skip the sender's own device(s) and hidden-sender filters.
+        sender_address: String,
+        subtitle: String,
+        body: String,
+        /// Hex tx id — APNs collapse-id (retry dedupe).
+        tx_id: String,
+    },
+    KaPosts {
+        /// Registered `kaposts_pubkey` whose content was acted on.
+        target_pubkey: String,
+        /// Actor's pubkey — devices registered as the actor are skipped (no self-pings).
+        actor_pubkey: String,
+        subtitle: String,
+        body: String,
+        /// Target content txid (present when the action targets content; omitted for follows).
+        post_id: Option<String>,
+        /// Action txid — APNs collapse-id.
+        tx_id: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct PushEvent {
     pub kind: PushEventKind,

@@ -203,6 +203,8 @@ impl Api {
         let push_router = PushApi::router()
             .with_state(self.push_api.clone())
             .layer(DefaultBodyLimit::max(PUSH_REQUEST_BODY_MAX_BYTES));
+        // KaChat fork: internal-only broadcast/KaPosts push injection (not proxied publicly).
+        let internal_push_router = PushApi::internal_router().with_state(self.push_api.clone());
 
         Router::new()
             .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
@@ -223,6 +225,7 @@ impl Api {
                 SelfStashApi::router().with_state(self.self_stash_api.clone()),
             )
             .nest("/v1/push", push_router)
+            .nest("/internal/push", internal_push_router)
             .nest(
                 "/group-messages",
                 GroupMessageApi::router().with_state(self.group_message_api.clone()),

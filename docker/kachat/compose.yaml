@@ -58,6 +58,16 @@ services:
       NETWORK_TYPE: ${NETWORK}
       KASIA_INDEXER_DB_ROOT: /app/data
       KASIA_API_BIND: 0.0.0.0:${CHAT_API_PORT}
+      # push notifications (APNs). The .p8 auth key lives on the mounted data volume; Team/Key
+      # IDs are not secret. Set APNS_ENVIRONMENT=sandbox for Xcode debug builds (prod = TestFlight/
+      # App Store). Empty APNS_* disables delivery (registration still works).
+      APNS_TEAM_ID: RP4Z22SFSD
+      APNS_KEY_ID: C757C5GCQB
+      APNS_TOPIC: com.kachat.app
+      APNS_KEY_PATH: /app/data/apns/AuthKey_C757C5GCQB.p8
+      APNS_ENVIRONMENT: production
+      # shared secret guarding the internal broadcast/KaPosts push-injection endpoints
+      INTERNAL_PUSH_SECRET: ${INTERNAL_PUSH_SECRET}
       RUST_LOG: info
     volumes:
       - /var/kachat-chat-data:/app/data

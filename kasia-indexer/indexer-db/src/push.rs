@@ -34,6 +34,18 @@ impl DeviceRegistrationPartition {
     pub fn approximate_len(&self) -> usize {
         self.0.approximate_len()
     }
+
+    /// Iterate every stored registration value (KaChat fork: used for broadcast/KaPosts fan-out,
+    /// which match on fields kept in the JSON value rather than a reverse index).
+    pub fn iter_values_rtx<'a>(
+        &'a self,
+        rtx: &'a ReadTransaction,
+    ) -> impl Iterator<Item = anyhow::Result<SharedImmutable<[u8]>>> + 'a {
+        rtx.iter(&self.0).map(|item| {
+            let (_key, value) = item?;
+            Ok(SharedImmutable::new(value))
+        })
+    }
 }
 
 #[derive(Clone)]
