@@ -966,6 +966,7 @@ impl PushRegistry {
         }
     }
 
+    #[allow(dead_code)] // capability gating retained but no longer enforced for group push
     fn token_has_capability(&mut self, token: &str, capability: &str) -> bool {
         if let Some(capabilities) = self.capability_cache.get(token) {
             return capabilities.contains(capability);
@@ -1049,13 +1050,12 @@ impl PushRegistry {
     }
 
     fn matching_tokens_for_group(&mut self, group_id: &[u8; 32]) -> anyhow::Result<Vec<String>> {
+        // KaChat fork: the KaChat app doesn't send the branch's `group_v1` capability string, but
+        // every KaChat client is group-capable — so match by watched group id alone (no gate).
         let tokens = self.tokens_for_group(group_id)?;
         self.metrics
             .increment_push_tokens_looked_up_total(tokens.len() as u64);
-        Ok(tokens
-            .into_iter()
-            .filter(|token| self.token_has_capability(token, GROUP_V1_CAPABILITY))
-            .collect())
+        Ok(tokens)
     }
 
     fn matching_tokens_for_group_control(
@@ -1063,16 +1063,16 @@ impl PushRegistry {
         sender: &AddressPayload,
         recipient: Option<&AddressPayload>,
     ) -> anyhow::Result<Vec<String>> {
+        // KaChat fork: no `group_v1` capability gate (see matching_tokens_for_group). This is what
+        // delivers "you were added to a group" — the gctl is addressed to the new member's primary
+        // address, so we match by primary_address (recipient) without requiring a capability.
         let tokens = match recipient {
             Some(recipient) => self.tokens_for_primary_address(recipient)?,
             None => self.tokens_for_address(sender)?,
         };
         self.metrics
             .increment_push_tokens_looked_up_total(tokens.len() as u64);
-        Ok(tokens
-            .into_iter()
-            .filter(|token| self.token_has_capability(token, GROUP_V1_CAPABILITY))
-            .collect())
+        Ok(tokens)
     }
 }
 
