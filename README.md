@@ -7,8 +7,13 @@ counter-actions (`unvote`/`unquote`), a per-post engagement endpoint, KaChat bro
 indexing (`#kaspa` / `#kachat-bugs`, 3-day retention), and a **KaChat Indexer** admin
 dashboard (`K-admin`) that will grow into the single pane of glass for all of it.
 
-- **What runs it / how to deploy:** [`KAPOSTS.md`](KAPOSTS.md) and
-  [`docker/KAPOSTS/DEPLOY.md`](docker/KAPOSTS/DEPLOY.md).
+## 🚀 Want to run your own indexer?
+
+**→ Follow [`INSTALL.md`](INSTALL.md) — a step‑by‑step, cross‑platform self‑hosting guide**
+(Linux, Windows, macOS) covering Docker, the indexer itself, optional **Portainer**, and
+**nginx‑proxy‑manager** for HTTPS. Start there.
+
+- **Deep‑dive deploy notes:** [`KAPOSTS.md`](KAPOSTS.md) and [`docker/kachat/DEPLOY.md`](docker/kachat/DEPLOY.md).
 - **Upstream lineage** is preserved in git history and the `upstream` remote; the original
   K-indexer docs follow below.
 
