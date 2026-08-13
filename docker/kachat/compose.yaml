@@ -66,6 +66,12 @@ services:
       APNS_TOPIC: com.kachat.app
       APNS_KEY_PATH: /app/data/apns/AuthKey_C757C5GCQB.p8
       APNS_ENVIRONMENT: production
+      # push notifications (FCM / Android). The Firebase *service-account* JSON lives on the
+      # mounted data volume (Firebase console → Project settings → Service accounts → Generate new
+      # private key). Empty FCM_* disables Android delivery (registration still works). The
+      # project id is not secret; the JSON holds the private key, so it stays on the volume only.
+      FCM_PROJECT_ID: ${FCM_PROJECT_ID}
+      FCM_SERVICE_ACCOUNT_PATH: /app/data/fcm/service-account.json
       # shared secret guarding the internal broadcast/KaPosts push-injection endpoints
       INTERNAL_PUSH_SECRET: ${INTERNAL_PUSH_SECRET}
       RUST_LOG: info
