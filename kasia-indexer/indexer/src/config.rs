@@ -20,6 +20,15 @@ pub struct IndexerConfig {
     pub apns_environment: ApnsEnvironment,
     #[serde(default = "default_push_auth_mode")]
     pub push_auth_mode: PushAuthMode,
+    // --- FCM (Firebase Cloud Messaging) for Android push ---
+    // GCP/Firebase project id (e.g. "kachat-12345"); required to enable FCM delivery.
+    pub fcm_project_id: Option<String>,
+    // Path to the Firebase *service-account* JSON (Console → Project settings → Service
+    // accounts → Generate new private key). Used for FCM HTTP v1 OAuth2. Mounted on the box,
+    // like the APNs .p8. Prefer this over the inline form.
+    pub fcm_service_account_path: Option<PathBuf>,
+    // Inline alternative to fcm_service_account_path (the full service-account JSON as a string).
+    pub fcm_service_account_json: Option<String>,
 }
 
 fn default_periodic_processor_interval_secs() -> u64 {

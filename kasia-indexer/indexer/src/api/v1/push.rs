@@ -855,14 +855,10 @@ fn verify_schnorr_signature(
 }
 
 fn normalize_device_token(token: &str) -> Result<String, PushApiError> {
-    let cleaned: String = token
-        .chars()
-        .filter(|character| character.is_ascii_hexdigit())
-        .collect();
-    if cleaned.len() < 64 || cleaned.len() > 512 || !cleaned.len().is_multiple_of(2) {
-        return Err(PushApiError::bad_request("Invalid device token length"));
-    }
-    Ok(cleaned.to_ascii_lowercase())
+    // Single source of truth (accepts both APNs hex and FCM tokens) lives in `crate::push` so the
+    // stored DB key and the signed `device_token_hash` are computed identically.
+    crate::push::normalize_device_token(token)
+        .map_err(|err| PushApiError::bad_request(err.to_string()))
 }
 
 fn normalize_hex_field(

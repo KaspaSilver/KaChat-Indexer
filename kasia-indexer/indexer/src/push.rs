@@ -1,6 +1,7 @@
 use crate::api::to_rpc_address;
 use crate::config::ApnsEnvironment;
 use crate::context::IndexerContext;
+use crate::fcm::{FcmClient, FcmError};
 use futures_util::{StreamExt, stream};
 use indexer_actors::metrics::SharedMetrics;
 use indexer_actors::push::{ExtensionPushEvent, PushEvent, PushEventKind};
@@ -13,7 +14,7 @@ use indexer_db::push::{
 use jsonwebtoken::{EncodingKey, Header};
 use kaspa_rpc_core::{RpcAddress, RpcNetworkType};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,11 +30,16 @@ const MAX_ALIAS_LEN_BYTES: usize = 64;
 const MAX_ADDRESS_LEN_BYTES: usize = 128;
 const MAX_PLATFORM_LEN_BYTES: usize = 16;
 const WALLET_PUBKEY_HEX_LEN: usize = 64;
-const SUPPORTED_PLATFORMS: &[&str] = &["ios", "macos"];
+const SUPPORTED_PLATFORMS: &[&str] = &["ios", "macos", "android"];
+/// FCM registration tokens are case-sensitive and much longer than APNs hex tokens; these bound
+/// what we accept for `platform=android`.
+const MIN_FCM_TOKEN_LEN: usize = 64;
+const MAX_FCM_TOKEN_LEN: usize = 4096;
 pub const GROUP_V1_CAPABILITY: &str = "group_v1";
 pub const PUSH_REGISTRY_COMMAND_CAPACITY: usize = 256;
 const MAX_PUSH_FANOUT: usize = 512;
 const APNS_SEND_CONCURRENCY: usize = 16;
+const FCM_SEND_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct WalletBinding {
@@ -935,6 +941,18 @@ impl PushRegistry {
         result
     }
 
+    /// Resolve the registered platform for each token (skipping any that are no longer
+    /// registered). Used by the dispatcher to route each token to APNs vs FCM.
+    fn platforms_for_tokens(&self, tokens: &[String]) -> anyhow::Result<HashMap<String, String>> {
+        let mut map = HashMap::with_capacity(tokens.len());
+        for token in tokens {
+            if let Some(registration) = self.get_registration(token)? {
+                map.insert(token.clone(), registration.platform);
+            }
+        }
+        Ok(map)
+    }
+
     fn token_allows_alias(&mut self, token: &str, alias: &str) -> bool {
         if let Some(aliases) = self.alias_cache.get(token) {
             return aliases.is_empty() || aliases.contains(alias);
@@ -1143,6 +1161,10 @@ enum PushRegistryCommand {
         actor_pubkey: String,
         response: RegistryResponse<Vec<String>>,
     },
+    PlatformsForTokens {
+        tokens: Vec<String>,
+        response: RegistryResponse<HashMap<String, String>>,
+    },
 }
 
 pub struct PushRegistryActor {
@@ -1285,6 +1307,10 @@ impl PushRegistryActor {
                     response,
                 } => {
                     let result = self.registry.tokens_for_kaposts(&target_pubkey, &actor_pubkey);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::PlatformsForTokens { tokens, response } => {
+                    let result = self.registry.platforms_for_tokens(&tokens);
                     let _ = response.send(result);
                 }
             }
@@ -1462,6 +1488,15 @@ impl PushRegistryHandle {
         .await
     }
 
+    /// Map each token to its registered platform (ios/macos/android), skipping unregistered ones.
+    pub async fn platforms_for_tokens(
+        &self,
+        tokens: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        self.request(|response| PushRegistryCommand::PlatformsForTokens { tokens, response })
+            .await
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
     }
@@ -1513,6 +1548,7 @@ pub struct PushDispatcher {
     registry: PushRegistryHandle,
     metrics: SharedMetrics,
     apns: Option<ApnsClient>,
+    fcm: Option<FcmClient>,
     network_type: RpcNetworkType,
     sent_cache: SentTxCache,
     invalid_token_counts: HashMap<String, u8>,
@@ -1532,12 +1568,27 @@ impl PushDispatcher {
                 None
             }
         };
+        let fcm = match FcmClient::from_config(&context.config) {
+            Ok(Some(client)) => {
+                info!("[Push] FCM enabled (project {})", client.project_id());
+                Some(client)
+            }
+            Ok(None) => {
+                info!("[Push] FCM disabled: no service account configured");
+                None
+            }
+            Err(err) => {
+                warn!("[Push] FCM disabled: {err}");
+                None
+            }
+        };
         Self {
             rx,
             ext_rx,
             metrics: registry.metrics(),
             registry,
             apns,
+            fcm,
             network_type: context.network_type,
             // Dedup window across BOTH the block-processor (real-time) and virtual-chain
             // (acceptance) emits, plus any reprocessing. 60s was too short — if acceptance landed
@@ -1554,7 +1605,7 @@ impl PushDispatcher {
                 event = self.rx.recv_async() => {
                     let Ok(event) = event else { break };
                     self.metrics.increment_push_events_total();
-                    if self.apns.is_none() {
+                    if !self.push_enabled() {
                         continue;
                     }
                     if let Err(err) = self.handle_event(event).await {
@@ -1564,7 +1615,7 @@ impl PushDispatcher {
                 ext = self.ext_rx.recv_async() => {
                     let Ok(event) = ext else { break };
                     self.metrics.increment_push_events_total();
-                    if self.apns.is_none() {
+                    if !self.push_enabled() {
                         continue;
                     }
                     if let Err(err) = self.handle_extension_event(event).await {
@@ -1586,10 +1637,6 @@ impl PushDispatcher {
             self.metrics.increment_push_dedup_dropped_total();
             return Ok(());
         }
-        let apns = match &self.apns {
-            Some(apns) => apns,
-            None => return Ok(()),
-        };
         match event {
             ExtensionPushEvent::Broadcast {
                 channel,
@@ -1614,15 +1661,24 @@ impl PushDispatcher {
                     aps: ExtensionAps {
                         alert: ExtensionAlert {
                             title: format!("#{channel}"),
-                            subtitle: Some(subtitle),
-                            body,
+                            subtitle: Some(subtitle.clone()),
+                            body: body.clone(),
                         },
                         sound: "default",
                         thread_id: format!("broadcast:{channel}"),
                     },
                     post_id: None,
                 };
-                self.deliver_extension(apns, tokens, &payload, &tx_id).await;
+                // FCM data-only mirror (Android builds the notification from these fields).
+                let mut data = BTreeMap::new();
+                data.insert("type".to_string(), "broadcast".to_string());
+                data.insert("channel".to_string(), channel.clone());
+                data.insert("title".to_string(), format!("#{channel}"));
+                data.insert("subtitle".to_string(), subtitle);
+                data.insert("body".to_string(), body);
+                data.insert("thread_id".to_string(), format!("broadcast:{channel}"));
+                data.insert("tx_id".to_string(), tx_id.clone());
+                self.deliver(tokens, &payload, &data, Some(&tx_id)).await;
                 Ok(())
             }
             ExtensionPushEvent::KaPosts {
@@ -1649,55 +1705,148 @@ impl PushDispatcher {
                     aps: ExtensionAps {
                         alert: ExtensionAlert {
                             title: "KaPosts".to_string(),
-                            subtitle: Some(subtitle),
-                            body,
+                            subtitle: Some(subtitle.clone()),
+                            body: body.clone(),
                         },
                         sound: "default",
                         thread_id: "kaposts".to_string(),
                     },
-                    post_id,
+                    post_id: post_id.clone(),
                 };
-                self.deliver_extension(apns, tokens, &payload, &tx_id).await;
+                let mut data = BTreeMap::new();
+                data.insert("type".to_string(), "kaposts".to_string());
+                data.insert("title".to_string(), "KaPosts".to_string());
+                data.insert("subtitle".to_string(), subtitle);
+                data.insert("body".to_string(), body);
+                data.insert("thread_id".to_string(), "kaposts".to_string());
+                data.insert("tx_id".to_string(), tx_id.clone());
+                if let Some(post_id) = post_id {
+                    data.insert("post_id".to_string(), post_id);
+                }
+                self.deliver(tokens, &payload, &data, Some(&tx_id)).await;
                 Ok(())
             }
         }
     }
 
-    async fn deliver_extension(
-        &self,
-        apns: &ApnsClient,
+    fn push_enabled(&self) -> bool {
+        self.apns.is_some() || self.fcm.is_some()
+    }
+
+    /// Route a fan-out set of tokens to the correct transport per registered platform: APNs for
+    /// ios/macos (and any unknown/legacy platform), FCM for android. APNs receives the rich
+    /// (encrypted) payload; FCM receives the data-only mirror. Bookkeeping (metrics, dead-token
+    /// pruning) is unified across both.
+    async fn deliver<P: serde::Serialize + Sync>(
+        &mut self,
         tokens: Vec<String>,
-        payload: &ExtensionPayload,
-        collapse_id: &str,
+        apns_payload: &P,
+        fcm_data: &BTreeMap<String, String>,
+        collapse_id: Option<&str>,
     ) {
-        let results = stream::iter(tokens.into_iter().map(|token| async move {
-            let result = apns.send_collapsible(&token, payload, Some(collapse_id)).await;
-            (token, result)
-        }))
-        .buffer_unordered(APNS_SEND_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-        for (token, result) in results {
-            match result {
-                Ok(()) => self.metrics.increment_push_sent_ok_total(),
-                Err(ApnsError::Unregistered) | Err(ApnsError::InvalidToken) => {
-                    self.metrics.increment_push_send_failed_total();
-                    let _ = self.registry.unregister(token).await;
+        if tokens.is_empty() {
+            return;
+        }
+        let platforms = self
+            .registry
+            .platforms_for_tokens(tokens.clone())
+            .await
+            .unwrap_or_default();
+        let mut apns_tokens = Vec::new();
+        let mut fcm_tokens = Vec::new();
+        for token in tokens {
+            match platforms.get(&token).map(String::as_str) {
+                Some("android") => fcm_tokens.push(token),
+                // ios / macos / unknown => APNs (legacy default).
+                _ => apns_tokens.push(token),
+            }
+        }
+
+        let mut outcomes: Vec<(String, DeliveryOutcome)> = Vec::new();
+
+        if let Some(apns) = self.apns.as_ref()
+            && !apns_tokens.is_empty()
+        {
+            let results = stream::iter(apns_tokens.into_iter().map(|token| async move {
+                let result = apns.send_collapsible(&token, apns_payload, collapse_id).await;
+                (token, DeliveryOutcome::from_apns(result))
+            }))
+            .buffer_unordered(APNS_SEND_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+            outcomes.extend(results);
+        }
+
+        if let Some(fcm) = self.fcm.as_ref()
+            && !fcm_tokens.is_empty()
+        {
+            let results = stream::iter(fcm_tokens.into_iter().map(|token| async move {
+                let result = fcm.send_data(&token, fcm_data, collapse_id).await;
+                (token, DeliveryOutcome::from_fcm(result))
+            }))
+            .buffer_unordered(FCM_SEND_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+            outcomes.extend(results);
+        }
+
+        self.record_outcomes(outcomes).await;
+    }
+
+    /// Apply metrics + dead-token pruning for a batch of delivery outcomes (transport-agnostic).
+    async fn record_outcomes(&mut self, outcomes: Vec<(String, DeliveryOutcome)>) {
+        for (token, outcome) in outcomes {
+            let token_short = token
+                .get(token.len().saturating_sub(8)..)
+                .unwrap_or(token.as_str())
+                .to_string();
+            match outcome {
+                DeliveryOutcome::Delivered => {
+                    self.metrics.increment_push_sent_ok_total();
+                    self.invalid_token_counts.remove(&token);
                 }
-                Err(err) => {
+                DeliveryOutcome::Unregistered => {
+                    warn!("[Push] Unregistered token ...{}, removing", token_short);
                     self.metrics.increment_push_send_failed_total();
-                    warn!("[Push] extension delivery failed: {err}");
+                    self.metrics.increment_push_unregistered_removed_total();
+                    let _ = self.registry.unregister(token.clone()).await;
+                    self.invalid_token_counts.remove(&token);
+                }
+                DeliveryOutcome::InvalidToken => {
+                    self.metrics.increment_push_send_failed_total();
+                    self.metrics.increment_push_invalid_token_total();
+                    let count = self.invalid_token_counts.entry(token.clone()).or_insert(0);
+                    *count = count.saturating_add(1);
+                    warn!(
+                        "[Push] Invalid token ...{} ({} consecutive)",
+                        token_short, count
+                    );
+                    if *count >= 10 {
+                        warn!(
+                            "[Push] Invalid token threshold reached for ...{}, removing",
+                            token_short
+                        );
+                        self.metrics.increment_push_unregistered_removed_total();
+                        let _ = self.registry.unregister(token.clone()).await;
+                        self.invalid_token_counts.remove(&token);
+                    }
+                }
+                DeliveryOutcome::AuthFailed(err) => {
+                    self.metrics.increment_push_send_failed_total();
+                    warn!(
+                        "[Push] auth failure for ...{}; keeping token registered: {}",
+                        token_short, err
+                    );
+                }
+                DeliveryOutcome::Failed(err) => {
+                    self.metrics.increment_push_send_failed_total();
+                    warn!("[Push] Failed to deliver to ...{}: {}", token_short, err);
                 }
             }
         }
     }
 
     async fn handle_event(&mut self, event: PushEvent) -> anyhow::Result<()> {
-        let apns = match &self.apns {
-            Some(apns) => apns,
-            None => return Ok(()),
-        };
-
         let mut tokens = match event.kind {
             PushEventKind::GroupMessage => {
                 let Some(group_id) = event.blinded_group_id else {
@@ -1794,68 +1943,62 @@ impl PushDispatcher {
             blinded_group_id: event.blinded_group_id.map(|id| id.to_hex()),
         };
 
-        let results = stream::iter(tokens.into_iter().map(|token| {
-            let payload = &payload;
-            async move {
-                let result = apns.send(&token, payload).await;
-                (token, result)
-            }
-        }))
-        .buffer_unordered(APNS_SEND_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-
-        for (token, result) in results {
-            let token_short = token
-                .get(token.len().saturating_sub(8)..)
-                .unwrap_or(token.as_str());
-            match result {
-                Ok(()) => {
-                    info!("[Push] Delivered to ...{}", token_short);
-                    self.metrics.increment_push_sent_ok_total();
-                    self.invalid_token_counts.remove(&token);
-                }
-                Err(ApnsError::Unregistered) => {
-                    warn!("[Push] Unregistered token ...{}, removing", token_short);
-                    self.metrics.increment_push_send_failed_total();
-                    self.metrics.increment_push_unregistered_removed_total();
-                    let _ = self.registry.unregister(token.clone()).await;
-                    self.invalid_token_counts.remove(&token);
-                }
-                Err(ApnsError::Auth(err)) => {
-                    self.metrics.increment_push_send_failed_total();
-                    warn!(
-                        "[Push] APNs auth failure for ...{}; keeping token registered: {}",
-                        token_short, err
-                    );
-                }
-                Err(ApnsError::InvalidToken) => {
-                    self.metrics.increment_push_send_failed_total();
-                    self.metrics.increment_push_invalid_token_total();
-                    let count = self.invalid_token_counts.entry(token.clone()).or_insert(0);
-                    *count = count.saturating_add(1);
-                    warn!(
-                        "[Push] Invalid token ...{} ({} consecutive)",
-                        token_short, count
-                    );
-                    if *count >= 10 {
-                        warn!(
-                            "[Push] Invalid token threshold reached for ...{}, removing",
-                            token_short
-                        );
-                        self.metrics.increment_push_unregistered_removed_total();
-                        let _ = self.registry.unregister(token.clone()).await;
-                        self.invalid_token_counts.remove(&token);
-                    }
-                }
-                Err(err) => {
-                    self.metrics.increment_push_send_failed_total();
-                    warn!("[Push] Failed to deliver to ...{}: {err}", token_short);
-                }
-            }
+        // FCM data-only mirror. `title`/`body` are the display-ready fallback (matching the APNs
+        // alert). We deliberately do NOT forward the encrypted body (`payload.payload`): FCM caps a
+        // message at 4KB and the ciphertext can be up to ~3.5KB, which would risk INVALID_ARGUMENT
+        // rejections (and wrongful token pruning). Android decrypts nothing yet — it shows the
+        // fallback text. When inline decryption is added, forward a size-bounded `enc_payload`.
+        let mut data = BTreeMap::new();
+        data.insert("type".to_string(), payload.message_type.clone());
+        data.insert("sender".to_string(), payload.sender.clone());
+        data.insert("tx_id".to_string(), payload.tx_id.clone());
+        data.insert("timestamp".to_string(), payload.timestamp.to_string());
+        data.insert("daa_score".to_string(), payload.daa_score.to_string());
+        data.insert("title".to_string(), payload.aps.alert.title.clone());
+        data.insert("body".to_string(), payload.aps.alert.body.clone());
+        if let Some(amount) = payload.amount {
+            data.insert("amount".to_string(), amount.to_string());
+        }
+        if let Some(group_id) = payload.blinded_group_id.as_ref() {
+            data.insert("blinded_group_id".to_string(), group_id.clone());
         }
 
+        // Chat pushes are already deduped server-side (sent_cache), so no collapse id is needed —
+        // preserves the pre-existing iOS delivery behavior (apns.send with no collapse header).
+        self.deliver(tokens, &payload, &data, None).await;
+
         Ok(())
+    }
+}
+
+/// Transport-agnostic delivery result, produced by mapping either `ApnsError` or `FcmError`.
+enum DeliveryOutcome {
+    Delivered,
+    Unregistered,
+    InvalidToken,
+    AuthFailed(String),
+    Failed(String),
+}
+
+impl DeliveryOutcome {
+    fn from_apns(result: Result<(), ApnsError>) -> Self {
+        match result {
+            Ok(()) => Self::Delivered,
+            Err(ApnsError::Unregistered) => Self::Unregistered,
+            Err(ApnsError::InvalidToken) => Self::InvalidToken,
+            Err(ApnsError::Auth(err)) => Self::AuthFailed(err),
+            Err(err) => Self::Failed(err.to_string()),
+        }
+    }
+
+    fn from_fcm(result: Result<(), FcmError>) -> Self {
+        match result {
+            Ok(()) => Self::Delivered,
+            Err(FcmError::Unregistered) => Self::Unregistered,
+            Err(FcmError::InvalidToken) => Self::InvalidToken,
+            Err(FcmError::Auth(err)) => Self::AuthFailed(err),
+            Err(err) => Self::Failed(err.to_string()),
+        }
     }
 }
 
@@ -2089,10 +2232,6 @@ impl ApnsClient {
         Ok(token)
     }
 
-    async fn send<T: Serialize>(&self, token: &str, payload: &T) -> Result<(), ApnsError> {
-        self.send_collapsible(token, payload, None).await
-    }
-
     async fn send_collapsible<T: Serialize>(
         &self,
         token: &str,
@@ -2145,13 +2284,44 @@ impl ApnsClient {
     }
 }
 
-fn normalize_device_token(token: &str) -> anyhow::Result<String> {
-    let cleaned: String = token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    // APNs treats the token as opaque; length may vary across environments/devices.
-    if cleaned.len() < 64 || cleaned.len() > 512 || !cleaned.len().is_multiple_of(2) {
+/// Canonicalize a device token for both storage (DB key) and the signed auth preimage.
+///
+/// Two token shapes are supported and auto-detected so the same function agrees on both the
+/// registration path and the signature-verification path:
+///   * **APNs** (iOS/macOS): opaque *hex* — may arrive with separators, stripped to lowercase hex.
+///   * **FCM** (Android): base64url-ish, case-sensitive, contains non-hex characters (always a
+///     `:` at minimum) — kept verbatim (trimmed), only charset/length validated.
+///
+/// The Android client MUST hash the FCM token exactly as sent (trimmed, unchanged case) so its
+/// `device_token_hash` matches what the server computes here.
+pub(crate) fn normalize_device_token(token: &str) -> anyhow::Result<String> {
+    let trimmed = token.trim();
+    // If every non-whitespace char is a hex digit, treat it as an APNs token (legacy behavior:
+    // strip separators, lowercase). Any other char (`:`, `_`, `-`, or g-z/G-Z) => FCM token.
+    let is_apns_hex = !trimmed
+        .chars()
+        .any(|c| !c.is_ascii_hexdigit() && !c.is_whitespace());
+
+    if is_apns_hex {
+        let cleaned: String = trimmed.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        // APNs treats the token as opaque; length may vary across environments/devices.
+        if cleaned.len() < 64 || cleaned.len() > 512 || !cleaned.len().is_multiple_of(2) {
+            anyhow::bail!("Invalid device token length");
+        }
+        return Ok(cleaned.to_ascii_lowercase());
+    }
+
+    // FCM registration token — preserve exactly (case-sensitive), validate charset + length.
+    if trimmed.len() < MIN_FCM_TOKEN_LEN || trimmed.len() > MAX_FCM_TOKEN_LEN {
         anyhow::bail!("Invalid device token length");
     }
-    Ok(cleaned.to_lowercase())
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+    {
+        anyhow::bail!("Invalid device token characters");
+    }
+    Ok(trimmed.to_string())
 }
 
 fn normalize_platform(platform: String) -> anyhow::Result<String> {
@@ -2568,8 +2738,8 @@ mod tests {
     use super::{
         DeviceRegistration, GROUP_V1_CAPABILITY, MAX_ADDRESS_LEN_BYTES, MAX_ALIAS_LEN_BYTES,
         MAX_ALIASES, MAX_WATCHED_ADDRESSES, PushRegistry, PushRegistryActor, WalletBinding,
-        address_to_payload, normalize_platform, normalize_wallet_pubkey, resolve_wallet_binding,
-        validate_registration_limits,
+        address_to_payload, normalize_device_token, normalize_platform, normalize_wallet_pubkey,
+        resolve_wallet_binding, validate_registration_limits,
     };
     use indexer_actors::metrics::create_shared_metrics;
     use indexer_db::push::{
@@ -2579,7 +2749,7 @@ mod tests {
     use kaspa_addresses::{Address, Prefix, Version};
 
     #[test]
-    fn normalize_platform_accepts_ios_and_macos() {
+    fn normalize_platform_accepts_ios_macos_and_android() {
         assert_eq!(
             normalize_platform(" iOS ".to_string()).expect("ios should be accepted"),
             "ios"
@@ -2588,12 +2758,48 @@ mod tests {
             normalize_platform("macOS".to_string()).expect("macos should be accepted"),
             "macos"
         );
+        assert_eq!(
+            normalize_platform(" Android ".to_string()).expect("android should be accepted"),
+            "android"
+        );
     }
 
     #[test]
     fn normalize_platform_rejects_unsupported() {
-        assert!(normalize_platform("android".to_string()).is_err());
+        assert!(normalize_platform("windows".to_string()).is_err());
         assert!(normalize_platform("".to_string()).is_err());
+    }
+
+    #[test]
+    fn normalize_device_token_accepts_apns_hex() {
+        let apns = "a".repeat(64);
+        assert_eq!(
+            normalize_device_token(&apns).expect("apns hex accepted"),
+            apns
+        );
+        // uppercase + separators are normalized to lowercase hex
+        assert_eq!(
+            normalize_device_token("AABB CCDD ".to_string().repeat(8).as_str())
+                .expect("apns hex accepted"),
+            "aabbccdd".repeat(8)
+        );
+        // odd length / too short rejected
+        assert!(normalize_device_token("abc").is_err());
+    }
+
+    #[test]
+    fn normalize_device_token_accepts_and_preserves_fcm() {
+        // Representative FCM token: contains ':' and mixed case → kept verbatim.
+        let fcm = format!("cXyZ-_9{}:APA91bHun_{}", "aB3".repeat(20), "Zz9".repeat(20));
+        let normalized = normalize_device_token(&fcm).expect("fcm token accepted");
+        assert_eq!(normalized, fcm, "FCM tokens must be case-preserved and unmodified");
+    }
+
+    #[test]
+    fn normalize_device_token_rejects_bad_fcm_chars() {
+        // '/' is outside the FCM charset.
+        let bad = format!("has/slash{}", "a".repeat(64));
+        assert!(normalize_device_token(&bad).is_err());
     }
 
     #[test]
@@ -2636,6 +2842,9 @@ mod tests {
             device_key_id: None,
             device_key_public_key_b64: None,
             device_key_counter: None,
+            watched_broadcast_channels: vec![],
+            hidden_broadcast_senders: Default::default(),
+            kaposts_pubkey: None,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -2694,6 +2903,9 @@ mod tests {
                 vec![GROUP_V1_CAPABILITY.to_string()],
                 Some(watched_address.clone()),
                 vec!["alice".to_string()],
+                vec![],
+                Default::default(),
+                None,
                 None,
                 None,
             )
@@ -2732,6 +2944,9 @@ mod tests {
                 vec![GROUP_V1_CAPABILITY.to_string()],
                 Some(watched_address),
                 vec!["bob".to_string()],
+                vec![],
+                Default::default(),
+                None,
                 None,
                 None,
             )
