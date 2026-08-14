@@ -20,7 +20,17 @@ pub const EMPTY_VERSION: u8 = 0; // used when we don't know address at all
 
 #[repr(C)]
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Immutable, IntoBytes, FromBytes, Unaligned, KnownLayout,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Immutable,
+    IntoBytes,
+    FromBytes,
+    Unaligned,
+    KnownLayout,
 )]
 pub struct AddressPayload {
     pub inverse_version: u8,

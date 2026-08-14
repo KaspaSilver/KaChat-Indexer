@@ -118,6 +118,12 @@ pub struct PushRegistrationRequest {
     #[serde(default)]
     #[serde(rename = "kaposts_notify")]
     pub kaposts_notify: Option<KaPostsNotify>,
+    // Address Activity: the device's own receive addresses to be notified about incoming KAS.
+    // Absent = feature off for this device. Kept out of the auth preimage, like other optional
+    // fields added after LegacyV1.
+    #[serde(default)]
+    #[serde(rename = "watch_only_addresses")]
+    pub watch_only_addresses: Vec<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -152,6 +158,12 @@ pub struct PushUpdateRequest {
     #[serde(default)]
     #[serde(rename = "kaposts_notify")]
     pub kaposts_notify: Option<KaPostsNotify>,
+    // Address Activity: the device's own receive addresses to be notified about incoming KAS.
+    // Absent = feature off for this device. Kept out of the auth preimage, like other optional
+    // fields added after LegacyV1.
+    #[serde(default)]
+    #[serde(rename = "watch_only_addresses")]
+    pub watch_only_addresses: Vec<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -407,6 +419,7 @@ async fn register_device(
             payload.hidden_broadcast_senders,
             payload.kaposts_pubkey,
             payload.kaposts_notify,
+            payload.watch_only_addresses,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )
@@ -472,6 +485,7 @@ async fn update_registration(
             payload.hidden_broadcast_senders,
             payload.kaposts_pubkey,
             payload.kaposts_notify,
+            payload.watch_only_addresses,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )

@@ -22,9 +22,38 @@ pub mod util;
 // ---------------------------------------------------------------------------
 
 use indexer_db::AddressPayload;
-use std::sync::RwLock;
+use std::collections::HashSet;
+use std::sync::{LazyLock, RwLock};
 
 static PERSONAL_ADDRESSES: RwLock<Vec<AddressPayload>> = RwLock::new(Vec::new());
+
+/// Union of every device's registered `watch_only_addresses` (Address Activity push). The push
+/// registry keeps this in sync; the block processor consults it to decide whether an accepted tx
+/// credits a watched address without a per-output DB lookup. Empty = the feature is fully inert
+/// (no device is watching any owned address), so the block-processing gate is a no-op.
+static WATCH_ONLY_ADDRESSES: LazyLock<RwLock<HashSet<AddressPayload>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// Replace the watch-only address set (called by the push registry on any registration change).
+pub fn set_watch_only_addresses(addrs: HashSet<AddressPayload>) {
+    if let Ok(mut guard) = WATCH_ONLY_ADDRESSES.write() {
+        *guard = addrs;
+    }
+}
+
+/// Whether no device is watching any owned address — the block processor skips all funds work then.
+pub fn watch_only_is_empty() -> bool {
+    WATCH_ONLY_ADDRESSES.read().map(|g| g.is_empty()).unwrap_or(true)
+}
+
+/// Whether `addr` is watched by at least one device (a slightly-stale over-approximation is fine —
+/// the dispatcher does the precise per-device match, so a false positive just drops downstream).
+pub fn watch_only_contains(addr: &AddressPayload) -> bool {
+    WATCH_ONLY_ADDRESSES
+        .read()
+        .map(|g| g.contains(addr))
+        .unwrap_or(false)
+}
 
 /// Replace the personal-mode address allowlist. An empty vec turns personal mode OFF.
 pub fn set_personal_addresses(addrs: Vec<AddressPayload>) {

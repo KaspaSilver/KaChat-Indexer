@@ -58,6 +58,34 @@ by Settings > Notifications > Wallet > "Address Activity" (default on).
 5. **Rate limiting** (recommended): cap address-activity pushes per device (e.g. 30/hour,
    drop-oldest) — an address posted publicly could otherwise be used to ping-spam a device.
 
+### Server status — IMPLEMENTED (2026-08)
+Shipped in the indexer. Notes / deviations from the spec above:
+- **Registration field** `watch_only_addresses` added to `/v1/push/register` + `/v1/push/update`
+  (DTOs + `DeviceRegistration` value), kept out of the auth preimage. Normalized to canonical
+  bech32, deduped, sorted (stable fast-path compare), capped at 200
+  (`MAX_WATCH_ONLY_ADDRESSES`); invalid entries are skipped, not rejected. Stored on the value
+  only — matching is done by scanning registrations (no reverse partition / DB migration).
+- **Ingestion**: chose the in-process block-processing match (design 2), not `UtxosChanged`.
+  `block_processor.rs::emit_funds_received` runs *before* the `ciph_msg` gate, matches outputs
+  against the `WATCH_ONLY_ADDRESSES` global set (union of all devices' watch-only addresses,
+  rebuilt by the push registry on every registration change and at startup), and emits a
+  `FundsPushEvent` over a dedicated channel. Fully inert when the global set is empty.
+- **DEVIATION — fires on block sighting, not acceptance.** The emit sits on the block-processor
+  path (same as the message pushes), so a tx later reorged out of the selected chain could yield
+  a rare false "received". The dispatcher dedups per `(tx, address)`. Revisit if false positives
+  show up in practice.
+- **Self-send filtering**: done per-device in `PushRegistry::watch_only_tokens` — a device is
+  dropped when the resolved tx sender is also in that device's watch-only set. Sender is a
+  best-effort first-input resolution via the acceptance partition (catches the common
+  change-from-own-payment case; may miss multi-input txs).
+- **Payload**: one push per credited address (NOT summed per-tx as the spec suggested — simpler,
+  and reads clearly as "received X on addr"). `type: "address_activity"`, `address`,
+  `amount_sompi`, `amount_kas`, server-rendered `title`/`body` ("Received 1.25 KAS"),
+  `thread_id: "funds:<address>"`, `tx_id`, `ts`. FCM carries a notification block (non-sensitive,
+  so it shows when the app is dead), like broadcast/KaPosts. No APNs collapse id (sent_cache
+  dedups instead).
+- **Rate limiting**: per-device sliding window, 30/hour (`WATCH_ONLY_RATE_*`) in the dispatcher.
+
 ### Client status (for coordination, no server action)
 The iOS NSE (`KaChatNotificationService`) and Android `KaChatFirebaseMessagingService` do NOT
 yet have a branch for `type: "address_activity"` — that client work is queued to land when this

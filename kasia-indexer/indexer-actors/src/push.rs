@@ -41,6 +41,22 @@ pub enum ExtensionPushEvent {
     },
 }
 
+/// Address Activity: an accepted tx credited one or more watched (owned / watch-only) addresses
+/// with KAS. Fed from the block processor to the push dispatcher, which matches each credited
+/// address to the devices watching it, sums per device, self-send-filters (skips when `sender` is
+/// one of that device's own addresses), rate-limits, and sends an `address_activity` push.
+#[derive(Debug, Clone)]
+pub struct FundsPushEvent {
+    /// Watched outputs credited by this tx: (address, amount in sompi).
+    pub credited: Vec<(AddressPayload, u64)>,
+    /// Resolved input (sender) address, if known — used for self-send filtering.
+    pub sender: Option<AddressPayload>,
+    /// Accepting tx id.
+    pub tx_id: [u8; 32],
+    pub timestamp: u64,
+    pub daa_score: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PushEvent {
     pub kind: PushEventKind,
