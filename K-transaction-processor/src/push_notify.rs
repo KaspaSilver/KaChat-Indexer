@@ -115,6 +115,17 @@ pub fn broadcast_preview(content: &str) -> String {
     truncate_chars(trimmed, 150)
 }
 
+/// True if `content` is a reaction envelope (`{"type":"reaction",...}`). Reactions are invisible
+/// protocol traffic and must never generate a push (NOTIFICATION_EXTENSIONS_TODO.md §3). Broadcasts
+/// are plaintext, so we can inspect and suppress here; encrypted 1:1 reactions are suppressed
+/// client-side instead.
+pub fn is_reaction_content(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content.trim())
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "reaction"))
+        .unwrap_or(false)
+}
+
 /// Notify the push service of a new broadcast in a tracked channel.
 pub fn notify_broadcast(channel: &str, sender_address: &str, body: String, tx_id: &str) {
     post(
@@ -131,9 +142,12 @@ pub fn notify_broadcast(channel: &str, sender_address: &str, body: String, tx_id
 
 /// Notify the push service of a KaPosts action targeting `target_pubkey`'s content.
 /// `actor_pubkey` is the actor (skipped from delivery); `post_id` is the target content txid.
+/// `action` is the machine-readable kind (`like`/`dislike`/`comment`/`repost`/`follow`) so the
+/// push service can honor per-type KaPosts notification toggles (kaposts_notify).
 pub fn notify_kaposts(
     target_pubkey: &str,
     actor_pubkey: &str,
+    action: &str,
     body: String,
     post_id: Option<String>,
     tx_id: &str,
@@ -153,6 +167,7 @@ pub fn notify_kaposts(
         json!({
             "target_pubkey": target_pubkey.trim().to_lowercase(),
             "actor_pubkey": actor_pubkey.trim().to_lowercase(),
+            "action": action,
             "subtitle": subtitle,
             "body": body,
             "post_id": post_id,

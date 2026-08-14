@@ -29,6 +29,9 @@ pub enum ExtensionPushEvent {
         target_pubkey: String,
         /// Actor's pubkey — devices registered as the actor are skipped (no self-pings).
         actor_pubkey: String,
+        /// Action kind (like/dislike/comment/repost/follow) for per-type toggle filtering; `None`
+        /// = always notify.
+        action: Option<String>,
         subtitle: String,
         body: String,
         /// Target content txid (present when the action targets content; omitted for follows).

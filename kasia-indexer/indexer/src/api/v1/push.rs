@@ -1,5 +1,7 @@
 use crate::config::PushAuthMode;
-use crate::push::{DeviceKeyBinding, GROUP_V1_CAPABILITY, PushRegistryHandle, WalletBinding};
+use crate::push::{
+    DeviceKeyBinding, GROUP_V1_CAPABILITY, KaPostsNotify, PushRegistryHandle, WalletBinding,
+};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use indexer_actors::push::ExtensionPushEvent;
@@ -111,6 +113,11 @@ pub struct PushRegistrationRequest {
     #[serde(default)]
     #[serde(rename = "kaposts_pubkey")]
     pub kaposts_pubkey: Option<String>,
+    // Per-action-type KaPosts push toggles. Absent = all enabled (old clients unaffected). Kept
+    // out of the auth preimage, like other optional fields added after LegacyV1.
+    #[serde(default)]
+    #[serde(rename = "kaposts_notify")]
+    pub kaposts_notify: Option<KaPostsNotify>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -140,6 +147,11 @@ pub struct PushUpdateRequest {
     #[serde(default)]
     #[serde(rename = "kaposts_pubkey")]
     pub kaposts_pubkey: Option<String>,
+    // Per-action-type KaPosts push toggles. Absent = all enabled (old clients unaffected). Kept
+    // out of the auth preimage, like other optional fields added after LegacyV1.
+    #[serde(default)]
+    #[serde(rename = "kaposts_notify")]
+    pub kaposts_notify: Option<KaPostsNotify>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -202,6 +214,10 @@ pub struct InternalBroadcastPush {
 pub struct InternalKaPostsPush {
     pub target_pubkey: String,
     pub actor_pubkey: String,
+    // Machine-readable action kind (like/dislike/comment/repost/follow) so the dispatcher can
+    // honor per-type KaPosts toggles. Absent = always notify.
+    #[serde(default)]
+    pub action: Option<String>,
     pub subtitle: String,
     pub body: String,
     #[serde(default)]
@@ -251,6 +267,7 @@ async fn internal_kaposts_push(
     let _ = state.ext_push_tx.try_send(ExtensionPushEvent::KaPosts {
         target_pubkey: payload.target_pubkey,
         actor_pubkey: payload.actor_pubkey,
+        action: payload.action,
         subtitle: payload.subtitle,
         body: payload.body,
         post_id: payload.post_id,
@@ -389,6 +406,7 @@ async fn register_device(
             payload.watched_broadcast_channels,
             payload.hidden_broadcast_senders,
             payload.kaposts_pubkey,
+            payload.kaposts_notify,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )
@@ -453,6 +471,7 @@ async fn update_registration(
             payload.watched_broadcast_channels,
             payload.hidden_broadcast_senders,
             payload.kaposts_pubkey,
+            payload.kaposts_notify,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )

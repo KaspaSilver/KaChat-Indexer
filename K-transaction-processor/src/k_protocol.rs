@@ -887,8 +887,11 @@ impl KProtocolProcessor {
                 transaction_id, channel, sender_address
             );
             // Fire-and-forget push notify (push service filters to bell-on / non-hidden devices).
-            let body = crate::push_notify::broadcast_preview(content);
-            crate::push_notify::notify_broadcast(&channel, &sender_address, body, transaction_id);
+            // Reaction envelopes are invisible protocol traffic — never push them.
+            if !crate::push_notify::is_reaction_content(content) {
+                let body = crate::push_notify::broadcast_preview(content);
+                crate::push_notify::notify_broadcast(&channel, &sender_address, body, transaction_id);
+            }
         }
         Ok(())
     }
@@ -1340,6 +1343,7 @@ impl KProtocolProcessor {
             crate::push_notify::notify_kaposts(
                 &target,
                 &k_reply.sender_pubkey,
+                "comment",
                 body,
                 Some(k_reply.post_id.clone()),
                 transaction_id,
@@ -1497,6 +1501,7 @@ impl KProtocolProcessor {
             crate::push_notify::notify_kaposts(
                 &target,
                 &k_quote.sender_pubkey,
+                "repost",
                 body,
                 Some(k_quote.content_id.clone()),
                 transaction_id,
@@ -1706,17 +1711,19 @@ impl KProtocolProcessor {
                 transaction_id, post_id_for_log, vote_for_log
             );
         }
-        // KaPosts push: notify the post's author of an up/down vote (skip unvote).
-        let vote_body = match vote_for_log.as_str() {
-            "upvote" => Some("liked your post"),
-            "downvote" => Some("disliked your post"),
+        // KaPosts push: notify the post's author of an up/down vote (skip unvote). Carries the
+        // action kind so the push service can honor the like/dislike toggles.
+        let vote_action = match vote_for_log.as_str() {
+            "upvote" => Some(("like", "liked your post")),
+            "downvote" => Some(("dislike", "disliked your post")),
             _ => None,
         };
-        if let Some(vote_body) = vote_body {
+        if let Some((action, vote_body)) = vote_action {
             if let Some(target) = self.content_author_pubkey(&post_id_for_log).await {
                 crate::push_notify::notify_kaposts(
                     &target,
                     &k_vote.sender_pubkey,
+                    action,
                     vote_body.to_string(),
                     Some(post_id_for_log.clone()),
                     transaction_id,
@@ -2038,6 +2045,7 @@ impl KProtocolProcessor {
                     crate::push_notify::notify_kaposts(
                         &k_follow.followed_user_pubkey,
                         &k_follow.sender_pubkey,
+                        "follow",
                         "followed you".to_string(),
                         None,
                         transaction_id,
