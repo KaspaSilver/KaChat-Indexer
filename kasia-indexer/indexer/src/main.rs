@@ -212,6 +212,9 @@ async fn main() -> anyhow::Result<()> {
         primary_address_partition,
         metrics.clone(),
     );
+    // Address Activity: seed the block processor's watch-only gate from persisted registrations
+    // before the registry is moved into its actor (rebuild reads the device partition).
+    push_registry.rebuild_watch_only_global();
     let (push_registry_actor, push_registry) =
         PushRegistryActor::new(push_registry, PUSH_REGISTRY_COMMAND_CAPACITY);
     let _push_registry_actor_handle = std::thread::Builder::new()
@@ -220,8 +223,15 @@ async fn main() -> anyhow::Result<()> {
     let (push_tx, push_rx) = flume::bounded(2048);
     // KaChat fork: broadcast/KaPosts pushes injected by the K-processor over HTTP.
     let (ext_push_tx, ext_push_rx) = flume::bounded(1024);
-    let push_dispatcher =
-        PushDispatcher::new(push_rx, ext_push_rx, push_registry.clone(), &context);
+    // Address Activity: funds-received events from the block processor to the push dispatcher.
+    let (funds_push_tx, funds_push_rx) = flume::bounded(2048);
+    let push_dispatcher = PushDispatcher::new(
+        push_rx,
+        ext_push_rx,
+        funds_push_rx,
+        push_registry.clone(),
+        &context,
+    );
     let _push_handle = tokio::spawn(push_dispatcher.run());
     let (block_intake_tx, block_intake_rx) = flume::bounded(4096);
     let (vcc_intake_tx, vcc_intake_rx) = flume::bounded(4096);
@@ -273,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         .tx_id_to_acceptance_partition(tx_id_to_acceptance_partition.clone())
         .shared_metrics(metrics.clone())
         .push_tx(push_tx.clone())
+        .push_funds_tx(funds_push_tx.clone())
         .build();
     let mut virtual_processor = VirtualProcessor::builder()
         .synced_capacity(3_000_000)

@@ -4,7 +4,7 @@ use crate::context::IndexerContext;
 use crate::fcm::{FcmClient, FcmError};
 use futures_util::{StreamExt, stream};
 use indexer_actors::metrics::SharedMetrics;
-use indexer_actors::push::{ExtensionPushEvent, PushEvent, PushEventKind};
+use indexer_actors::push::{ExtensionPushEvent, FundsPushEvent, PushEvent, PushEventKind};
 use indexer_actors::util::ToHex;
 use indexer_db::AddressPayload;
 use indexer_db::push::{
@@ -26,6 +26,9 @@ const MAX_WATCHED_GROUP_IDS: usize = 256;
 const MAX_CAPABILITIES: usize = 32;
 const MAX_CAPABILITY_LEN_BYTES: usize = 64;
 const MAX_ALIASES: usize = 256;
+/// Address Activity: cap on a device's watch-only address set (its own receive addresses). Bounded
+/// so a single registration can't blow up the global gate set or the per-event device scan.
+const MAX_WATCH_ONLY_ADDRESSES: usize = 200;
 const MAX_ALIAS_LEN_BYTES: usize = 64;
 const MAX_ADDRESS_LEN_BYTES: usize = 128;
 const MAX_PLATFORM_LEN_BYTES: usize = 16;
@@ -40,6 +43,9 @@ pub const PUSH_REGISTRY_COMMAND_CAPACITY: usize = 256;
 const MAX_PUSH_FANOUT: usize = 512;
 const APNS_SEND_CONCURRENCY: usize = 16;
 const FCM_SEND_CONCURRENCY: usize = 16;
+/// Address Activity: at most this many funds pushes per device within `WATCH_ONLY_RATE_WINDOW`.
+const WATCH_ONLY_RATE_MAX: usize = 30;
+const WATCH_ONLY_RATE_WINDOW: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone)]
 pub struct WalletBinding {
@@ -103,6 +109,7 @@ impl PushRegistry {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        watch_only_addresses: Vec<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -129,6 +136,7 @@ impl PushRegistry {
         let normalized_broadcast_channels = normalize_broadcast_channels(watched_broadcast_channels);
         let normalized_hidden_senders = normalize_hidden_broadcast_senders(hidden_broadcast_senders);
         let normalized_kaposts_pubkey = normalize_kaposts_pubkey(kaposts_pubkey);
+        let (normalized_watch_only, _) = normalize_watch_only_addresses(watch_only_addresses);
         if addresses.is_empty() && group_ids.is_empty() {
             anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
         }
@@ -205,8 +213,13 @@ impl PushRegistry {
                     && reg.hidden_broadcast_senders == normalized_hidden_senders
                     && reg.kaposts_pubkey == normalized_kaposts_pubkey
                     && reg.kaposts_notify == kaposts_notify
+                    && reg.watch_only_addresses == normalized_watch_only
             })
             .unwrap_or(false);
+        let watch_only_changed = existing
+            .as_ref()
+            .map(|reg| reg.watch_only_addresses != normalized_watch_only)
+            .unwrap_or(!normalized_watch_only.is_empty());
         if addresses_unchanged
             && group_ids_unchanged
             && capabilities_unchanged
@@ -243,6 +256,7 @@ impl PushRegistry {
             hidden_broadcast_senders: normalized_hidden_senders,
             kaposts_pubkey: normalized_kaposts_pubkey,
             kaposts_notify,
+            watch_only_addresses: normalized_watch_only,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -356,6 +370,11 @@ impl PushRegistry {
                 if !had_existing {
                     self.metrics.increment_push_registered_devices(1);
                 }
+                // Address Activity: if this device's watch-only set changed, refresh the global
+                // set the block processor gates funds-detection on.
+                if watch_only_changed {
+                    self.rebuild_watch_only_global();
+                }
                 Ok(())
             }
             Ok(_) => {
@@ -384,6 +403,7 @@ impl PushRegistry {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        watch_only_addresses: Vec<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -409,6 +429,7 @@ impl PushRegistry {
         let normalized_broadcast_channels = normalize_broadcast_channels(watched_broadcast_channels);
         let normalized_hidden_senders = normalize_hidden_broadcast_senders(hidden_broadcast_senders);
         let normalized_kaposts_pubkey = normalize_kaposts_pubkey(kaposts_pubkey);
+        let (normalized_watch_only, _) = normalize_watch_only_addresses(watch_only_addresses);
         if addresses.is_empty() && group_ids.is_empty() {
             anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
         }
@@ -485,8 +506,13 @@ impl PushRegistry {
                     && reg.hidden_broadcast_senders == normalized_hidden_senders
                     && reg.kaposts_pubkey == normalized_kaposts_pubkey
                     && reg.kaposts_notify == kaposts_notify
+                    && reg.watch_only_addresses == normalized_watch_only
             })
             .unwrap_or(false);
+        let watch_only_changed = existing
+            .as_ref()
+            .map(|reg| reg.watch_only_addresses != normalized_watch_only)
+            .unwrap_or(!normalized_watch_only.is_empty());
         if addresses_unchanged
             && group_ids_unchanged
             && capabilities_unchanged
@@ -521,6 +547,7 @@ impl PushRegistry {
             hidden_broadcast_senders: normalized_hidden_senders,
             kaposts_pubkey: normalized_kaposts_pubkey,
             kaposts_notify,
+            watch_only_addresses: normalized_watch_only,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -634,6 +661,11 @@ impl PushRegistry {
                 if !had_existing {
                     self.metrics.increment_push_registered_devices(1);
                 }
+                // Address Activity: if this device's watch-only set changed, refresh the global
+                // set the block processor gates funds-detection on.
+                if watch_only_changed {
+                    self.rebuild_watch_only_global();
+                }
                 Ok(())
             }
             Ok(_) => {
@@ -661,6 +693,10 @@ impl PushRegistry {
             validate_unregister_binding(existing.as_ref(), wallet_pubkey.as_deref())?;
         }
         let had_existing = existing.is_some();
+        let had_watch_only = existing
+            .as_ref()
+            .map(|reg| !reg.watch_only_addresses.is_empty())
+            .unwrap_or(false);
         let token_key = token.as_bytes();
 
         self.metrics.increment_db_write_ops_total(1);
@@ -699,6 +735,10 @@ impl PushRegistry {
                 self.clear_capabilities(&token);
                 if had_existing {
                     self.metrics.decrement_push_registered_devices(1);
+                }
+                // Address Activity: dropping a device that watched addresses shrinks the global set.
+                if had_watch_only {
+                    self.rebuild_watch_only_global();
                 }
                 Ok(())
             }
@@ -879,6 +919,64 @@ impl PushRegistry {
             if pk == target && pk != actor {
                 tokens.push(reg.device_token);
             }
+        }
+        Ok(tokens)
+    }
+
+    /// Address Activity: recompute the union of every device's `watch_only_addresses` and hand it
+    /// to the block processor's global gate. Called after any registration change that touched the
+    /// watch-only set, and once at startup. Scans all registrations (registration changes are
+    /// infrequent vs. blocks, so no incremental index is kept).
+    pub fn rebuild_watch_only_global(&self) {
+        let rtx = self.tx_keyspace.read_tx();
+        let mut set: HashSet<AddressPayload> = HashSet::new();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let Ok(value) = entry else { continue };
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            for address in &reg.watch_only_addresses {
+                if let Ok(payload) = address_to_payload(address) {
+                    set.insert(payload);
+                }
+            }
+        }
+        indexer_actors::set_watch_only_addresses(set);
+    }
+
+    /// Address Activity: devices to notify that `address` was credited. Matches devices whose
+    /// `watch_only_addresses` include `address`, and drops any device that also watches `sender`
+    /// (a self-send: the owner funded their own address, so no ping). Iterates all registrations
+    /// (funds events are gated on the global watch-only set, so this only runs for real hits).
+    pub fn watch_only_tokens(
+        &self,
+        address: &AddressPayload,
+        sender: Option<&AddressPayload>,
+    ) -> anyhow::Result<Vec<String>> {
+        let rtx = self.tx_keyspace.read_tx();
+        let mut tokens = Vec::new();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let value = entry?;
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            if reg.watch_only_addresses.is_empty() {
+                continue;
+            }
+            let payloads: Vec<AddressPayload> = reg
+                .watch_only_addresses
+                .iter()
+                .filter_map(|a| address_to_payload(a).ok())
+                .collect();
+            if !payloads.iter().any(|p| p == address) {
+                continue;
+            }
+            if let Some(sender) = sender
+                && payloads.iter().any(|p| p == sender)
+            {
+                continue;
+            }
+            tokens.push(reg.device_token);
         }
         Ok(tokens)
     }
@@ -1149,6 +1247,7 @@ enum PushRegistryCommand {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        watch_only_addresses: Vec<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1164,6 +1263,7 @@ enum PushRegistryCommand {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        watch_only_addresses: Vec<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1215,6 +1315,11 @@ enum PushRegistryCommand {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, KaPostsNotify>>,
     },
+    MatchWatchOnlyTokens {
+        address: AddressPayload,
+        sender: Option<AddressPayload>,
+        response: RegistryResponse<Vec<String>>,
+    },
 }
 
 pub struct PushRegistryActor {
@@ -1251,6 +1356,7 @@ impl PushRegistryActor {
                     hidden_broadcast_senders,
                     kaposts_pubkey,
                     kaposts_notify,
+                    watch_only_addresses,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1267,6 +1373,7 @@ impl PushRegistryActor {
                         hidden_broadcast_senders,
                         kaposts_pubkey,
                         kaposts_notify,
+                        watch_only_addresses,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1283,6 +1390,7 @@ impl PushRegistryActor {
                     hidden_broadcast_senders,
                     kaposts_pubkey,
                     kaposts_notify,
+                    watch_only_addresses,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1298,6 +1406,7 @@ impl PushRegistryActor {
                         hidden_broadcast_senders,
                         kaposts_pubkey,
                         kaposts_notify,
+                        watch_only_addresses,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1375,6 +1484,14 @@ impl PushRegistryActor {
                     let result = self.registry.kaposts_notify_for_tokens(&tokens);
                     let _ = response.send(result);
                 }
+                PushRegistryCommand::MatchWatchOnlyTokens {
+                    address,
+                    sender,
+                    response,
+                } => {
+                    let result = self.registry.watch_only_tokens(&address, sender.as_ref());
+                    let _ = response.send(result);
+                }
             }
         }
         info!("[PushRegistry] actor stopped");
@@ -1416,6 +1533,7 @@ impl PushRegistryHandle {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        watch_only_addresses: Vec<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1431,6 +1549,7 @@ impl PushRegistryHandle {
             hidden_broadcast_senders,
             kaposts_pubkey,
             kaposts_notify,
+            watch_only_addresses,
             wallet_binding,
             device_key_binding,
             response,
@@ -1451,6 +1570,7 @@ impl PushRegistryHandle {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        watch_only_addresses: Vec<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1465,6 +1585,7 @@ impl PushRegistryHandle {
             hidden_broadcast_senders,
             kaposts_pubkey,
             kaposts_notify,
+            watch_only_addresses,
             wallet_binding,
             device_key_binding,
             response,
@@ -1581,6 +1702,20 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// Address Activity: devices to notify that `address` was credited (self-sends filtered out).
+    pub async fn match_watch_only_tokens(
+        &self,
+        address: AddressPayload,
+        sender: Option<AddressPayload>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.request(|response| PushRegistryCommand::MatchWatchOnlyTokens {
+            address,
+            sender,
+            response,
+        })
+        .await
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
     }
@@ -1654,6 +1789,10 @@ pub struct DeviceRegistration {
     // Per-action-type KaPosts push toggles; absent = all enabled.
     #[serde(default)]
     pub kaposts_notify: Option<KaPostsNotify>,
+    // Address Activity: the device's own/watch-only addresses to be notified on incoming KAS.
+    // Normalized canonical bech32; stored on the value only (feeds the in-memory watch-only index).
+    #[serde(default)]
+    pub watch_only_addresses: Vec<String>,
     #[serde(default)]
     pub app_attest_key_id: Option<String>,
     #[serde(default)]
@@ -1667,6 +1806,7 @@ pub struct DeviceRegistration {
 pub struct PushDispatcher {
     rx: flume::Receiver<PushEvent>,
     ext_rx: flume::Receiver<ExtensionPushEvent>,
+    funds_rx: flume::Receiver<FundsPushEvent>,
     registry: PushRegistryHandle,
     metrics: SharedMetrics,
     apns: Option<ApnsClient>,
@@ -1674,12 +1814,16 @@ pub struct PushDispatcher {
     network_type: RpcNetworkType,
     sent_cache: SentTxCache,
     invalid_token_counts: HashMap<String, u8>,
+    /// Address Activity: per-device sliding-window timestamps used to cap funds pushes (a busy
+    /// address must not spam a device). See `WATCH_ONLY_RATE_*`.
+    watch_only_rate: HashMap<String, VecDeque<Instant>>,
 }
 
 impl PushDispatcher {
     pub fn new(
         rx: flume::Receiver<PushEvent>,
         ext_rx: flume::Receiver<ExtensionPushEvent>,
+        funds_rx: flume::Receiver<FundsPushEvent>,
         registry: PushRegistryHandle,
         context: &IndexerContext,
     ) -> Self {
@@ -1707,6 +1851,7 @@ impl PushDispatcher {
         Self {
             rx,
             ext_rx,
+            funds_rx,
             metrics: registry.metrics(),
             registry,
             apns,
@@ -1718,6 +1863,7 @@ impl PushDispatcher {
             // so an hour-long window is always safe and kills the duplicates.
             sent_cache: SentTxCache::new(Duration::from_secs(3600)),
             invalid_token_counts: HashMap::new(),
+            watch_only_rate: HashMap::new(),
         }
     }
 
@@ -1742,6 +1888,16 @@ impl PushDispatcher {
                     }
                     if let Err(err) = self.handle_extension_event(event).await {
                         warn!("[Push] Failed to handle extension event: {err}");
+                    }
+                }
+                funds = self.funds_rx.recv_async() => {
+                    let Ok(event) = funds else { break };
+                    self.metrics.increment_push_events_total();
+                    if !self.push_enabled() {
+                        continue;
+                    }
+                    if let Err(err) = self.handle_funds_event(event).await {
+                        warn!("[Push] Failed to handle funds event: {err}");
                     }
                 }
             }
@@ -1865,6 +2021,92 @@ impl PushDispatcher {
                 Ok(())
             }
         }
+    }
+
+    /// Address Activity: an accepted tx credited one or more watched addresses. For each credited
+    /// address, match the devices watching it (self-sends already filtered by the registry), apply
+    /// the per-device rate limit, and send a display-ready `address_activity` push. Non-sensitive
+    /// content (just "received N KAS"), so FCM carries a notification block (fires when the app is
+    /// dead), mirroring broadcast/KaPosts.
+    async fn handle_funds_event(&mut self, event: FundsPushEvent) -> anyhow::Result<()> {
+        let tx_hex = event.tx_id.to_hex();
+        for (address, amount) in &event.credited {
+            let Ok(Some(address_str)) =
+                to_rpc_address(address, self.network_type).map(|opt| opt.map(|a| a.to_string()))
+            else {
+                continue;
+            };
+            // Per-(tx, address) dedup: a tx crediting two watched addresses fires two pushes, but
+            // the same (tx, address) reprocessed (real-time vs. acceptance) must not double-fire.
+            let dedup_key = format!("funds:{tx_hex}:{address_str}");
+            if !self.sent_cache.mark_seen(&dedup_key) {
+                self.metrics.increment_push_dedup_dropped_total();
+                continue;
+            }
+            let mut tokens = self
+                .registry
+                .match_watch_only_tokens(*address, event.sender)
+                .await?;
+            tokens.sort_unstable();
+            tokens.dedup();
+            let now = Instant::now();
+            tokens.retain(|token| self.allow_watch_only_push(token, now));
+            if tokens.is_empty() {
+                continue;
+            }
+            if tokens.len() > MAX_PUSH_FANOUT {
+                tokens.truncate(MAX_PUSH_FANOUT);
+            }
+            let amount_kas = format_kas(*amount);
+            let title = "Funds received".to_string();
+            let body = format!("Received {amount_kas} KAS");
+            let thread_id = format!("funds:{address_str}");
+            let payload = ExtensionPayload {
+                aps: ExtensionAps {
+                    alert: ExtensionAlert {
+                        title: title.clone(),
+                        subtitle: Some(address_str.clone()),
+                        body: body.clone(),
+                    },
+                    sound: "default",
+                    thread_id: thread_id.clone(),
+                },
+                post_id: None,
+            };
+            let mut data = BTreeMap::new();
+            data.insert("type".to_string(), "address_activity".to_string());
+            data.insert("address".to_string(), address_str.clone());
+            data.insert("amount_sompi".to_string(), amount.to_string());
+            data.insert("amount_kas".to_string(), amount_kas);
+            data.insert("title".to_string(), title);
+            data.insert("subtitle".to_string(), address_str);
+            data.insert("body".to_string(), body);
+            data.insert("thread_id".to_string(), thread_id);
+            data.insert("tx_id".to_string(), tx_hex.clone());
+            data.insert("ts".to_string(), event.timestamp.to_string());
+            // Collapse id omitted: our sent_cache already dedups per (tx, address), and a single
+            // tx-wide collapse id would merge two distinct address credits into one notification.
+            self.deliver(tokens, &payload, &data, None, true).await;
+        }
+        Ok(())
+    }
+
+    /// Address Activity: sliding-window per-device rate limit. Records and allows the send when the
+    /// device is under `WATCH_ONLY_RATE_MAX` within `WATCH_ONLY_RATE_WINDOW`; otherwise drops it.
+    fn allow_watch_only_push(&mut self, token: &str, now: Instant) -> bool {
+        let window = self.watch_only_rate.entry(token.to_string()).or_default();
+        while let Some(front) = window.front() {
+            if now.duration_since(*front) > WATCH_ONLY_RATE_WINDOW {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if window.len() >= WATCH_ONLY_RATE_MAX {
+            return false;
+        }
+        window.push_back(now);
+        true
     }
 
     fn push_enabled(&self) -> bool {
@@ -2281,6 +2523,22 @@ fn payload_within_limit(payload: String) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Format a sompi amount as a human KAS string (8 decimals, trailing zeros trimmed). 1 KAS =
+/// 100_000_000 sompi.
+fn format_kas(sompi: u64) -> String {
+    const SOMPI_PER_KAS: u64 = 100_000_000;
+    let whole = sompi / SOMPI_PER_KAS;
+    let frac = sompi % SOMPI_PER_KAS;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let mut frac_str = format!("{frac:08}");
+    while frac_str.ends_with('0') {
+        frac_str.pop();
+    }
+    format!("{whole}.{frac_str}")
 }
 
 struct SentTxCache {
@@ -2828,6 +3086,35 @@ fn normalize_addresses(
     Ok((normalized, payloads))
 }
 
+/// Address Activity: canonicalize + dedupe + cap a device's watch-only addresses. Invalid entries
+/// are skipped rather than failing the whole registration (a heartbeat must not error on one bad
+/// address). Output is sorted so the fast-path "unchanged" comparison is stable across calls.
+fn normalize_watch_only_addresses(
+    addresses: Vec<String>,
+) -> (Vec<String>, Vec<AddressPayload>) {
+    let mut seen = HashSet::new();
+    let mut pairs: Vec<(String, AddressPayload)> = Vec::new();
+    for address in addresses {
+        let Ok(rpc) = RpcAddress::try_from(address.trim()) else {
+            continue;
+        };
+        let Ok(payload) = AddressPayload::try_from(&rpc) else {
+            continue;
+        };
+        let string = rpc.to_string();
+        if seen.insert(string.clone()) {
+            pairs.push((string, payload));
+        }
+        if pairs.len() >= MAX_WATCH_ONLY_ADDRESSES {
+            break;
+        }
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let normalized = pairs.iter().map(|(s, _)| s.clone()).collect();
+    let payloads = pairs.into_iter().map(|(_, p)| p).collect();
+    (normalized, payloads)
+}
+
 fn normalize_aliases(aliases: Vec<String>) -> HashSet<String> {
     let mut normalized = HashSet::new();
     for alias in aliases {
@@ -2948,8 +3235,9 @@ fn unix_time_secs() -> u64 {
 mod tests {
     use super::{
         DeviceRegistration, GROUP_V1_CAPABILITY, MAX_ADDRESS_LEN_BYTES, MAX_ALIAS_LEN_BYTES,
-        MAX_ALIASES, MAX_WATCHED_ADDRESSES, PushRegistry, PushRegistryActor, WalletBinding,
-        address_to_payload, normalize_device_token, normalize_platform, normalize_wallet_pubkey,
+        MAX_ALIASES, MAX_WATCH_ONLY_ADDRESSES, MAX_WATCHED_ADDRESSES, PushRegistry,
+        PushRegistryActor, WalletBinding, address_to_payload, format_kas, normalize_device_token,
+        normalize_platform, normalize_wallet_pubkey, normalize_watch_only_addresses,
         resolve_wallet_binding, validate_registration_limits,
     };
     use indexer_actors::metrics::create_shared_metrics;
@@ -3030,6 +3318,34 @@ mod tests {
     }
 
     #[test]
+    fn format_kas_trims_and_scales() {
+        assert_eq!(format_kas(0), "0");
+        assert_eq!(format_kas(100_000_000), "1");
+        assert_eq!(format_kas(150_000_000), "1.5");
+        assert_eq!(format_kas(1), "0.00000001");
+        assert_eq!(format_kas(250_000_000), "2.5");
+    }
+
+    #[test]
+    fn normalize_watch_only_dedupes_caps_and_skips_invalid() {
+        let valid = Address::new(Prefix::Mainnet, Version::PubKey, &[3; 32]).to_string();
+        let (normalized, payloads) = normalize_watch_only_addresses(vec![
+            valid.clone(),
+            valid.clone(), // duplicate collapses
+            "not-an-address".to_string(), // invalid skipped
+        ]);
+        assert_eq!(normalized, vec![valid.clone()]);
+        assert_eq!(payloads.len(), 1);
+
+        // Cap: distinct valid addresses beyond the limit are truncated.
+        let many: Vec<String> = (0u8..=255)
+            .map(|i| Address::new(Prefix::Mainnet, Version::PubKey, &[i; 32]).to_string())
+            .collect();
+        let (capped, _) = normalize_watch_only_addresses(many);
+        assert_eq!(capped.len(), MAX_WATCH_ONLY_ADDRESSES);
+    }
+
+    #[test]
     fn normalize_wallet_pubkey_rejects_invalid_values() {
         assert!(normalize_wallet_pubkey("").is_err());
         assert!(normalize_wallet_pubkey("abc").is_err());
@@ -3057,6 +3373,7 @@ mod tests {
             hidden_broadcast_senders: Default::default(),
             kaposts_pubkey: None,
             kaposts_notify: None,
+            watch_only_addresses: vec![],
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -3119,6 +3436,7 @@ mod tests {
                 Default::default(),
                 None,
                 None,
+                vec![],
                 None,
                 None,
             )
@@ -3161,6 +3479,7 @@ mod tests {
                 Default::default(),
                 None,
                 None,
+                vec![],
                 None,
                 None,
             )

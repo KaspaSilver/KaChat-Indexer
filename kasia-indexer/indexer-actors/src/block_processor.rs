@@ -4,7 +4,7 @@ use crate::BlockGap;
 use crate::block_gap_filler::BlockGapFiller;
 use crate::data_source::Command;
 use crate::metrics::SharedMetrics;
-use crate::push::{PushEvent, PushEventKind, parse_self_stash_alias};
+use crate::push::{FundsPushEvent, PushEvent, PushEventKind, parse_self_stash_alias};
 use crate::util::{ToHex, ToHex64};
 use crate::virtual_chain_processor::CompactHeader;
 use fjall::{TxKeyspace, WriteTransaction};
@@ -84,6 +84,8 @@ pub struct BlockProcessor {
     tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
     shared_metrics: SharedMetrics,
     push_tx: Option<flume::Sender<PushEvent>>,
+    // Address Activity: accepted txs crediting a watched (owned) address are forwarded here.
+    push_funds_tx: Option<flume::Sender<FundsPushEvent>>,
     #[builder(default)]
     gaps_filling_in_progress: usize,
 }
@@ -363,6 +365,54 @@ impl BlockProcessor {
         }
     }
 
+    /// Address Activity: emit a [`FundsPushEvent`] when `tx` credits at least one watched (owned)
+    /// address. The dispatcher does the per-device match, per-device summing, self-send filtering
+    /// and rate limiting. Cheap no-op when no device is watching (`watch_only_is_empty`).
+    fn emit_funds_received(
+        &self,
+        tx: &RpcTransaction,
+        tx_id: RpcTransactionId,
+        block_header: &RpcHeader,
+    ) {
+        let Some(funds_tx) = &self.push_funds_tx else {
+            return;
+        };
+        if crate::watch_only_is_empty() {
+            return;
+        }
+        let mut credited: Vec<(AddressPayload, u64)> = Vec::new();
+        for output in &tx.outputs {
+            if let Ok(addr) = AddressPayload::try_from(&output.script_public_key)
+                && crate::watch_only_contains(&addr)
+            {
+                credited.push((addr, output.value));
+            }
+        }
+        if credited.is_empty() {
+            return;
+        }
+        // Best-effort sender resolution (first input) for self-send filtering — catches the common
+        // case of change returning to one's own address from one's own outgoing payment.
+        let sender = tx.inputs.first().and_then(|input| {
+            let outpoint = input.previous_outpoint;
+            self.tx_id_to_acceptance_partition
+                .key_by_tx_id(outpoint.transaction_id.as_ref())
+                .ok()
+                .flatten()
+                .map(|key| key.receiver)
+        });
+        let event = FundsPushEvent {
+            credited,
+            sender,
+            tx_id: tx_id.as_bytes(),
+            timestamp: block_header.timestamp,
+            daa_score: block_header.daa_score,
+        };
+        if funds_tx.try_send(event).is_err() {
+            warn!("Dropping funds push event; queue is full");
+        }
+    }
+
     fn handle_transaction(
         &self,
         wtx: &mut WriteTransaction,
@@ -373,6 +423,14 @@ impl BlockProcessor {
             Some(data) => data.transaction_id,
             None => Transaction::try_from(tx.clone())?.id(),
         };
+
+        // Address Activity: notify on a tx crediting a watched (owned) address. Runs before the
+        // sealed-operation gate so bare KAS transfers (no ciph_msg payload — they return just
+        // below) are covered, and is fully inert when no device watches any owned address. NOTE:
+        // this fires on block sighting (matching the message pushes here), not strictly on
+        // acceptance; the dispatcher dedups by tx id, but a tx later reorged out of the selected
+        // chain could yield a rare false "received" push.
+        self.emit_funds_received(tx, tx_id, block_header);
 
         // todo handle the case when tx has many operations
         let Some(op) = parse_sealed_operation(&tx.payload).inspect(|op| {
