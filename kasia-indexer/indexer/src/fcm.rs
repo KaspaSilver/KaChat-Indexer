@@ -204,6 +204,7 @@ impl FcmClient {
         token: &str,
         data: &BTreeMap<String, String>,
         collapse_key: Option<&str>,
+        include_notification: bool,
     ) -> Result<(), FcmError> {
         let access_token = self.access_token().await?;
 
@@ -212,10 +213,27 @@ impl FcmClient {
             // FCM caps collapse_key length; tx ids are well under it.
             collapse_key: collapse_key.map(|c| c.to_string()),
         };
+        // Optional `notification` block. Included for public, display-ready content
+        // (broadcast/KaPosts) so the OS shows it even when the app is dead. OMITTED for encrypted
+        // DM/group content (data-only) so the app's handler runs and decrypts the body itself.
+        let notification = if include_notification {
+            match (data.get("title"), data.get("body")) {
+                (Some(title), Some(body)) if !title.is_empty() || !body.is_empty() => {
+                    Some(FcmNotification {
+                        title: title.clone(),
+                        body: body.clone(),
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let message = FcmSendRequest {
             message: FcmMessage {
                 token,
                 data,
+                notification,
                 android,
             },
         };
@@ -255,6 +273,19 @@ impl FcmClient {
             })
             .map(|s| s.to_string());
 
+        // Diagnostic: surface the exact FCM rejection reason (SENDER_ID_MISMATCH vs
+        // INVALID_ARGUMENT vs UNREGISTERED, etc.) and a token suffix so mismatched-project
+        // tokens are identifiable. Only fires on a non-success response.
+        let token_suffix = token.get(token.len().saturating_sub(10)..).unwrap_or(token);
+        tracing::warn!(
+            "[FCM] send failed token=...{} http={} status={:?} detail={:?} body={}",
+            token_suffix,
+            status,
+            status_str,
+            detail_code,
+            body.chars().take(300).collect::<String>()
+        );
+
         let code = detail_code.or_else(|| status_str.clone());
         match code.as_deref() {
             // Token gone: app uninstalled or token rotated.
@@ -282,7 +313,15 @@ struct FcmSendRequest<'a> {
 struct FcmMessage<'a> {
     token: &'a str,
     data: &'a BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notification: Option<FcmNotification>,
     android: AndroidConfig,
+}
+
+#[derive(Serialize)]
+struct FcmNotification {
+    title: String,
+    body: String,
 }
 
 #[derive(Serialize)]

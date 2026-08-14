@@ -342,9 +342,15 @@ async fn register_device(
     State(state): State<PushApi>,
     Json(payload): Json<PushRegistrationRequest>,
 ) -> impl IntoResponse {
+    let dt = &payload.device_token;
+    let token_suffix = dt.get(dt.len().saturating_sub(10)..).unwrap_or(dt.as_str());
+    let watched_sample: Vec<&String> = payload.watched_addresses.iter().take(4).collect();
     tracing::info!(
-        "[Push] register watched={} groups={} bcast_channels={:?} kaposts_pubkey={} primary={} auth={}",
+        "[Push] register platform={} token=...{} watched={} watched_sample={:?} groups={} bcast_channels={:?} kaposts_pubkey={} primary={} auth={}",
+        payload.platform,
+        token_suffix,
         payload.watched_addresses.len(),
+        watched_sample,
         payload.watched_group_ids.as_ref().map(|g| g.len()).unwrap_or(0),
         payload.watched_broadcast_channels,
         payload.kaposts_pubkey.is_some(),

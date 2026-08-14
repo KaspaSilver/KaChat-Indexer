@@ -36,6 +36,9 @@ services:
     build:
       context: ../..
       dockerfile: docker/kachat/Dockerfile.kachat-app
+      # Build on the host network so the utoipa-swagger-ui build script can reliably resolve
+      # codeload.github.com (the default build network intermittently fails DNS on this box).
+      network: host
     restart: unless-stopped
     network_mode: "host"
     environment:

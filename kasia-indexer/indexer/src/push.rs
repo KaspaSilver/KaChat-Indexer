@@ -953,6 +953,23 @@ impl PushRegistry {
         Ok(map)
     }
 
+    /// Resolve each token's own (primary) address. Used to drop a device from a push when its own
+    /// wallet is the message sender (a user's own message must not ping their other devices).
+    fn primary_addresses_for_tokens(
+        &self,
+        tokens: &[String],
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let mut map = HashMap::with_capacity(tokens.len());
+        for token in tokens {
+            if let Some(registration) = self.get_registration(token)?
+                && let Some(primary) = registration.primary_address
+            {
+                map.insert(token.clone(), primary);
+            }
+        }
+        Ok(map)
+    }
+
     fn token_allows_alias(&mut self, token: &str, alias: &str) -> bool {
         if let Some(aliases) = self.alias_cache.get(token) {
             return aliases.is_empty() || aliases.contains(alias);
@@ -1165,6 +1182,10 @@ enum PushRegistryCommand {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, String>>,
     },
+    PrimaryAddressesForTokens {
+        tokens: Vec<String>,
+        response: RegistryResponse<HashMap<String, String>>,
+    },
 }
 
 pub struct PushRegistryActor {
@@ -1311,6 +1332,10 @@ impl PushRegistryActor {
                 }
                 PushRegistryCommand::PlatformsForTokens { tokens, response } => {
                     let result = self.registry.platforms_for_tokens(&tokens);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::PrimaryAddressesForTokens { tokens, response } => {
+                    let result = self.registry.primary_addresses_for_tokens(&tokens);
                     let _ = response.send(result);
                 }
             }
@@ -1497,6 +1522,15 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// Map each token to its registered primary (own) address, skipping those without one.
+    pub async fn primary_addresses_for_tokens(
+        &self,
+        tokens: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        self.request(|response| PushRegistryCommand::PrimaryAddressesForTokens { tokens, response })
+            .await
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
     }
@@ -1678,7 +1712,7 @@ impl PushDispatcher {
                 data.insert("body".to_string(), body);
                 data.insert("thread_id".to_string(), format!("broadcast:{channel}"));
                 data.insert("tx_id".to_string(), tx_id.clone());
-                self.deliver(tokens, &payload, &data, Some(&tx_id)).await;
+                self.deliver(tokens, &payload, &data, Some(&tx_id), true).await;
                 Ok(())
             }
             ExtensionPushEvent::KaPosts {
@@ -1723,7 +1757,7 @@ impl PushDispatcher {
                 if let Some(post_id) = post_id {
                     data.insert("post_id".to_string(), post_id);
                 }
-                self.deliver(tokens, &payload, &data, Some(&tx_id)).await;
+                self.deliver(tokens, &payload, &data, Some(&tx_id), true).await;
                 Ok(())
             }
         }
@@ -1737,12 +1771,18 @@ impl PushDispatcher {
     /// ios/macos (and any unknown/legacy platform), FCM for android. APNs receives the rich
     /// (encrypted) payload; FCM receives the data-only mirror. Bookkeeping (metrics, dead-token
     /// pruning) is unified across both.
+    /// `fcm_notification` = include a `notification` block in the FCM message. TRUE for public,
+    /// display-ready content (broadcast/KaPosts) so the OS shows it even when the app is dead.
+    /// FALSE for encrypted DM/group content so the message is data-only and the app's handler runs
+    /// to DECRYPT it and build the notification itself (matches iOS's NSE). Trade-off: data-only
+    /// needs the app wake-able (battery unrestricted) to fire when fully force-closed.
     async fn deliver<P: serde::Serialize + Sync>(
         &mut self,
         tokens: Vec<String>,
         apns_payload: &P,
         fcm_data: &BTreeMap<String, String>,
         collapse_id: Option<&str>,
+        fcm_notification: bool,
     ) {
         if tokens.is_empty() {
             return;
@@ -1761,6 +1801,14 @@ impl PushDispatcher {
                 _ => apns_tokens.push(token),
             }
         }
+
+        info!(
+            "[Push] deliver split: apns={} fcm={} (apns_configured={} fcm_configured={})",
+            apns_tokens.len(),
+            fcm_tokens.len(),
+            self.apns.is_some(),
+            self.fcm.is_some(),
+        );
 
         let mut outcomes: Vec<(String, DeliveryOutcome)> = Vec::new();
 
@@ -1781,7 +1829,9 @@ impl PushDispatcher {
             && !fcm_tokens.is_empty()
         {
             let results = stream::iter(fcm_tokens.into_iter().map(|token| async move {
-                let result = fcm.send_data(&token, fcm_data, collapse_id).await;
+                let result = fcm
+                    .send_data(&token, fcm_data, collapse_id, fcm_notification)
+                    .await;
                 (token, DeliveryOutcome::from_fcm(result))
             }))
             .buffer_unordered(FCM_SEND_CONCURRENCY)
@@ -1873,6 +1923,31 @@ impl PushDispatcher {
                     .await?
             }
         };
+        // Fires for EVERY chat/DM/group push event, before the empty-token early return, so a DM
+        // that matches zero devices is still visible (watched-address mismatch vs no-event-emitted).
+        let kind_label = match event.kind {
+            PushEventKind::Contextual => "contextual",
+            PushEventKind::Payment => "payment",
+            PushEventKind::Handshake => "handshake",
+            PushEventKind::SelfStash => "self_stash",
+            PushEventKind::GroupMessage => "group_message",
+            PushEventKind::GroupControl => "group_control",
+        };
+        let watched_str = to_rpc_address(&event.watched_address, self.network_type)
+            .ok()
+            .flatten()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        info!(
+            "[Push] chat-event kind={} matched_tokens={} payload_len={} watched_address={} alias={:?} blinded_group={} tx={}",
+            kind_label,
+            tokens.len(),
+            event.payload.as_ref().map(|p| p.len() as i64).unwrap_or(-1),
+            watched_str,
+            event.alias,
+            event.blinded_group_id.is_some(),
+            event.tx_id.to_hex(),
+        );
         if tokens.is_empty() {
             return Ok(());
         }
@@ -1892,6 +1967,22 @@ impl PushDispatcher {
             return Ok(());
         };
         let sender = sender_addr.to_string();
+
+        // Never notify a device of a message its own wallet sent. Without this, a device that
+        // watches its own address (needed to receive handshakes, where watched_address = receiver)
+        // also matches its own outgoing contextual messages (watched_address = sender) — so sending
+        // a DM from one of a user's devices would ping their other devices. For receiver-filtered
+        // kinds (payment/handshake) the sender's own devices aren't in the match set anyway, so
+        // this is a harmless no-op there.
+        let own_primaries = self
+            .registry
+            .primary_addresses_for_tokens(tokens.clone())
+            .await
+            .unwrap_or_default();
+        tokens.retain(|token| own_primaries.get(token).map(|primary| primary != &sender).unwrap_or(true));
+        if tokens.is_empty() {
+            return Ok(());
+        }
 
         let tx_id = event.tx_id.to_hex();
         if !self.sent_cache.mark_seen(&tx_id) {
@@ -1943,11 +2034,12 @@ impl PushDispatcher {
             blinded_group_id: event.blinded_group_id.map(|id| id.to_hex()),
         };
 
-        // FCM data-only mirror. `title`/`body` are the display-ready fallback (matching the APNs
-        // alert). We deliberately do NOT forward the encrypted body (`payload.payload`): FCM caps a
-        // message at 4KB and the ciphertext can be up to ~3.5KB, which would risk INVALID_ARGUMENT
-        // rejections (and wrongful token pruning). Android decrypts nothing yet — it shows the
-        // fallback text. When inline decryption is added, forward a size-bounded `enc_payload`.
+        // FCM data-only payload (no notification block — see deliver()): the Android FCM handler
+        // decrypts `enc_payload` with the wallet key and builds the notification with the real
+        // sender + text, mirroring iOS's Notification Service Extension. `title`/`body` are a
+        // fallback if decryption isn't possible. The sealed body is already bounded to
+        // MAX_PUSH_PAYLOAD_BYTES (3500), well under FCM's 4KB message cap once combined with the
+        // small metadata fields below.
         let mut data = BTreeMap::new();
         data.insert("type".to_string(), payload.message_type.clone());
         data.insert("sender".to_string(), payload.sender.clone());
@@ -1962,10 +2054,14 @@ impl PushDispatcher {
         if let Some(group_id) = payload.blinded_group_id.as_ref() {
             data.insert("blinded_group_id".to_string(), group_id.clone());
         }
+        // The sealed/encrypted message body for the app to decrypt locally.
+        if let Some(enc) = payload.payload.as_ref() {
+            data.insert("enc_payload".to_string(), enc.clone());
+        }
 
-        // Chat pushes are already deduped server-side (sent_cache), so no collapse id is needed —
-        // preserves the pre-existing iOS delivery behavior (apns.send with no collapse header).
-        self.deliver(tokens, &payload, &data, None).await;
+        // Chat pushes are already deduped server-side (sent_cache), so no collapse id is needed.
+        // Data-only (fcm_notification=false) so the Android handler runs and decrypts.
+        self.deliver(tokens, &payload, &data, None, false).await;
 
         Ok(())
     }
@@ -2541,11 +2637,22 @@ fn token_from_index_key(key: &[u8], prefix_len: usize) -> Option<String> {
         return None;
     }
     let token_bytes = &key[prefix_len..];
-    if !token_bytes.iter().all(|b| b.is_ascii_hexdigit()) {
+    let token = std::str::from_utf8(token_bytes).ok()?;
+    if token.is_empty() {
         return None;
     }
-    let token = std::str::from_utf8(token_bytes).ok()?;
-    Some(token.to_ascii_lowercase())
+    // Tokens are stored already-normalized (APNs = lowercase hex; FCM = case-sensitive
+    // base64url-ish with ':'), so return the stored bytes VERBATIM. Do NOT restrict to hex or
+    // lowercase — that silently dropped/corrupted Android FCM tokens, making them invisible to
+    // watched-address and group matching (DMs/group push never matched, while broadcast/KaPosts,
+    // which use separate indexes, worked). Validate the charset defensively only.
+    if !token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+    {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn decode_group_id_hex(value: &str) -> anyhow::Result<[u8; 32]> {
