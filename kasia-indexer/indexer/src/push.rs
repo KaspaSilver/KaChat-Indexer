@@ -102,6 +102,7 @@ impl PushRegistry {
         watched_broadcast_channels: Vec<String>,
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
+        kaposts_notify: Option<KaPostsNotify>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -203,6 +204,7 @@ impl PushRegistry {
                 reg.watched_broadcast_channels == normalized_broadcast_channels
                     && reg.hidden_broadcast_senders == normalized_hidden_senders
                     && reg.kaposts_pubkey == normalized_kaposts_pubkey
+                    && reg.kaposts_notify == kaposts_notify
             })
             .unwrap_or(false);
         if addresses_unchanged
@@ -240,6 +242,7 @@ impl PushRegistry {
             watched_broadcast_channels: normalized_broadcast_channels,
             hidden_broadcast_senders: normalized_hidden_senders,
             kaposts_pubkey: normalized_kaposts_pubkey,
+            kaposts_notify,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -380,6 +383,7 @@ impl PushRegistry {
         watched_broadcast_channels: Vec<String>,
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
+        kaposts_notify: Option<KaPostsNotify>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -480,6 +484,7 @@ impl PushRegistry {
                 reg.watched_broadcast_channels == normalized_broadcast_channels
                     && reg.hidden_broadcast_senders == normalized_hidden_senders
                     && reg.kaposts_pubkey == normalized_kaposts_pubkey
+                    && reg.kaposts_notify == kaposts_notify
             })
             .unwrap_or(false);
         if addresses_unchanged
@@ -515,6 +520,7 @@ impl PushRegistry {
             watched_broadcast_channels: normalized_broadcast_channels,
             hidden_broadcast_senders: normalized_hidden_senders,
             kaposts_pubkey: normalized_kaposts_pubkey,
+            kaposts_notify,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -970,6 +976,23 @@ impl PushRegistry {
         Ok(map)
     }
 
+    /// Each token's KaPosts per-type toggle prefs, skipping tokens that stored none (they default
+    /// to all-enabled). Used to filter KaPosts pushes by action kind.
+    fn kaposts_notify_for_tokens(
+        &self,
+        tokens: &[String],
+    ) -> anyhow::Result<HashMap<String, KaPostsNotify>> {
+        let mut map = HashMap::with_capacity(tokens.len());
+        for token in tokens {
+            if let Some(registration) = self.get_registration(token)?
+                && let Some(pref) = registration.kaposts_notify
+            {
+                map.insert(token.clone(), pref);
+            }
+        }
+        Ok(map)
+    }
+
     fn token_allows_alias(&mut self, token: &str, alias: &str) -> bool {
         if let Some(aliases) = self.alias_cache.get(token) {
             return aliases.is_empty() || aliases.contains(alias);
@@ -1125,6 +1148,7 @@ enum PushRegistryCommand {
         watched_broadcast_channels: Vec<String>,
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
+        kaposts_notify: Option<KaPostsNotify>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1139,6 +1163,7 @@ enum PushRegistryCommand {
         watched_broadcast_channels: Vec<String>,
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
+        kaposts_notify: Option<KaPostsNotify>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1186,6 +1211,10 @@ enum PushRegistryCommand {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, String>>,
     },
+    KaPostsNotifyForTokens {
+        tokens: Vec<String>,
+        response: RegistryResponse<HashMap<String, KaPostsNotify>>,
+    },
 }
 
 pub struct PushRegistryActor {
@@ -1221,6 +1250,7 @@ impl PushRegistryActor {
                     watched_broadcast_channels,
                     hidden_broadcast_senders,
                     kaposts_pubkey,
+                    kaposts_notify,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1236,6 +1266,7 @@ impl PushRegistryActor {
                         watched_broadcast_channels,
                         hidden_broadcast_senders,
                         kaposts_pubkey,
+                        kaposts_notify,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1251,6 +1282,7 @@ impl PushRegistryActor {
                     watched_broadcast_channels,
                     hidden_broadcast_senders,
                     kaposts_pubkey,
+                    kaposts_notify,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1265,6 +1297,7 @@ impl PushRegistryActor {
                         watched_broadcast_channels,
                         hidden_broadcast_senders,
                         kaposts_pubkey,
+                        kaposts_notify,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1338,6 +1371,10 @@ impl PushRegistryActor {
                     let result = self.registry.primary_addresses_for_tokens(&tokens);
                     let _ = response.send(result);
                 }
+                PushRegistryCommand::KaPostsNotifyForTokens { tokens, response } => {
+                    let result = self.registry.kaposts_notify_for_tokens(&tokens);
+                    let _ = response.send(result);
+                }
             }
         }
         info!("[PushRegistry] actor stopped");
@@ -1378,6 +1415,7 @@ impl PushRegistryHandle {
         watched_broadcast_channels: Vec<String>,
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
+        kaposts_notify: Option<KaPostsNotify>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1392,6 +1430,7 @@ impl PushRegistryHandle {
             watched_broadcast_channels,
             hidden_broadcast_senders,
             kaposts_pubkey,
+            kaposts_notify,
             wallet_binding,
             device_key_binding,
             response,
@@ -1411,6 +1450,7 @@ impl PushRegistryHandle {
         watched_broadcast_channels: Vec<String>,
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
+        kaposts_notify: Option<KaPostsNotify>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1424,6 +1464,7 @@ impl PushRegistryHandle {
             watched_broadcast_channels,
             hidden_broadcast_senders,
             kaposts_pubkey,
+            kaposts_notify,
             wallet_binding,
             device_key_binding,
             response,
@@ -1531,8 +1572,52 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// Map each token to its stored KaPosts per-type toggle prefs (tokens with none are omitted).
+    pub async fn kaposts_notify_for_tokens(
+        &self,
+        tokens: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, KaPostsNotify>> {
+        self.request(|response| PushRegistryCommand::KaPostsNotifyForTokens { tokens, response })
+            .await
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
+    }
+}
+
+/// Per-action-type KaPosts push toggles (iOS Settings > Notifications > KaPosts). A missing struct
+/// (or a missing field) defaults to enabled, so old clients keep getting everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct KaPostsNotify {
+    #[serde(default = "kaposts_notify_default")]
+    pub likes: bool,
+    #[serde(default = "kaposts_notify_default")]
+    pub dislikes: bool,
+    #[serde(default = "kaposts_notify_default")]
+    pub reposts: bool,
+    #[serde(default = "kaposts_notify_default")]
+    pub comments: bool,
+    #[serde(default = "kaposts_notify_default")]
+    pub follows: bool,
+}
+
+fn kaposts_notify_default() -> bool {
+    true
+}
+
+impl KaPostsNotify {
+    /// Whether a push for `action` (like/dislike/repost/comment/follow) is enabled. Unknown action
+    /// kinds always notify (fail open).
+    pub fn allows(&self, action: &str) -> bool {
+        match action {
+            "like" => self.likes,
+            "dislike" => self.dislikes,
+            "repost" => self.reposts,
+            "comment" => self.comments,
+            "follow" => self.follows,
+            _ => true,
+        }
     }
 }
 
@@ -1566,6 +1651,9 @@ pub struct DeviceRegistration {
     pub hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
     #[serde(default)]
     pub kaposts_pubkey: Option<String>,
+    // Per-action-type KaPosts push toggles; absent = all enabled.
+    #[serde(default)]
+    pub kaposts_notify: Option<KaPostsNotify>,
     #[serde(default)]
     pub app_attest_key_id: Option<String>,
     #[serde(default)]
@@ -1718,6 +1806,7 @@ impl PushDispatcher {
             ExtensionPushEvent::KaPosts {
                 target_pubkey,
                 actor_pubkey,
+                action,
                 subtitle,
                 body,
                 post_id,
@@ -1731,6 +1820,21 @@ impl PushDispatcher {
                 tokens.dedup();
                 if tokens.is_empty() {
                     return Ok(());
+                }
+                // Honor per-action-type KaPosts toggles: drop devices that disabled this action
+                // kind. A device with no stored preference (map miss) defaults to enabled.
+                if let Some(action) = action.as_deref() {
+                    let prefs = self
+                        .registry
+                        .kaposts_notify_for_tokens(tokens.clone())
+                        .await
+                        .unwrap_or_default();
+                    tokens.retain(|token| {
+                        prefs.get(token).map(|pref| pref.allows(action)).unwrap_or(true)
+                    });
+                    if tokens.is_empty() {
+                        return Ok(());
+                    }
                 }
                 if tokens.len() > MAX_PUSH_FANOUT {
                     tokens.truncate(MAX_PUSH_FANOUT);
@@ -2952,6 +3056,7 @@ mod tests {
             watched_broadcast_channels: vec![],
             hidden_broadcast_senders: Default::default(),
             kaposts_pubkey: None,
+            kaposts_notify: None,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -3015,6 +3120,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("registration succeeds");
@@ -3053,6 +3159,7 @@ mod tests {
                 vec!["bob".to_string()],
                 vec![],
                 Default::default(),
+                None,
                 None,
                 None,
                 None,
