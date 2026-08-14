@@ -138,6 +138,113 @@ inferior; implement only if registration changes are undesirable.
 
 ---
 
+## 4. Per-device APNs environment routing — **URGENT, currently breaks all TestFlight push**
+
+### Symptom
+iOS TestFlight builds receive **zero** push notifications. Because remote push is the only
+background delivery path, no messages arrive at all until the user opens the app. Development
+builds installed straight from Xcode work fine on the same phone, same wallet, same indexer.
+
+### Root cause (verified in this repo)
+APNs device tokens are **environment-scoped**. A build signed with `aps-environment =
+development` (Xcode install) gets a token that is only valid at `api.sandbox.push.apple.com`.
+TestFlight and App Store builds are signed `aps-environment = production` and get a token only
+valid at `api.push.apple.com`. Posting a token to the wrong host fails **silently per device** —
+Apple returns HTTP 400 `BadDeviceToken`, the send is simply dropped.
+
+This indexer picks the endpoint **once, globally, at startup**:
+
+- `indexer/src/config.rs:19-20` — `apns_environment: ApnsEnvironment`, `#[serde(default = "default_apns_environment")]`
+- `indexer/src/config.rs:53-55` — `default_apns_environment()` returns `ApnsEnvironment::Sandbox`
+- `indexer/src/push.rs:2287-2290` — `ApnsClient::new` resolves `config.apns_environment` into a
+  single `endpoint` string stored on the client
+- `indexer/src/push.rs:2341` — every send does `format!("{}/3/device/{}", self.endpoint, token)`
+
+So with the default (or an explicit `sandbox`) config, **every production token is posted to the
+sandbox host and dropped**. One global setting cannot serve a fleet that contains both dev and
+TestFlight/App Store installs, which is always the case once a developer is also a tester.
+
+### IMMEDIATE UNBLOCK (do this first, no code change)
+Set `apns_environment = production` in the deployed config. TestFlight and App Store builds are
+production; that single flip restores push for every real user. The cost is that the operator's
+own Xcode dev builds stop receiving push until the per-device work below lands. **Do this before
+anything else** — it is a one-line config change and it fixes the reported outage.
+
+### The real fix — route per device
+
+**Client side: already shipped.** `KaChat/Services/PushNotificationManager.swift` now sends its
+own environment on both registration and update. Exact contract:
+
+| Field | Type | Values | Notes |
+|---|---|---|---|
+| `apns_environment` | `String` | `"development"` \| `"production"` | Sent on `POST /v1/push/register` **and** `PUT /v1/push/update`. Absent = old client. |
+
+The client determines this at runtime by reading `aps-environment` out of the embedded
+provisioning profile (`embedded.mobileprovision`), falling back to build config (`DEBUG` →
+`development`, else `production`) when no profile is present. It is also part of the client's
+registration fingerprint and is persisted, so a device that crosses environments (TestFlight
+build installed over an Xcode build) forces a **full re-registration** instead of reusing the
+stale record — the server will therefore always see a fresh `register` with the correct value
+after an environment change, not just an `update`.
+
+**Server changes required:**
+
+1. **Accept the field.** Add to both request DTOs in `indexer/src/api/v1/push.rs` (the
+   `PushRegisterRequest` around line 90-115 and `PushUpdateRequest` around line 118-145), using
+   exactly the pattern already used for `watched_broadcast_channels` / `kaposts_pubkey`:
+   ```rust
+   #[serde(default)]
+   #[serde(rename = "apns_environment")]
+   pub apns_environment: Option<String>,
+   ```
+   **Keep it OUT of the LegacyV1 auth preimage** — same rule as every other post-hoc optional
+   field. Old clients that never send it must keep validating.
+
+2. **Normalize + validate.** Accept only `"development"` and `"production"` (lowercase, trimmed).
+   Anything else → treat as `None` (fall back, see 4) rather than rejecting the registration; a
+   bad value must never cost a device its push. Only meaningful for `platform = ios | macos`;
+   ignore it for `android`/FCM tokens.
+
+3. **Store it per device.** Add `#[serde(default)] pub apns_environment: Option<String>` to the
+   stored registration struct in `indexer/src/push.rs` (~line 1540-1577, alongside
+   `watched_broadcast_channels`) and thread it through `PushRegistry::register` (~line 92-245)
+   and `PushRegistry::update` (~line 370-520), including the "nothing changed" comparison at
+   ~line 200-210 / ~line 478-486 so a pure environment change still rewrites the record.
+
+4. **Route on the DEVICE's value at send time.** `ApnsClient` currently bakes one `endpoint` in
+   at construction (`push.rs:2287-2290`). Change to either:
+   - build **two** `ApnsClient`s (sandbox + production) sharing the same team id / key id / .p8 /
+     topic — the JWT and topic are identical across environments, only the host differs — and
+     pick per token in the dispatcher's APNs branch (`push.rs:1815-1825`, where `apns_tokens` is
+     iterated), or
+   - keep one client and pass the endpoint (or an `ApnsEnvironment`) into `send_collapsible`
+     (`push.rs:2331-2341`).
+
+   The dispatcher currently splits tokens by platform only; extend that split so APNs tokens are
+   grouped by stored environment and each group goes to its host. Both groups can still be sent
+   concurrently under `APNS_SEND_CONCURRENCY`.
+
+5. **Fallback for pre-existing devices.** Devices registered before this field existed have
+   `apns_environment = None`. Those MUST fall back to the global `config.apns_environment` —
+   which is why the config key stays. Do not drop or reject them.
+
+6. **Recommended: self-heal on `BadDeviceToken`.** APNs' 400 `BadDeviceToken` for an otherwise
+   well-formed token is the exact signature of an environment mismatch. On that specific reason,
+   retry the same token once against the *other* host; if it succeeds, persist the corrected
+   environment on the registration. This makes stale records repair themselves without waiting
+   for the device to re-register.
+
+7. **Logging.** The existing `[Push] deliver split: apns=… fcm=…` line (`push.rs:1805-1811`)
+   should also report the sandbox/production split. Silent `BadDeviceToken` drops are what made
+   this outage invisible for so long — log the reason string per failed token at `warn`.
+
+### Acceptance check
+With a TestFlight build and an Xcode build of the same app installed on two devices, both
+registered against the same indexer, a single incoming message must notify **both**. Server logs
+should show one send to `api.push.apple.com` and one to `api.sandbox.push.apple.com`.
+
+---
+
 *Generated from the KaChat 4.0 client work; findings verified against this repo's source at
 the time of writing. Coordinate payload key names with the client team before shipping — the
 values above are what the iOS client expects to consume.*
