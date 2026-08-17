@@ -2734,6 +2734,25 @@ impl ApnsClient {
                     .map(|s| s.to_string())
             });
 
+        // Diagnostic: BadDeviceToken (sandbox token hitting the prod endpoint, or vice versa) and
+        // DeviceTokenNotForTopic (apns-topic != the token's app bundle id) both collapse into
+        // InvalidToken below, but they have very different fixes — so log the raw reason + endpoint
+        // + token tail to tell them apart.
+        if matches!(
+            reason.as_deref(),
+            Some("BadDeviceToken") | Some("DeviceTokenNotForTopic")
+        ) {
+            let token_tail = token.get(token.len().saturating_sub(8)..).unwrap_or(token);
+            warn!(
+                "[Push][APNs] device token rejected: reason={} status={} endpoint={} topic={} token=...{}",
+                reason.as_deref().unwrap_or("unknown"),
+                status,
+                self.endpoint,
+                self.topic,
+                token_tail,
+            );
+        }
+
         match reason.as_deref() {
             Some("Unregistered") => Err(ApnsError::Unregistered),
             Some("BadDeviceToken") | Some("DeviceTokenNotForTopic") => Err(ApnsError::InvalidToken),

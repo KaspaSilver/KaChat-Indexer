@@ -11,3 +11,11 @@ K-webserver/locust/__pycache__
 Cargo.lock
 /target
 SKI_2.2.0_MIGRATION_ISSUES.md
+
+# Secrets: never commit real env files. Use *.env.example templates (placeholders only).
+.env
+*.env
+!*.env.example
+# Local backups that may contain secrets.
+*.bak
+*.bak.*
