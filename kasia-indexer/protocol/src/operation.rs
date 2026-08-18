@@ -192,6 +192,34 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_canonical_kchat_prefix() {
+        // Canonical KaChat prefix parses identically to the legacy Kasia prefix.
+        let kchat = parse_sealed_operation(b"kchat:1:comm:alias123:abc123");
+        let legacy = parse_sealed_operation(b"ciph_msg:1:comm:alias123:abc123");
+        assert_eq!(
+            kchat,
+            Some(SealedOperation::ContextualMessageV1(
+                SealedContextualMessageV1 {
+                    alias: b"alias123",
+                    sealed_hex: b"abc123",
+                }
+            ))
+        );
+        assert_eq!(kchat, legacy);
+        // A bare (versionless) kchat payload is still a message/handshake blob.
+        assert_eq!(
+            parse_sealed_operation(b"kchat:abc123"),
+            Some(SealedOperation::SealedMessageOrSealedHandshakeVNone(
+                SealedMessageOrSealedHandshakeVNone {
+                    sealed_hex: b"abc123",
+                }
+            ))
+        );
+        // Unknown prefixes still reject.
+        assert_eq!(parse_sealed_operation(b"other:1:comm:a:b"), None);
+    }
+
+    #[test]
     fn test_deserialize_sealed_message_or_sealed_handshake() {
         let payload = b"ciph_msg:abc123";
         let result = parse_sealed_operation(payload);

@@ -24,9 +24,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use utoipa::ToSchema;
 
-const AUTH_DOMAIN_V1: &str = "kasia-push-auth:v1";
-const AUTH_DOMAIN_V2: &str = "kasia-push-auth:v2";
-const DEVICE_AUTH_DOMAIN: &str = "kasia-push-device-auth:v1";
+// Canonical KaChat push-auth domains. New clients sign preimages with these.
+const AUTH_DOMAIN_V1: &str = "kchat-push-auth:v1";
+const AUTH_DOMAIN_V2: &str = "kchat-push-auth:v2";
+const DEVICE_AUTH_DOMAIN: &str = "kchat-push-device-auth:v1";
+// Legacy Kasia domains — still ACCEPTED via dual-verify so devices registered before the KaChat
+// rebrand keep authenticating. The preimage differs only in the leading `domain=` line, so the
+// verify path retries with this substituted in. Never emitted for new signatures.
+const LEGACY_AUTH_DOMAIN_PREFIX: &str = "domain=kchat-push-auth:";
+const LEGACY_AUTH_DOMAIN_PREFIX_REPLACEMENT: &str = "domain=kasia-push-auth:";
+const LEGACY_DEVICE_AUTH_DOMAIN_PREFIX: &str = "domain=kchat-push-device-auth:";
+const LEGACY_DEVICE_AUTH_DOMAIN_PREFIX_REPLACEMENT: &str = "domain=kasia-push-device-auth:";
 const DEVICE_AUTH_SCHEME: &str = "device_key_v1";
 const NONCE_TTL_MS: u64 = 60_000;
 const MAX_SIGNATURE_WINDOW_MS: u64 = 60_000;
@@ -746,7 +754,18 @@ fn verify_wallet_binding_from_auth(
         expires_at_ms: auth.expires_at_ms,
     });
 
-    verify_schnorr_signature(&wallet_pubkey, &preimage, auth.signature.trim())?;
+    let signature = auth.signature.trim();
+    // Dual-accept: verify against the canonical kchat-domain preimage; if that fails, retry with
+    // the legacy kasia domain (differs only in the leading `domain=` line) so pre-rebrand
+    // registrations still authenticate.
+    if verify_schnorr_signature(&wallet_pubkey, &preimage, signature).is_err() {
+        let legacy_preimage = preimage.replacen(
+            LEGACY_AUTH_DOMAIN_PREFIX,
+            LEGACY_AUTH_DOMAIN_PREFIX_REPLACEMENT,
+            1,
+        );
+        verify_schnorr_signature(&wallet_pubkey, &legacy_preimage, signature)?;
+    }
     Ok(WalletBinding {
         wallet_pubkey,
         wallet_address,
@@ -788,8 +807,16 @@ fn verify_device_key_binding_from_auth(
         timestamp_ms: auth.timestamp_ms,
         expires_at_ms: auth.expires_at_ms,
     });
-    verify_p256_signature(&public_key, preimage.as_bytes(), &signature)
-        .map_err(|_| PushApiError::unauthorized("Invalid device key signature"))?;
+    // Dual-accept: canonical kchat device-auth domain first, then legacy kasia domain.
+    if verify_p256_signature(&public_key, preimage.as_bytes(), &signature).is_err() {
+        let legacy_preimage = preimage.replacen(
+            LEGACY_DEVICE_AUTH_DOMAIN_PREFIX,
+            LEGACY_DEVICE_AUTH_DOMAIN_PREFIX_REPLACEMENT,
+            1,
+        );
+        verify_p256_signature(&public_key, legacy_preimage.as_bytes(), &signature)
+            .map_err(|_| PushApiError::unauthorized("Invalid device key signature"))?;
+    }
 
     Ok(Some(DeviceKeyBinding {
         key_id,
@@ -1474,12 +1501,12 @@ mod tests {
         assert!(!legacy.contains("capabilities_hash="));
 
         let transitional = make(AuthPreimageFormat::TransitionalGroups);
-        assert!(transitional.contains("domain=kasia-push-auth:v1"));
+        assert!(transitional.contains("domain=kchat-push-auth:v1"));
         assert!(transitional.contains("watched_group_ids_hash="));
         assert!(!transitional.contains("capabilities_hash="));
 
         let v2 = make(AuthPreimageFormat::V2);
-        assert!(v2.contains("domain=kasia-push-auth:v2\nauth_version=2"));
+        assert!(v2.contains("domain=kchat-push-auth:v2\nauth_version=2"));
         assert!(v2.contains("watched_group_ids_hash="));
         assert!(v2.contains("capabilities_hash="));
     }
@@ -1518,7 +1545,7 @@ mod tests {
         let keypair = Keypair::from_secret_key(&secp, &secret);
         let (xonly_pubkey, _) = XOnlyPublicKey::from_keypair(&keypair);
         let wallet_pubkey = hex_encode(&xonly_pubkey.serialize());
-        let preimage = "domain=kasia-push-auth:v1\nnonce=n".to_string();
+        let preimage = "domain=kchat-push-auth:v1\nnonce=n".to_string();
         let digest: [u8; 32] = Sha256::digest(preimage.as_bytes()).into();
         let message = Message::from_digest(digest);
         let signature = secp.sign_schnorr_no_aux_rand(&message, &keypair);
@@ -1526,5 +1553,36 @@ mod tests {
         signature_hex.replace_range(0..2, "ff");
 
         assert!(verify_schnorr_signature(&wallet_pubkey, &preimage, &signature_hex).is_err());
+    }
+
+    #[test]
+    fn legacy_kasia_domain_signature_still_verifies_via_fallback() {
+        // A device that signed with the pre-rebrand kasia domain must still authenticate: the
+        // canonical kchat preimage won't match its signature, but the domain-substituted legacy
+        // preimage (exactly what the verify path retries with) will.
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[0x33; 32]).expect("valid secret");
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let (xonly_pubkey, _) = XOnlyPublicKey::from_keypair(&keypair);
+        let wallet_pubkey = hex_encode(&xonly_pubkey.serialize());
+
+        let canonical = "domain=kchat-push-auth:v1\nnonce=n\nmethod=POST".to_string();
+        let legacy = canonical.replacen(
+            LEGACY_AUTH_DOMAIN_PREFIX,
+            LEGACY_AUTH_DOMAIN_PREFIX_REPLACEMENT,
+            1,
+        );
+        assert!(legacy.starts_with("domain=kasia-push-auth:v1"));
+
+        // Sign the LEGACY preimage, as a pre-rebrand client would have.
+        let digest: [u8; 32] = Sha256::digest(legacy.as_bytes()).into();
+        let message = Message::from_digest(digest);
+        let signature = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+        let signature_hex = hex_encode(signature.as_ref());
+
+        // Fails against the canonical preimage, passes against the legacy-substituted one —
+        // exactly the fallback verify_wallet_binding_from_auth performs.
+        assert!(verify_schnorr_signature(&wallet_pubkey, &canonical, &signature_hex).is_err());
+        assert!(verify_schnorr_signature(&wallet_pubkey, &legacy, &signature_hex).is_ok());
     }
 }

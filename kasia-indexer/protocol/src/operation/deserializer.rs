@@ -4,11 +4,20 @@ use crate::operation::{
 };
 use tracing::warn;
 
-pub const PROTOCOL_PREFIX: &str = "ciph_msg:";
+/// Canonical KaChat protocol prefix. KaChat is its own network on Kaspa; all new chat content is
+/// written with this prefix.
+pub const PROTOCOL_PREFIX: &str = "kchat:";
+/// Legacy Kasia prefix. Still read so pre-rebrand chat history keeps resolving; never written going
+/// forward. (KaChat no longer interoperates with the Kasia network — this is read-only legacy.)
+pub const LEGACY_PROTOCOL_PREFIX: &str = "ciph_msg:";
 pub const VERSION_1_PART: &str = "1:";
 
 pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_>> {
-    let payload_without_protocol = payload_bytes.strip_prefix(PROTOCOL_PREFIX.as_bytes())?;
+    // Dual-read: accept the canonical `kchat:` prefix and the legacy `ciph_msg:` prefix (same
+    // payload grammar after the prefix), so old on-chain content still parses.
+    let payload_without_protocol = payload_bytes
+        .strip_prefix(PROTOCOL_PREFIX.as_bytes())
+        .or_else(|| payload_bytes.strip_prefix(LEGACY_PROTOCOL_PREFIX.as_bytes()))?;
     if payload_without_protocol.is_empty() {
         return None;
     }

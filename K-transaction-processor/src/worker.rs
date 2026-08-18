@@ -51,7 +51,8 @@ impl Worker {
                 if let Some(ref payload_hex) = transaction.payload {
                     if let Ok(payload_bytes) = hex::decode(payload_hex) {
                         if let Ok(payload_str) = std::str::from_utf8(&payload_bytes) {
-                            if payload_str.starts_with("k:1:")
+                            if payload_str.starts_with("kchat:1:")
+                                || payload_str.starts_with("k:1:")
                                 || payload_str.starts_with("ciph_msg:1:bcast:")
                             {
                                 //info!("Worker {} - Processing K protocol / broadcast transaction: {}", self.id, transaction_id);
@@ -151,7 +152,8 @@ impl Worker {
                     if let Some(ref payload_hex) = transaction.payload {
                         if let Ok(payload_bytes) = hex::decode(payload_hex) {
                             if let Ok(payload_str) = std::str::from_utf8(&payload_bytes) {
-                                if payload_str.starts_with("k:1:")
+                                if payload_str.starts_with("kchat:1:")
+                                    || payload_str.starts_with("k:1:")
                                     || payload_str.starts_with("ciph_msg:1:bcast:")
                                 {
                                     //info!("Worker {} - Processing K protocol / broadcast transaction on retry: {}", self.id, transaction_id);
