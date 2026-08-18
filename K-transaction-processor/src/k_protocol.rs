@@ -424,12 +424,15 @@ impl KProtocolProcessor {
 
     /// Parse K protocol payload and extract action type
     pub fn parse_k_protocol_payload(&self, payload: &str) -> Result<KActionType> {
-        // Remove the K protocol prefix "k:1:"
-        if !payload.starts_with("k:1:") {
-            return Err(anyhow::anyhow!("Invalid K protocol prefix"));
-        }
-
-        let k_payload = &payload[4..]; // Remove "k:1:" prefix
+        // Strip the protocol prefix: canonical KaChat `kchat:1:`, or legacy K `k:1:` (read-only,
+        // for pre-rebrand history). Everything after the version is identical.
+        let k_payload = if let Some(rest) = payload.strip_prefix("kchat:1:") {
+            rest
+        } else if let Some(rest) = payload.strip_prefix("k:1:") {
+            rest
+        } else {
+            return Err(anyhow::anyhow!("Invalid KaChat/K protocol prefix"));
+        };
 
         // Split by colons to get the components
         let parts: Vec<&str> = k_payload.split(':').collect();
@@ -715,10 +718,14 @@ impl KProtocolProcessor {
             }
         };
 
-        // KaChat broadcast (fork addition): `ciph_msg:1:bcast:<channel>:<content>`. Different
-        // protocol family from `k:1:` — route it before K parsing, and store the content
-        // verbatim from the RAW payload (not the control-char-cleaned one).
-        if let Some(rest) = payload_str.strip_prefix("ciph_msg:1:bcast:") {
+        // KaChat broadcast: canonical `kchat:1:bcast:<channel>:<content>`, legacy
+        // `ciph_msg:1:bcast:<...>` still read for pre-rebrand history. Different payload family
+        // from posts — route it before K parsing, and store the content verbatim from the RAW
+        // payload (not the control-char-cleaned one).
+        if let Some(rest) = payload_str
+            .strip_prefix("kchat:1:bcast:")
+            .or_else(|| payload_str.strip_prefix("ciph_msg:1:bcast:"))
+        {
             if !FEATURE_BROADCASTS.load(std::sync::atomic::Ordering::Relaxed) {
                 return Ok(()); // broadcast indexing disabled in settings
             }
