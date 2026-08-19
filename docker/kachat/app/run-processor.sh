@@ -1,6 +1,6 @@
 #!/bin/sh
 # KaChat protocol processor (KaPosts + broadcasts) + heartbeat + retention pruner.
-exec /app/K-transaction-processor \
+exec /app/kachat-transaction-processor \
   --upgrade-db --network "${NETWORK}" \
   --db-host localhost --db-port "${DB_PORT}" --db-name "${DB_NAME}" \
   --db-user "${DB_USER}" --db-password "${DB_PASSWORD}" \

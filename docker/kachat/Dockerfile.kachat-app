@@ -8,11 +8,11 @@ FROM rust:1.91-alpine AS ourbuild
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
 WORKDIR /src
 COPY Cargo.toml ./
-RUN sed -i '/members = \[/,/\]/c\members = ["K-transaction-processor","K-webserver","K-admin"]' Cargo.toml
-COPY K-transaction-processor ./K-transaction-processor
-COPY K-webserver ./K-webserver
-COPY K-admin ./K-admin
-RUN cargo build --release --bin K-transaction-processor --bin K-webserver --bin K-admin
+RUN sed -i '/members = \[/,/\]/c\members = ["kachat-transaction-processor","kachat-webserver","kachat-admin"]' Cargo.toml
+COPY kachat-transaction-processor ./kachat-transaction-processor
+COPY kachat-webserver ./kachat-webserver
+COPY kachat-admin ./kachat-admin
+RUN cargo build --release --bin kachat-transaction-processor --bin kachat-webserver --bin kachat-admin
 
 # --- Stage 2: build the vendored chat (kasia) indexer ---
 FROM rust:1.89.0-alpine3.20 AS chatbuild
@@ -29,9 +29,9 @@ WORKDIR /app
 # Block ingester binary lifted from the upstream Alpine image (musl-compatible).
 COPY --from=supertypo/simply-kaspa-indexer:v2.3.0 /usr/local/bin/simply-kaspa-indexer /usr/local/bin/simply-kaspa-indexer
 # Our binaries + the chat indexer.
-COPY --from=ourbuild /src/target/release/K-transaction-processor /app/
-COPY --from=ourbuild /src/target/release/K-webserver /app/
-COPY --from=ourbuild /src/target/release/K-admin /app/
+COPY --from=ourbuild /src/target/release/kachat-transaction-processor /app/
+COPY --from=ourbuild /src/target/release/kachat-webserver /app/
+COPY --from=ourbuild /src/target/release/kachat-admin /app/
 COPY --from=chatbuild /src/target/release/indexer /app/kachat-chat-indexer
 # Launch scripts + supervisor config.
 COPY docker/kachat/app/ /app/

@@ -55,11 +55,11 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Build and push K-transaction-processor
+    - name: Build and push kachat-transaction-processor
       uses: docker/build-push-action@v5
       with:
         context: .
-        file: ${{ github.ref == 'refs/heads/master' && './docker/PROD/Dockerfile.K-transaction-processor' || './docker/DEV/Dockerfile.K-transaction-processor' }}
+        file: ${{ github.ref == 'refs/heads/master' && './docker/PROD/Dockerfile.kachat-transaction-processor' || './docker/DEV/Dockerfile.kachat-transaction-processor' }}
         push: true
         tags: |
           ${{ github.ref == 'refs/heads/master' && 'thesheepcat/k-transaction-processor:latest' || 'thesheepcat/k-transaction-processor:dev' }}
@@ -83,11 +83,11 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Build and push K-webserver
+    - name: Build and push kachat-webserver
       uses: docker/build-push-action@v5
       with:
         context: .
-        file: ${{ github.ref == 'refs/heads/master' && './docker/PROD/Dockerfile.K-webserver' || './docker/DEV/Dockerfile.K-webserver' }}
+        file: ${{ github.ref == 'refs/heads/master' && './docker/PROD/Dockerfile.kachat-webserver' || './docker/DEV/Dockerfile.kachat-webserver' }}
         push: true
         tags: |
           ${{ github.ref == 'refs/heads/master' && 'thesheepcat/k-webserver:latest' || 'thesheepcat/k-webserver:dev' }}
@@ -111,11 +111,11 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    - name: Build and push K-database-cleaner
+    - name: Build and push kachat-database-cleaner
       uses: docker/build-push-action@v5
       with:
         context: .
-        file: ${{ github.ref == 'refs/heads/master' && './docker/PROD/Dockerfile.K-database-cleaner' || './docker/DEV/Dockerfile.K-database-cleaner' }}
+        file: ${{ github.ref == 'refs/heads/master' && './docker/PROD/Dockerfile.kachat-database-cleaner' || './docker/DEV/Dockerfile.kachat-database-cleaner' }}
         push: true
         tags: |
           ${{ github.ref == 'refs/heads/master' && 'thesheepcat/k-database-cleaner:latest' || 'thesheepcat/k-database-cleaner:dev' }}
@@ -147,18 +147,18 @@ jobs:
 
     - name: Build release binaries
       run: |
-        cargo build --release --bin K-transaction-processor
-        cargo build --release --bin K-webserver
-        cargo build --release --bin K-database-cleaner
-        cargo build --release --bin K-content-remover
+        cargo build --release --bin kachat-transaction-processor
+        cargo build --release --bin kachat-webserver
+        cargo build --release --bin kachat-database-cleaner
+        cargo build --release --bin kachat-content-remover
 
     - name: Create release archives
       run: |
         mkdir -p release-artifacts
-        tar -czf release-artifacts/K-transaction-processor-linux-x86_64.tar.gz -C target/release K-transaction-processor
-        tar -czf release-artifacts/K-webserver-linux-x86_64.tar.gz -C target/release K-webserver
-        tar -czf release-artifacts/K-database-cleaner-linux-x86_64.tar.gz -C target/release K-database-cleaner
-        tar -czf release-artifacts/K-content-remover-linux-x86_64.tar.gz -C target/release K-content-remover
+        tar -czf release-artifacts/kachat-transaction-processor-linux-x86_64.tar.gz -C target/release kachat-transaction-processor
+        tar -czf release-artifacts/kachat-webserver-linux-x86_64.tar.gz -C target/release kachat-webserver
+        tar -czf release-artifacts/kachat-database-cleaner-linux-x86_64.tar.gz -C target/release kachat-database-cleaner
+        tar -czf release-artifacts/kachat-content-remover-linux-x86_64.tar.gz -C target/release kachat-content-remover
 
     - name: Extract version from Cargo.toml
       id: tag
@@ -175,18 +175,18 @@ jobs:
         draft: false
         prerelease: false
         files: |
-          release-artifacts/K-transaction-processor-linux-x86_64.tar.gz
-          release-artifacts/K-webserver-linux-x86_64.tar.gz
-          release-artifacts/K-database-cleaner-linux-x86_64.tar.gz
-          release-artifacts/K-content-remover-linux-x86_64.tar.gz
+          release-artifacts/kachat-transaction-processor-linux-x86_64.tar.gz
+          release-artifacts/kachat-webserver-linux-x86_64.tar.gz
+          release-artifacts/kachat-database-cleaner-linux-x86_64.tar.gz
+          release-artifacts/kachat-content-remover-linux-x86_64.tar.gz
         body: |
           ## Linux x86_64 Binaries
 
           This release contains compiled binaries for all K-indexer modules:
-          - K-transaction-processor
-          - K-webserver
-          - K-database-cleaner
-          - K-content-remover
+          - kachat-transaction-processor
+          - kachat-webserver
+          - kachat-database-cleaner
+          - kachat-content-remover
 
           **Platform:** Linux (Ubuntu) x86_64
 

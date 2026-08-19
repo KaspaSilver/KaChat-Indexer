@@ -8,7 +8,7 @@ The K-indexer system processes K-PROTOCOL transactions using the following main 
 - **Kaspa node**: Source of blockchain transactions
 - **simply-kaspa-indexer**: Indexes all Kaspa transactions into PostgreSQL
 - **Postgres database**: Stores transaction data and K-protocol content
-- **K-transaction-processor**: Processes K-PROTOCOL transactions specifically
+- **kachat-transaction-processor**: Processes K-PROTOCOL transactions specifically
 
 ## Sequence Diagram
 
@@ -19,10 +19,10 @@ sequenceDiagram
     participant SKI as simply-kaspa-indexer
     participant DB as Postgres database
     participant TRIG as DB Trigger<br/>(notify_transaction)
-    participant NL as K-transaction-processor<br/>NotificationListener
-    participant NQ as K-transaction-processor<br/>NotificationQueue
-    participant W as K-transaction-processor<br/>Worker
-    participant KP as K-transaction-processor<br/>KProtocolProcessor
+    participant NL as kachat-transaction-processor<br/>NotificationListener
+    participant NQ as kachat-transaction-processor<br/>NotificationQueue
+    participant W as kachat-transaction-processor<br/>Worker
+    participant KP as kachat-transaction-processor<br/>KProtocolProcessor
 
     Note over KN,SKI: Transaction arrives on Kaspa network
     KN->>SKI: New transaction via WebSocket
@@ -111,7 +111,7 @@ sequenceDiagram
 - Checks if payload starts with `6b3a313a` (hex encoding of "k:1:")
 - If match found, executes `pg_notify('transaction_channel', encode(NEW.transaction_id, 'hex'))`
 
-**Code Reference:** [database.rs:172-199](K-transaction-processor/src/database.rs#L172-L199)
+**Code Reference:** [database.rs:172-199](kachat-transaction-processor/src/database.rs#L172-L199)
 
 ### 3. Notification Routing (Steps 7-10)
 - **NotificationListener** listens on PostgreSQL channel `transaction_channel` via `PgListener`
@@ -120,8 +120,8 @@ sequenceDiagram
 - **NotificationQueue** distributes work to workers using round-robin algorithm
 
 **Code References:**
-- [listener.rs:20-88](K-transaction-processor/src/listener.rs#L20-L88)
-- [queue.rs:33-62](K-transaction-processor/src/queue.rs#L33-L62)
+- [listener.rs:20-88](kachat-transaction-processor/src/listener.rs#L20-L88)
+- [queue.rs:33-62](kachat-transaction-processor/src/queue.rs#L33-L62)
 
 ### 4. Transaction Fetching (Steps 11-14)
 - Worker receives transaction_id from its dedicated MPSC channel
@@ -129,7 +129,7 @@ sequenceDiagram
 - Converts hex payload to bytes, then to UTF-8 string
 - Verifies payload starts with "k:1:"
 
-**Code Reference:** [worker.rs:45-94](K-transaction-processor/src/worker.rs#L45-L94)
+**Code Reference:** [worker.rs:45-94](kachat-transaction-processor/src/worker.rs#L45-L94)
 
 ### 5. K-Protocol Parsing (Steps 15-18)
 - **KProtocolProcessor** parses the payload using colon-delimited format
@@ -144,7 +144,7 @@ sequenceDiagram
   - `block` - Block/unblock users
   - `follow` - Follow/unfollow users
 
-**Code Reference:** [k_protocol.rs:232-469](K-transaction-processor/src/k_protocol.rs#L232-L469)
+**Code Reference:** [k_protocol.rs:232-469](kachat-transaction-processor/src/k_protocol.rs#L232-L469)
 
 ### 6. Signature Verification (Steps 19-23)
 Uses Kaspa's cryptographic signature verification:
@@ -154,7 +154,7 @@ Uses Kaspa's cryptographic signature verification:
 4. Verifies signature using `kaspa_wallet_core::message::verify_message()`
 5. Transactions with invalid signatures are skipped
 
-**Code Reference:** [k_protocol.rs:161-229](K-transaction-processor/src/k_protocol.rs#L161-L229)
+**Code Reference:** [k_protocol.rs:161-229](kachat-transaction-processor/src/k_protocol.rs#L161-L229)
 
 ### 7. Action-Specific Database Operations (Steps 24-30)
 
@@ -163,47 +163,47 @@ Uses Kaspa's cryptographic signature verification:
 - Inserts into `k_broadcasts` table
 - Uses `ON CONFLICT (transaction_id) DO NOTHING`
 
-**Code Reference:** [k_protocol.rs:859-933](K-transaction-processor/src/k_protocol.rs#L859-L933)
+**Code Reference:** [k_protocol.rs:859-933](kachat-transaction-processor/src/k_protocol.rs#L859-L933)
 
 #### Post
 - Inserts into `k_contents` table with `content_type = 'post'`
 - If mentions exist, inserts into `k_mentions` using CTE (Common Table Expression)
 - Uses `ON CONFLICT (sender_signature) DO NOTHING`
 
-**Code Reference:** [k_protocol.rs:559-664](K-transaction-processor/src/k_protocol.rs#L559-L664)
+**Code Reference:** [k_protocol.rs:559-664](kachat-transaction-processor/src/k_protocol.rs#L559-L664)
 
 #### Reply
 - Inserts into `k_contents` with `content_type = 'reply'`
 - References parent post via `referenced_content_id`
 - Handles mentions similar to posts
 
-**Code Reference:** [k_protocol.rs:667-778](K-transaction-processor/src/k_protocol.rs#L667-L778)
+**Code Reference:** [k_protocol.rs:667-778](kachat-transaction-processor/src/k_protocol.rs#L667-L778)
 
 #### Quote
 - Inserts into `k_contents` with `content_type = 'quote'`
 - References quoted content via `referenced_content_id`
 - Creates mention for quoted content author
 
-**Code Reference:** [k_protocol.rs:781-856](K-transaction-processor/src/k_protocol.rs#L781-L856)
+**Code Reference:** [k_protocol.rs:781-856](kachat-transaction-processor/src/k_protocol.rs#L781-L856)
 
 #### Vote
 - Inserts into `k_votes` table
 - Creates mention for post author
 - Uses `ON CONFLICT (sender_signature) DO NOTHING`
 
-**Code Reference:** [k_protocol.rs:936-1011](K-transaction-processor/src/k_protocol.rs#L936-L1011)
+**Code Reference:** [k_protocol.rs:936-1011](kachat-transaction-processor/src/k_protocol.rs#L936-L1011)
 
 #### Block/Unblock
 - **Block**: Inserts into `k_blocks` with `ON CONFLICT (sender_pubkey, blocked_user_pubkey) DO NOTHING`
 - **Unblock**: Deletes matching records from `k_blocks`
 
-**Code Reference:** [k_protocol.rs:1014-1118](K-transaction-processor/src/k_protocol.rs#L1014-L1118)
+**Code Reference:** [k_protocol.rs:1014-1118](kachat-transaction-processor/src/k_protocol.rs#L1014-L1118)
 
 #### Follow/Unfollow
 - **Follow**: Inserts into `k_follows` with `ON CONFLICT (sender_pubkey, followed_user_pubkey) DO NOTHING`
 - **Unfollow**: Deletes matching records from `k_follows`
 
-**Code Reference:** [k_protocol.rs:1121-1225](K-transaction-processor/src/k_protocol.rs#L1121-L1225)
+**Code Reference:** [k_protocol.rs:1121-1225](kachat-transaction-processor/src/k_protocol.rs#L1121-L1225)
 
 ## Configuration
 
@@ -227,7 +227,7 @@ Key configuration parameters from [compose.yaml:34](docker/DEV/compose.yaml#L34)
 - `k_follows` - User following relationships
 - `k_vars` - System configuration (schema version, network type)
 
-**Code Reference:** [database.rs:396-471](K-transaction-processor/src/database.rs#L396-L471)
+**Code Reference:** [database.rs:396-471](kachat-transaction-processor/src/database.rs#L396-L471)
 
 ## Error Handling
 
@@ -266,5 +266,5 @@ main.rs
     └── set_and_verify_network()
 ```
 
-**Code Reference:** [main.rs:69-180](K-transaction-processor/src/main.rs#L69-L180)
+**Code Reference:** [main.rs:69-180](kachat-transaction-processor/src/main.rs#L69-L180)
 

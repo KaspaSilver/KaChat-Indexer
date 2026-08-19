@@ -1,12 +1,12 @@
 # K-Webserver Monitoring with Grafana & Prometheus
 
-Monitor K-webserver API endpoints performance with Prometheus metrics and Grafana dashboards (highly suggested for public indexers).
+Monitor kachat-webserver API endpoints performance with Prometheus metrics and Grafana dashboards (highly suggested for public indexers).
 
 ## 🎯 Overview
 
-The K-webserver monitoring stack provides real-time visibility into API endpoint performance through:
+The kachat-webserver monitoring stack provides real-time visibility into API endpoint performance through:
 
-- **📈 Prometheus**: Scrapes metrics from K-webserver every 15 seconds
+- **📈 Prometheus**: Scrapes metrics from kachat-webserver every 15 seconds
 - **📊 Grafana**: Visualizes metrics with pre-configured dashboards
 - **🔍 Automatic Provisioning**: Dashboards and data sources configured automatically
 
@@ -23,7 +23,7 @@ The K-webserver monitoring stack provides real-time visibility into API endpoint
 
 ### Prerequisites
 
-- K-webserver running and accessible
+- kachat-webserver running and accessible
 - Docker and Docker Compose installed
 
 ### 📋 Step-by-Step Instructions
@@ -36,20 +36,20 @@ Navigate to the monitoring configuration folder:
 cd K-indexer/docker/MONITORING
 ```
 
-Open `prometheus.yml` and update the K-webserver endpoint:
+Open `prometheus.yml` and update the kachat-webserver endpoint:
 
 ```yaml
 scrape_configs:
   - job_name: 'k-webserver'
     static_configs:
-      - targets: ['localhost:3000']  # Change to your K-webserver address
+      - targets: ['localhost:3000']  # Change to your kachat-webserver address
     metrics_path: '/metrics'
     scrape_interval: 15s
 ```
 
 **Configuration Notes:**
-- Replace `localhost:3000` with your K-webserver address (host:port)
-- If K-webserver is on a remote server, use the server's IP address or hostname
+- Replace `localhost:3000` with your kachat-webserver address (host:port)
+- If kachat-webserver is on a remote server, use the server's IP address or hostname
 
 #### 2. **Start Monitoring Services**
 
@@ -102,7 +102,7 @@ Shows the average response time for requests over a 1-minute rolling window:
 
 ### Monitored Endpoints
 
-The dashboard tracks performance for the following K-webserver endpoints:
+The dashboard tracks performance for the following kachat-webserver endpoints:
 - `/get-posts`
 - `/get-posts-watching`
 - `/get-contents-following`
@@ -171,7 +171,7 @@ docker/MONITORING/
     │   └── dashboards/
     │       └── dashboards.yml      # Dashboard provisioning config
     └── dashboards/
-        └── grafana-dashboard-axum-endpoints.json  # K-webserver dashboard
+        └── grafana-dashboard-axum-endpoints.json  # kachat-webserver dashboard
 ```
 
 ---
@@ -180,10 +180,10 @@ docker/MONITORING/
 
 ### No Data in Grafana
 
-1. **Check K-webserver is running** and accessible
+1. **Check kachat-webserver is running** and accessible
 2. **Verify Prometheus target**: Visit `http://localhost:9090/targets` and ensure the k-webserver target is "UP"
-3. **Check the endpoint URL** in `prometheus.yml` matches your K-webserver address
-4. **Verify K-webserver exposes metrics**: Visit `http://your-k-webserver:port/metrics`
+3. **Check the endpoint URL** in `prometheus.yml` matches your kachat-webserver address
+4. **Verify kachat-webserver exposes metrics**: Visit `http://your-k-webserver:port/metrics`
 
 ### Dashboard Shows "No Data"
 
@@ -193,8 +193,8 @@ docker/MONITORING/
 
 ### Connection Refused
 
-If Prometheus can't reach K-webserver:
-- For **local K-webserver**: Verify you can locally access `localhost:3000`
-- For **remote K-webserver**: Ensure firewall allows access to the metrics endpoint
-- For **K-webserver in Docker**: Use the container name or Docker network address
+If Prometheus can't reach kachat-webserver:
+- For **local kachat-webserver**: Verify you can locally access `localhost:3000`
+- For **remote kachat-webserver**: Ensure firewall allows access to the metrics endpoint
+- For **kachat-webserver in Docker**: Use the container name or Docker network address
 

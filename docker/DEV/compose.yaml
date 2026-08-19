@@ -51,7 +51,7 @@ services:
       simply-kaspa-indexer-DEV:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f K-transaction-processor || exit 1"]
+      test: ["CMD-SHELL", "pgrep -f kachat-transaction-processor || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -91,7 +91,7 @@ services:
       k-transaction-processor-DEV:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f K-database-cleaner || exit 1"]
+      test: ["CMD-SHELL", "pgrep -f kachat-database-cleaner || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

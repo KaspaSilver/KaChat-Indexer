@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "K-transaction-processor",
-    "K-webserver",
-    "K-database-cleaner",
-    "K-content-remover",
-    "K-admin"
+    "kachat-transaction-processor",
+    "kachat-webserver",
+    "kachat-database-cleaner",
+    "kachat-content-remover",
+    "kachat-admin"
 ]
 resolver = "2"
 

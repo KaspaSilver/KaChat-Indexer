@@ -1,4 +1,4 @@
-# Deploying the KaPosts indexer as the public default (`kaposts.duckdns.org`)
+# Deploying the KaChat indexer as the public default (`kaposts.duckdns.org`)
 
 This turns the local stack into the public endpoint the KaChat app connects to, fronted by
 the **nginx-proxy-manager** already running on this box, with TLS from Let's Encrypt.
