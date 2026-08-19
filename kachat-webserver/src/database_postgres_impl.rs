@@ -3103,7 +3103,7 @@ impl DatabaseInterface for PostgresDbManager {
                     FROM (
                         SELECT km.block_time, km.id
                         FROM k_mentions km
-                        WHERE km.mentioned_pubkey = $1
+                        WHERE substr(km.mentioned_pubkey, 2) = substr($1, 2)
                           AND km.sender_pubkey IS NOT NULL
                           AND km.sender_pubkey != $1
                           AND (km.block_time > $2 OR (km.block_time = $2 AND km.id > $3))
@@ -3134,7 +3134,7 @@ impl DatabaseInterface for PostgresDbManager {
                 FROM (
                     SELECT km.block_time, km.id
                     FROM k_mentions km
-                    WHERE km.mentioned_pubkey = $1
+                    WHERE substr(km.mentioned_pubkey, 2) = substr($1, 2)
                       AND km.sender_pubkey IS NOT NULL
                       AND km.sender_pubkey != $1
                       AND NOT EXISTS (
@@ -3212,7 +3212,13 @@ impl DatabaseInterface for PostgresDbManager {
                        CASE WHEN km.content_type = 'quote' THEN 'quote' ELSE 'mention' END as notification_type
                 FROM k_mentions km
                 LEFT JOIN k_contents kc ON km.content_type = 'quote' AND km.content_id = kc.transaction_id
-                WHERE km.mentioned_pubkey = $1
+                -- Match on the x-only key (drop the 1-byte parity prefix). @mentions are derived
+                -- from a Kaspa address as `02 + x-only` (even-Y by BIP-340 convention), while a
+                -- user's real signing key may be odd-parity (`03 + x-only`) and is what they query
+                -- with. Comparing only the 32-byte x-coordinate makes both match, so odd-parity
+                -- users still receive their mentions; reply/quote/vote rows (stored with the real
+                -- key) share the same x-coordinate, so they keep matching too.
+                WHERE substr(km.mentioned_pubkey, 2) = substr($1, 2)
                   AND km.sender_pubkey IS NOT NULL
                   AND km.sender_pubkey != $1
                   AND NOT EXISTS (

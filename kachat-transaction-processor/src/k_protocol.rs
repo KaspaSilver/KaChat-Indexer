@@ -212,6 +212,10 @@ pub struct KPost {
     pub sender_signature: String,
     pub base64_encoded_message: String,
     pub mentioned_pubkeys: Vec<String>,
+    /// Whether the payload arrived under the canonical `kchat:1:` prefix (vs legacy `k:1:`).
+    /// @mention notifications are a KaChat-network feature — only kchat posts emit mention rows.
+    #[serde(default)]
+    pub is_kchat: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -425,7 +429,9 @@ impl KProtocolProcessor {
     /// Parse K protocol payload and extract action type
     pub fn parse_k_protocol_payload(&self, payload: &str) -> Result<KActionType> {
         // Strip the protocol prefix: canonical KaChat `kchat:1:`, or legacy K `k:1:` (read-only,
-        // for pre-rebrand history). Everything after the version is identical.
+        // for pre-rebrand history). Everything after the version is identical. The flag feeds
+        // kchat-only features (@mention notifications).
+        let is_kchat = payload.starts_with("kchat:1:");
         let k_payload = if let Some(rest) = payload.strip_prefix("kchat:1:") {
             rest
         } else if let Some(rest) = payload.strip_prefix("k:1:") {
@@ -508,6 +514,7 @@ impl KProtocolProcessor {
                     sender_signature,
                     base64_encoded_message,
                     mentioned_pubkeys,
+                    is_kchat,
                 }))
             }
             "reply" => {
@@ -948,6 +955,25 @@ impl KProtocolProcessor {
             info!("Post {} rejected ({}), skipping", transaction_id, reason);
             return Ok(());
         }
+
+        // @mention notifications are kchat-network-only: a legacy `k:1:` post still indexes
+        // normally (and its signature was verified over the ORIGINAL mentioned_pubkeys above),
+        // but emits no mention rows. Only canonical `kchat:1:` posts notify mentioned users.
+        let k_post = if k_post.is_kchat {
+            k_post
+        } else {
+            if !k_post.mentioned_pubkeys.is_empty() {
+                info!(
+                    "Post {} carries {} mention(s) under the legacy k:1: prefix — indexing without mention notifications (kchat:1: required)",
+                    transaction_id,
+                    k_post.mentioned_pubkeys.len()
+                );
+            }
+            KPost {
+                mentioned_pubkeys: Vec::new(),
+                ..k_post
+            }
+        };
 
         // Extract block time
         let block_time = transaction.block_time.unwrap_or(0);

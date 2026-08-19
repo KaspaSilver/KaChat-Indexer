@@ -472,11 +472,13 @@ impl NotificationPost {
         mention_id: i64,
         mention_block_time: u64,
     ) -> Self {
-        // Determine content type - if referenced_content_id is set, it's a quote
+        // A k_mentions row for a top-level post (no referenced_content_id) is only ever created by
+        // an @mention (the post's mentioned_pubkeys), so surface it to clients as "mention". A row
+        // that references another post is a quote-notification.
         let content_type = if record.referenced_content_id.is_some() {
             "quote".to_string()
         } else {
-            "post".to_string()
+            "mention".to_string()
         };
 
         Self {
