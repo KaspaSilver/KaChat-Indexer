@@ -9,7 +9,7 @@ This document outlines the implementation steps for adding hashtag management fu
 
 ### 1.1 New Migration File: `v1_to_v2.sql`
 
-**Location:** `K-transaction-processor/src/migrations/schema/v1_to_v2.sql`
+**Location:** `kachat-transaction-processor/src/migrations/schema/v1_to_v2.sql`
 
 **Summary:** This migration adds hashtag support with:
 - 1 new table: `k_hashtags`
@@ -247,7 +247,7 @@ UPDATE k_vars SET value = '2' WHERE key = 'schema_version';
 
 ### 1.2 Update `up.sql`
 
-**Location:** `K-transaction-processor/src/migrations/schema/up.sql`
+**Location:** `kachat-transaction-processor/src/migrations/schema/up.sql`
 
 #### **Monolithic Schema Update**
 
@@ -302,7 +302,7 @@ ON DELETE CASCADE;
 
 ### 1.3 Update `down.sql`
 
-**Location:** `K-transaction-processor/src/migrations/schema/down.sql`
+**Location:** `kachat-transaction-processor/src/migrations/schema/down.sql`
 
 Add the k_hashtags table drop statement after the k_contents line (around line 9):
 
@@ -314,7 +314,7 @@ DROP TABLE IF EXISTS k_hashtags CASCADE;
 
 ### 1.4 Update `verify_schema_setup` Function
 
-**Location:** `K-transaction-processor/src/database.rs`
+**Location:** `kachat-transaction-processor/src/database.rs`
 
 #### 1.4.1 Update Schema Version Constant
 
@@ -379,7 +379,7 @@ if index_count == 37 {
 
 ### 1.5 Migration Execution Strategy
 
-**Location:** `K-transaction-processor/src/database.rs`
+**Location:** `kachat-transaction-processor/src/database.rs`
 
 The migration system automatically upgrades the database schema on startup. Two changes are needed:
 
@@ -455,11 +455,11 @@ if current_version == 1 {
 
 ---
 
-## Step 2: Hashtag Extraction and Processing in K-transaction-processor
+## Step 2: Hashtag Extraction and Processing in kachat-transaction-processor
 
 ### 2.1 Create Hashtag Extraction Module
 
-**Location:** `K-transaction-processor/src/hashtag_extractor.rs`
+**Location:** `kachat-transaction-processor/src/hashtag_extractor.rs`
 
 Create a new module dedicated to hashtag extraction logic with the following functionality:
 
@@ -970,7 +970,7 @@ mod tests {
 
 ### 2.2 Register Module in `main.rs`
 
-**Location:** `K-transaction-processor/src/main.rs`
+**Location:** `kachat-transaction-processor/src/main.rs`
 
 Add the module declaration:
 
@@ -980,7 +980,7 @@ mod hashtag_extractor;
 
 ### 2.3 Update `k_protocol.rs`
 
-**Location:** `K-transaction-processor/src/k_protocol.rs`
+**Location:** `kachat-transaction-processor/src/k_protocol.rs`
 
 #### 2.3.1 Add Import
 
@@ -1220,7 +1220,7 @@ The SQL structure is identical to posts, just replace `'post'` with `'quote'` an
 
 ### 2.4 Dependencies Update
 
-**Location:** `K-transaction-processor/Cargo.toml`
+**Location:** `kachat-transaction-processor/Cargo.toml`
 
 Ensure the following dependencies are present:
 

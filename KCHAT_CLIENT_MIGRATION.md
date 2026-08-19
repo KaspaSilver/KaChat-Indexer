@@ -180,5 +180,5 @@ Round-trip check: a message written as `kchat:1:comm:{alias}:{hex}` must decode 
 *Server reference (for context): commit that shipped the dual-read + dual-accept is on
 `main` of the kachat-indexer repo. The indexer parses chats in
 `kasia-indexer/protocol/src/operation/deserializer.rs`, KaPosts in
-`K-transaction-processor/src/k_protocol.rs`, and push-auth in
+`kachat-transaction-processor/src/k_protocol.rs`, and push-auth in
 `kasia-indexer/indexer/src/api/v1/push.rs`.*

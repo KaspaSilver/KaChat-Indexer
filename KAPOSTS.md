@@ -10,7 +10,7 @@ KaChat iOS app already speaks, and adds the KaChat-specific behaviour described 
 1. **Server-side exclusivity (two-way).** The transaction processor indexes a post/reply/quote
    only if its decoded message begins with the KaChat marker **U+2060** (WORD JOINER).
    K-website content never enters this database.
-   → `K-transaction-processor/src/k_protocol.rs` (`validate_kachat_message`, gates in
+   → `kachat-transaction-processor/src/k_protocol.rs` (`validate_kachat_message`, gates in
    `save_k_post/reply/quote_to_database`).
    **Text-only content policy:** the same gate also rejects anything that isn't bounded plain
    text — non-UTF-8, over `MAX_KACHAT_MESSAGE_CHARS` (4096), embedded media / data URIs
@@ -30,10 +30,10 @@ KaChat iOS app already speaks, and adds the KaChat-specific behaviour described 
 3. **Per-post actor lists.** New read endpoint `GET /get-post-engagement` returning who
    upvoted/downvoted/reposted/quoted **any** post (upstream only exposed this for your own
    posts, via notifications).
-   → `K-webserver/src/{web_server,api_handlers,database_trait,database_postgres_impl,models}.rs`.
-4. **K-admin dashboard.** A new workspace crate serving an ops/admin GUI (pipeline health,
+   → `kachat-webserver/src/{web_server,api_handlers,database_trait,database_postgres_impl,models}.rs`.
+4. **kachat-admin dashboard.** A new workspace crate serving an ops/admin GUI (pipeline health,
    table stats, content moderation, broadcasts).
-   → `K-admin/`.
+   → `kachat-admin/`.
 5. **KaChat broadcast indexing.** The same stack also indexes KaChat **broadcast** channel
    messages (a different protocol — `ciph_msg:1:bcast:<channel>:<content>`, no signatures,
    sender = the self-send address). Served from the **same webserver/host** as KaPosts, so
@@ -51,8 +51,8 @@ KaChat iOS app already speaks, and adds the KaChat-specific behaviour described 
    - Requires `simply-kaspa` to populate `addresses_transactions` (the `--disable` list drops
      `addresses_transactions_table` and `transactions_outputs` for KaPosts; the KAPOSTS
      compose re-enables them, bounded by the 1h staging retention).
-   → `K-transaction-processor/src/{database.rs (trigger + kachat_broadcasts table),
-   k_protocol.rs (process_broadcast)}`, `K-webserver` get-broadcasts, `K-admin` Broadcasts tab.
+   → `kachat-transaction-processor/src/{database.rs (trigger + kachat_broadcasts table),
+   k_protocol.rs (process_broadcast)}`, `kachat-webserver` get-broadcasts, `kachat-admin` Broadcasts tab.
 
 New on-chain payload/signing shapes (colon-joined, `k:1:` prefix; signature is Kaspa
 personal-message schnorr over the signing string):
@@ -125,7 +125,7 @@ and non-marker K-website posts should be absent.
 
 - **No DB migration** was required: the marker filter and removals use the existing tables,
   and the engagement endpoint is read-only.
-- Moderation removal in the dashboard mirrors upstream `K-content-remover` (atomic
+- Moderation removal in the dashboard mirrors upstream `kachat-content-remover` (atomic
   delete-all-by-pubkey); k_hashtags cascade via FK.
 - Pipeline health in the dashboard is derived from the `transactions` table freshness;
   per-container up/down status stays in Portainer.

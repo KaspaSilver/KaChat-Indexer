@@ -3,11 +3,11 @@
 /K-indexer-legacy/k-indexer.db
 .continue
 transaction_processing_spec.md
-K-transaction-processor/target
-K-transaction-processor/Cargo.lock
-K-webserver/target
-K-webserver/Cargo.lock
-K-webserver/locust/__pycache__
+kachat-transaction-processor/target
+kachat-transaction-processor/Cargo.lock
+kachat-webserver/target
+kachat-webserver/Cargo.lock
+kachat-webserver/locust/__pycache__
 Cargo.lock
 /target
 SKI_2.2.0_MIGRATION_ISSUES.md

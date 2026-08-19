@@ -5,7 +5,7 @@ broadcasts. It is a fork of [thesheepcat/K-indexer](https://github.com/thesheepc
 extended with: server-side KaChat-only exclusivity, text-only content validation, removal
 counter-actions (`unvote`/`unquote`), a per-post engagement endpoint, KaChat broadcast
 indexing (`#kaspa` / `#kachat-bugs`, 3-day retention), and a **KaChat Indexer** admin
-dashboard (`K-admin`) that will grow into the single pane of glass for all of it.
+dashboard (`kachat-admin`) that will grow into the single pane of glass for all of it.
 
 ## 🚀 Want to run your own indexer?
 
@@ -30,9 +30,9 @@ The new indexer architecture is composed of the following components:
 - **🔗 Rusty-Kaspa Node**: A running rusty-kaspa node
 - **💾 PostgreSQL Database**: Database for storing indexed data
 - **📡 Simply-kaspa-indexer**: By supertypo (https://github.com/supertypo/simply-kaspa-indexer) to receive all transactions from Kaspa network and temporarily store them
-- **🔍 K-transaction-processor**: Filters incoming transactions and indexes all K-related data in proper database tables
-- **🌐 K-webserver**: Serves all K-related data to web applications via API calls
-- **🧹 K-database-cleaner** *(Optional)*: Maintains a lighter, cleaner database for personal indexers by automatically purging unwanted content
+- **🔍 kachat-transaction-processor**: Filters incoming transactions and indexes all K-related data in proper database tables
+- **🌐 kachat-webserver**: Serves all K-related data to web applications via API calls
+- **🧹 kachat-database-cleaner** *(Optional)*: Maintains a lighter, cleaner database for personal indexers by automatically purging unwanted content
 
 ### Process Flow
 
@@ -107,7 +107,7 @@ nano .env
 | `DB_PASSWORD` | `password` | PostgreSQL database password |
 | `DB_NAME` | `k-db` | PostgreSQL database name |
 | `DB_PORT` | `5432` | PostgreSQL database access port |
-| `WEBSERVER_PORT` | `3000` | K-webserver access port (used by K-webapp, to connect to K-indexer) |
+| `WEBSERVER_PORT` | `3000` | kachat-webserver access port (used by K-webapp, to connect to K-indexer) |
 | `USER_PUBKEY` | - | Your Kaspa public key (required only for `personal-indexer`) |
 | `DATA_RETENTION` | `72h` | How long to keep content from non-followed users (required only for `personal-indexer`) |
 | `PURGE_INTERVAL` | `10m` | How often to run cleanup operations (required only for `personal-indexer`) |
@@ -161,11 +161,11 @@ You can find all details of the API techical specification in the [API_TECHNICAL
 
 ---
 
-## 🧹 Personal Indexer with K-database-cleaner
+## 🧹 Personal Indexer with kachat-database-cleaner
 
-For users running a **personal indexer**, K-database-cleaner helps maintain a lightweight, efficient database by automatically removing unwanted data based on your preferences.
+For users running a **personal indexer**, kachat-database-cleaner helps maintain a lightweight, efficient database by automatically removing unwanted data based on your preferences.
 
-### Why Use K-database-cleaner?
+### Why Use kachat-database-cleaner?
 
 When running a personal indexer, you may not want to store:
 - Content from users you've blocked
@@ -173,7 +173,7 @@ When running a personal indexer, you may not want to store:
 - Orphaned replies and votes that reference deleted content
 - Follow/block records from other users
 
-K-database-cleaner runs periodic purge operations to keep your database clean and storage-efficient, retaining only the content that matters to you.
+kachat-database-cleaner runs periodic purge operations to keep your database clean and storage-efficient, retaining only the content that matters to you.
 
 ### Key Features
 
@@ -184,21 +184,21 @@ K-database-cleaner runs periodic purge operations to keep your database clean an
 
 ### Getting Started
 
-For full documentation on installation, configuration, and usage, see the [K-database-cleaner README](K-database-cleaner/README.md).
+For full documentation on installation, configuration, and usage, see the [kachat-database-cleaner README](kachat-database-cleaner/README.md).
 
 ---
 
-## 🗑️ Content Removal with K-content-remover
+## 🗑️ Content Removal with kachat-content-remover
 
-For operators running a **public indexer**, K-content-remover provides a simple way to remove harmful, spam, or unwanted content created by specific users from your database.
+For operators running a **public indexer**, kachat-content-remover provides a simple way to remove harmful, spam, or unwanted content created by specific users from your database.
 
-### Why Use K-content-remover?
+### Why Use kachat-content-remover?
 
 Public indexers may need to remove:
 - Spam content from malicious users
 - Harmful or unwanted content from malicious users
 
-K-content-remover allows you to completely remove all content associated with a specific public key in a single, atomic operation.
+kachat-content-remover allows you to completely remove all content associated with a specific public key in a single, atomic operation.
 
 ### Key Features
 
@@ -210,13 +210,13 @@ K-content-remover allows you to completely remove all content associated with a 
 
 ### Getting Started
 
-For full documentation on installation, configuration, and usage, see the [K-content-remover README](K-content-remover/README.md).
+For full documentation on installation, configuration, and usage, see the [kachat-content-remover README](kachat-content-remover/README.md).
 
 ---
 
 ## 📊 K-Webserver Performance Monitoring
 
-For operators running a **public indexer**, monitoring K-webserver performance is essential to ensure optimal API response times and identify potential bottlenecks.
+For operators running a **public indexer**, monitoring kachat-webserver performance is essential to ensure optimal API response times and identify potential bottlenecks.
 
 ### Why Monitor K-Webserver?
 

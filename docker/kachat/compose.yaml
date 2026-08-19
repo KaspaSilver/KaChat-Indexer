@@ -80,6 +80,9 @@ services:
       RUST_LOG: info
     volumes:
       - /var/kachat-chat-data:/app/data
+      # Merged store (4.12M Kasia history + local kchat: data) imported from kachat.app, overlaid
+      # onto the chat-indexer's data dir. apns/ + fcm/ keys still come from the base mount above.
+      - /home/vahome/kachat-import/mainnet:/app/data/mainnet
     depends_on:
       kachat-db:
         condition: service_healthy

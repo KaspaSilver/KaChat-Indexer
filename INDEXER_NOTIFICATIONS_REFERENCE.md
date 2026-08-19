@@ -6,7 +6,7 @@ client can parse every payload without reading the server source.
 
 Server crate: `kasia-indexer` (Rust). Push code: `indexer/src/push.rs`, `indexer/src/fcm.rs`,
 `indexer/src/api/v1/push.rs`, `indexer-actors/src/{push,block_processor,lib}.rs`.
-K-side (broadcast/KaPosts) injectors: `K-transaction-processor/src/push_notify.rs`.
+K-side (broadcast/KaPosts) injectors: `kachat-transaction-processor/src/push_notify.rs`.
 
 Related design/spec doc: [`NOTIFICATION_EXTENSIONS_TODO.md`](NOTIFICATION_EXTENSIONS_TODO.md).
 

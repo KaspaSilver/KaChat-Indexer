@@ -1,0 +1,25 @@
+[package]
+name = "kachat-admin"
+version.workspace = true
+edition.workspace = true
+
+# Ops/admin dashboard for the KaPosts (KaChat-owned) indexer. Serves a self-contained
+# static SPA plus a small JSON API (pipeline health, table stats, content moderation).
+# Reads the same PostgreSQL database the processor writes and the webserver reads.
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+axum = "0.7"
+tower = "0.5.2"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres"] }
+serde = { version = "1.0.227", features = ["derive"] }
+serde_json = "1.0.145"
+clap = { version = "4.5.48", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+anyhow = "1.0.100"
+hex = "0.4"
+base64 = "0.21"
+# HTTP client to proxy the vendored kasia (chat) indexer's /metrics into the dashboard.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -16,7 +16,7 @@ UTXO subscription **only while the app is running**; with the app closed, nothin
 by Settings > Notifications > Wallet > "Address Activity" (default on).
 
 ### Why the current server cannot do this (verified)
-- `K-webserver`/indexer ingestion drops any transaction whose payload does not parse as a
+- `kachat-webserver`/indexer ingestion drops any transaction whose payload does not parse as a
   `ciph_msg:`-prefixed sealed operation (`block_processor.rs:378`). A bare KAS transfer exits
   before any address matching — there is **no UTXO/balance watcher anywhere in the indexer**.
 - `PushEventKind` (`indexer-actors/src/push.rs`) is exclusively Kasia-protocol events.
