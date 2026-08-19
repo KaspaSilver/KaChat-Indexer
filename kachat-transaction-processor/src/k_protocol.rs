@@ -1063,7 +1063,18 @@ impl KProtocolProcessor {
                 .iter()
                 .map(|pk| hex::decode(pk))
                 .collect();
-            let mentioned_pubkeys_bytes = mentioned_pubkeys_bytes?;
+            let mut mentioned_pubkeys_bytes = mentioned_pubkeys_bytes?;
+            // De-dupe by the x-only coordinate (skip the 02/03 parity byte): `02+x` and `03+x`
+            // are the same user (an address-derived mention vs their true key) and must produce
+            // exactly one mention row. Also collapses plain duplicates ("@alice @alice.kas").
+            {
+                let mut seen_xonly: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
+                mentioned_pubkeys_bytes.retain(|pk| {
+                    let xonly = if pk.len() == 33 { pk[1..].to_vec() } else { pk.clone() };
+                    seen_xonly.insert(xonly)
+                });
+            }
 
             if hashtags.is_empty() {
                 // Has mentions but no hashtags - CTE with post + mentions

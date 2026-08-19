@@ -3105,7 +3105,7 @@ impl DatabaseInterface for PostgresDbManager {
                         FROM k_mentions km
                         WHERE substr(km.mentioned_pubkey, 2) = substr($1, 2)
                           AND km.sender_pubkey IS NOT NULL
-                          AND km.sender_pubkey != $1
+                          AND substr(km.sender_pubkey, 2) != substr($1, 2)
                           AND (km.block_time > $2 OR (km.block_time = $2 AND km.id > $3))
                           AND NOT EXISTS (
                               SELECT 1 FROM k_blocks kb
@@ -3136,7 +3136,7 @@ impl DatabaseInterface for PostgresDbManager {
                     FROM k_mentions km
                     WHERE substr(km.mentioned_pubkey, 2) = substr($1, 2)
                       AND km.sender_pubkey IS NOT NULL
-                      AND km.sender_pubkey != $1
+                      AND substr(km.sender_pubkey, 2) != substr($1, 2)
                       AND NOT EXISTS (
                           SELECT 1 FROM k_blocks kb
                           WHERE kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = km.sender_pubkey
@@ -3220,7 +3220,7 @@ impl DatabaseInterface for PostgresDbManager {
                 -- key) share the same x-coordinate, so they keep matching too.
                 WHERE substr(km.mentioned_pubkey, 2) = substr($1, 2)
                   AND km.sender_pubkey IS NOT NULL
-                  AND km.sender_pubkey != $1
+                  AND substr(km.sender_pubkey, 2) != substr($1, 2)
                   AND NOT EXISTS (
                       SELECT 1 FROM k_blocks kb
                       WHERE kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = km.sender_pubkey
