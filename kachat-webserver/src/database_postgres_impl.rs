@@ -3209,9 +3209,18 @@ impl DatabaseInterface for PostgresDbManager {
             WITH filtered_notifications AS (
                 SELECT km.id as notification_id, km.content_id, km.content_type, km.block_time, km.sender_pubkey,
                        kc.referenced_content_id,
-                       CASE WHEN km.content_type = 'quote' THEN 'quote' ELSE 'mention' END as notification_type
+                       CASE WHEN km.content_type = 'quote' THEN 'quote' ELSE 'mention' END as notification_type,
+                       -- A reply's mentioned_pubkeys carry the parent author (the reply-notification
+                       -- hook) PLUS any @mentioned third parties. Rows whose mentioned pubkey is NOT
+                       -- the parent author (x-only compare) are @mentions inside the comment and are
+                       -- surfaced as contentType "mention". Unknown parent (deleted) keeps "reply".
+                       (km.content_type = 'reply'
+                        AND parent_c.sender_pubkey IS NOT NULL
+                        AND substr(parent_c.sender_pubkey, 2) != substr(km.mentioned_pubkey, 2)) as is_reply_mention
                 FROM k_mentions km
                 LEFT JOIN k_contents kc ON km.content_type = 'quote' AND km.content_id = kc.transaction_id
+                LEFT JOIN k_contents reply_c ON km.content_type = 'reply' AND km.content_id = reply_c.transaction_id AND reply_c.content_type = 'reply'
+                LEFT JOIN k_contents parent_c ON reply_c.referenced_content_id = parent_c.transaction_id
                 -- Match on the x-only key (drop the 1-byte parity prefix). @mentions are derived
                 -- from a Kaspa address as `02 + x-only` (even-Y by BIP-340 convention), while a
                 -- user's real signing key may be odd-parity (`03 + x-only`) and is what they query
@@ -3252,6 +3261,7 @@ impl DatabaseInterface for PostgresDbManager {
                     b.base64_encoded_profile_image as user_profile_image,
                     fn.content_type,
                     fn.notification_type,
+                    fn.is_reply_mention,
                     -- Vote-specific fields
                     CASE WHEN fn.content_type = 'vote' THEN v.vote ELSE NULL END as vote_type,
                     CASE WHEN fn.content_type = 'vote' THEN v.block_time ELSE NULL END as vote_block_time,
@@ -3361,6 +3371,7 @@ impl DatabaseInterface for PostgresDbManager {
                     content: ContentRecord::Post(post_record),
                     mention_id: notification_id,
                     mention_block_time: block_time as u64,
+                    is_reply_mention: false,
                 });
             } else if content_type == "quote" {
                 // Handle quote notifications - someone quoted my content
@@ -3395,6 +3406,7 @@ impl DatabaseInterface for PostgresDbManager {
                     content: ContentRecord::Post(post_record),
                     mention_id: notification_id,
                     mention_block_time: block_time as u64,
+                    is_reply_mention: false,
                 });
             } else if content_type == "reply" {
                 let reply_record = KReplyRecord {
@@ -3421,6 +3433,11 @@ impl DatabaseInterface for PostgresDbManager {
                     content: ContentRecord::Reply(reply_record),
                     mention_id: notification_id,
                     mention_block_time: block_time as u64,
+                    is_reply_mention: row
+                        .try_get::<Option<bool>, _>("is_reply_mention")
+                        .ok()
+                        .flatten()
+                        .unwrap_or(false),
                 });
             } else if content_type == "vote" {
                 let vote_record = KVoteRecord {
@@ -3445,6 +3462,7 @@ impl DatabaseInterface for PostgresDbManager {
                     content: ContentRecord::Vote(vote_record),
                     mention_id: notification_id,
                     mention_block_time: block_time as u64,
+                    is_reply_mention: false,
                 });
             }
         }

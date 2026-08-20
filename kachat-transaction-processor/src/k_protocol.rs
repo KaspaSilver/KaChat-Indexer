@@ -1288,7 +1288,18 @@ impl KProtocolProcessor {
                 .iter()
                 .map(|pk| hex::decode(pk))
                 .collect();
-            let mentioned_pubkeys_bytes = mentioned_pubkeys_bytes?;
+            let mut mentioned_pubkeys_bytes = mentioned_pubkeys_bytes?;
+            // De-dupe by x-only (same rule as posts): `02+x` and `03+x` are the same user. For
+            // replies this also guarantees the parent author can never get two rows (one reply +
+            // one mention) if a client sends both parity forms of their key.
+            {
+                let mut seen_xonly: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
+                mentioned_pubkeys_bytes.retain(|pk| {
+                    let xonly = if pk.len() == 33 { pk[1..].to_vec() } else { pk.clone() };
+                    seen_xonly.insert(xonly)
+                });
+            }
 
             if hashtags.is_empty() {
                 // Has mentions but no hashtags - CTE with reply + mentions
