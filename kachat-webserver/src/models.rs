@@ -150,6 +150,9 @@ pub struct NotificationContentRecord {
     pub content: ContentRecord,
     pub mention_id: i64,
     pub mention_block_time: u64,
+    /// Reply rows only: the mentioned pubkey is NOT the parent post's author, i.e. this is an
+    /// @mention inside a comment — surfaced to clients as contentType "mention" instead of "reply".
+    pub is_reply_mention: bool,
 }
 
 // Referenced content data for quotes (only the original content being quoted)

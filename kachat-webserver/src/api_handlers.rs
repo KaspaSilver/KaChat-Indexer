@@ -954,11 +954,19 @@ impl ApiHandlers {
                     )
                 }
                 ContentRecord::Reply(reply_record) => {
-                    NotificationPost::from_k_reply_record_with_mention_cursor(
+                    let mut post = NotificationPost::from_k_reply_record_with_mention_cursor(
                         &reply_record,
                         notification_record.mention_id,
                         notification_record.mention_block_time,
-                    )
+                    );
+                    // @mention inside a comment (mentioned pubkey != parent author): surface as a
+                    // "mention" pointing at the comment itself; the parent author's row keeps
+                    // contentType "reply" so they are never double-notified.
+                    if notification_record.is_reply_mention {
+                        post.content_type = "mention".to_string();
+                        post.content_id = Some(reply_record.transaction_id.clone());
+                    }
+                    post
                 }
                 ContentRecord::Vote(vote_record) => {
                     // For votes, we now have enriched vote record with all necessary data
