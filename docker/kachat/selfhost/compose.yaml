@@ -69,6 +69,10 @@ services:
       network: host
     restart: unless-stopped
     network_mode: "host"
+    # Let the chat indexer's fjall store flush cleanly on recreate/stop (must exceed the chat
+    # program's stopwaitsecs in supervisord.conf) — a kill mid-compaction corrupts the LSM
+    # metadata partition. See docs/RECOVERY-chat-metadata.md.
+    stop_grace_period: 60s
     environment:
       # Node + network — points at the bundled kaspad on this host (BORSH wRPC 17110).
       KASPA_NODE_ADDRESS: ${KASPA_NODE_ADDRESS}

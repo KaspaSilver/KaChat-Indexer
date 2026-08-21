@@ -41,6 +41,11 @@ services:
       network: host
     restart: unless-stopped
     network_mode: "host"
+    # Give the chat indexer's fjall store time to flush on recreate/stop. Must EXCEED the
+    # chat program's stopwaitsecs (supervisord.conf) so supervisord can shut chat down cleanly
+    # before Docker SIGKILLs the container — a kill mid-compaction corrupts the LSM metadata
+    # partition (see docs/RECOVERY-chat-metadata.md).
+    stop_grace_period: 60s
     environment:
       # node + network
       KASPA_NODE_ADDRESS: ${KASPA_NODE_ADDRESS}
