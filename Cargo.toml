@@ -6,6 +6,8 @@ members = [
     "kachat-content-remover",
     "kachat-admin"
 ]
+# Emergency-only recovery tool; not part of normal builds (own deps: fjall). See its README.
+exclude = ["tools/reseed-metadata"]
 resolver = "2"
 
 [workspace.package]
