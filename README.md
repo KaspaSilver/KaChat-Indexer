@@ -1,263 +1,200 @@
 # KaChat Indexer
 
-**KaChat Indexer** is the KaChat-owned indexer powering KaPosts (social) and KaChat
-broadcasts. It is a fork of [thesheepcat/K-indexer](https://github.com/thesheepcat/K-indexer)
-extended with: server-side KaChat-only exclusivity, text-only content validation, removal
-counter-actions (`unvote`/`unquote`), a per-post engagement endpoint, KaChat broadcast
-indexing (`#kaspa` / `#kachat-bugs`, 3-day retention), and a **KaChat Indexer** admin
-dashboard (`kachat-admin`) that will grow into the single pane of glass for all of it.
+**KaChat Indexer** is the engine behind **KaChat** — the cross-platform Kaspa messenger and
+social network (iPhone, Android, and the [KaChat Desktop web app](https://github.com/KaspaSilver/KaChat-Desktop)).
+It reads the Kaspa chain and turns KaChat's on-chain `kchat:` traffic into fast REST APIs
+that every KaChat client talks to.
 
-## 🚀 Want to run your own indexer?
+One indexer serves all of KaChat:
 
-**→ Follow [`INSTALL.md`](INSTALL.md) — a step‑by‑step, cross‑platform self‑hosting guide**
-(Linux, Windows, macOS) covering Docker, the indexer itself, optional **Portainer**, and
-**nginx‑proxy‑manager** for HTTPS. Start there.
+- **💬 Direct & group chats** — end-to-end encrypted messaging, handshakes, payments, group control.
+- **📣 Broadcasts** — public rooms (e.g. `#kaspa`, `#kachat-bugs`) with configurable retention.
+- **📝 KaPosts** — the social feed: posts, replies, quotes, votes, follows, blocks.
+- **🔔 @mentions & push** — client-resolved `@` mentions surface as notifications; optional
+  APNs (iOS) and FCM (Android) delivery.
+- **📊 Admin dashboard** — a single pane of glass (services, chain sync, database + chat-store
+  size, live stats).
 
-- **Deep‑dive deploy notes:** [`KAPOSTS.md`](KAPOSTS.md) and [`docker/kachat/DEPLOY.md`](docker/kachat/DEPLOY.md).
-- **Upstream lineage** is preserved in git history and the `upstream` remote; the original
-  K-indexer docs follow below.
+KaChat runs on its own on-chain identifier, **`kchat:`**, so it is its own network — while still
+reading legacy history so nothing from before the rebrand is lost.
 
 ---
 
-## Upstream: K-indexer
+## 🚀 Run your own KaChat Indexer — one command
 
-K-indexer is a simplified Kaspa transaction indexer designed specifically for indexing and serving K protocol transactions.
+This downloads Docker (if needed), a full Kaspa node, Postgres, the KaChat app, plus
+**Portainer** (monitoring) and **nginx-proxy-manager** (HTTPS) — and starts all of it in Docker.
 
-## 🚀 New Architecture
+```bash
+curl -fsSL https://raw.githubusercontent.com/KaspaSilver/kachat-indexer/main/install.sh | bash
+```
 
-The new indexer architecture is composed of the following components:
+Works on **Linux**, **macOS**, and **Windows** (run it in **WSL2** or **Git Bash** — Docker
+Desktop sets up WSL2 for you). Nothing else to install first; the command handles the rest.
 
-- **🔗 Rusty-Kaspa Node**: A running rusty-kaspa node
-- **💾 PostgreSQL Database**: Database for storing indexed data
-- **📡 Simply-kaspa-indexer**: By supertypo (https://github.com/supertypo/simply-kaspa-indexer) to receive all transactions from Kaspa network and temporarily store them
-- **🔍 kachat-transaction-processor**: Filters incoming transactions and indexes all K-related data in proper database tables
-- **🌐 kachat-webserver**: Serves all K-related data to web applications via API calls
-- **🧹 kachat-database-cleaner** *(Optional)*: Maintains a lighter, cleaner database for personal indexers by automatically purging unwanted content
+### 🧹 Remove everything — one command
 
-### Process Flow
+Tears down the whole stack, deletes its data volumes and downloaded images, and removes the
+files it cloned. (It leaves Docker itself installed and asks you to type `yes` first.)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KaspaSilver/kachat-indexer/main/uninstall.sh | bash
+```
+
+---
+
+## 📦 What the one command sets up
+
+| Container | What it is | Notes |
+|---|---|---|
+| **kaspad** | A full Kaspa node (rusty-kaspad) — the chain source | RPC on **16110** (gRPC) and **17110** (BORSH wRPC); `--utxoindex` on. Bound to the host, so it doubles as **your own node**. |
+| **kachat-db** | PostgreSQL 17 | KaPosts + broadcast tables |
+| **kachat-app** | The KaChat indexer itself | Block ingester + `kchat:` processor + REST API + chat indexer + admin, under one supervisor |
+| **nginx-proxy-manager** | HTTPS front door *(optional)* | Only started if you're not already running one |
+| **portainer** | Docker monitoring UI *(optional)* | Only started if you're not already running one |
+
+The installer is safe to re-run — it fast-forwards the repo, keeps your existing `.env`, and
+won't start a second Portainer or nginx-proxy-manager if you already have one.
+
+### Ports & endpoints
+
+| Service | URL / port | |
+|---|---|---|
+| Kaspa node RPC | `127.0.0.1:16110` (gRPC), `127.0.0.1:17110` (BORSH wRPC) | use your own node |
+| KaPosts REST API | `http://localhost:3080` | try `/health` |
+| Chat indexer API | `http://localhost:8600` | |
+| Admin dashboard | `http://localhost:3081` | loopback only — reach it over an SSH tunnel |
+| Portainer | `http://localhost:9000` | set an admin password on first visit |
+| nginx-proxy-manager | `http://localhost:81` | first login `admin@example.com` / `changeme` — **change it immediately** |
+
+> **First run:** the bundled Kaspa node has to sync before chat and KaPosts data appear.
+> Watch it with `docker logs -f kaspad`. Everything else is up and waiting in the meantime.
+
+---
+
+## 📊 Monitoring with Portainer
+
+Portainer gives you a browser dashboard for the whole stack at **http://localhost:9000**:
+
+- Health, uptime, and CPU/memory for every KaChat container
+- Live and historical **logs** for troubleshooting
+- One-click **restart**, or open a container shell — no terminal needed
+
+You also get KaChat's own **admin dashboard** (Services, chain sync, database + chat-store size,
+live stats) at `http://localhost:3081`. It binds to loopback for safety; reach it with an SSH
+tunnel: `ssh -L 3081:localhost:3081 <your-server>`, then open `http://localhost:3081`.
+
+## 🔒 HTTPS with nginx-proxy-manager
+
+To put your indexer behind a domain with a free Let's Encrypt certificate:
+
+1. Open **http://localhost:81** and log in (`admin@example.com` / `changeme`, then change it).
+2. Add a **Proxy Host** for your domain pointing at `host.docker.internal` port `3080` (REST API)
+   — and another for `host.docker.internal` port `8600` (chat API).
+3. Enable **SSL → Request a new certificate** and **Force SSL**.
+
+Your clients then talk to `https://your-domain` instead of raw ports.
+
+---
+
+## ⚙️ Configuration
+
+Settings live in `docker/kachat/selfhost/.env` (generated on first install, with a fresh random
+database password and push secret). Common knobs:
+
+| Variable | Default | Description |
+|---|---|---|
+| `NETWORK` | `mainnet` | Kaspa network the node + indexer run on |
+| `KASPA_NODE_ADDRESS` / `KASPA_NODE_PORT` | `127.0.0.1` / `17110` | Node BORSH wRPC endpoint — repoint to use an existing node instead of the bundled one |
+| `WEBSERVER_PORT` | `3080` | KaPosts REST API port |
+| `CHAT_API_PORT` | `8600` | Chat indexer API port |
+| `ADMIN_PORT` | `3081` | Admin dashboard (loopback) |
+| `FCM_PROJECT_ID` | *(empty)* | Set to enable Android push (drop the service-account JSON on the app data volume) |
+
+Push notifications are **off** by default (self-hosters have no Apple/Firebase credentials);
+device registration still works — only delivery is a no-op until you add your own keys.
+
+After editing `.env`, apply changes with:
+
+```bash
+cd ~/kachat/kachat-indexer/docker/kachat/selfhost && docker compose up -d
+```
+
+---
+
+## 🧩 Architecture
 
 ```mermaid
 sequenceDiagram
-    participant KN as Kaspa Node
-    participant SKI as Simply-Kaspa-Indexer
-    participant DB as PostgreSQL Database
-    participant NL as K-Transaction-Processor<br/>Listener
-    participant NQ as Notification Queue
-    participant WP as Worker Pool<br/>(Multiple Workers)
-    participant WS as K-Webserver
-    participant API as Web Applications
+    participant KN as Kaspa Node (kaspad)
+    participant SKI as Block Ingester
+    participant DB as PostgreSQL
+    participant PR as KaChat Processor
+    participant CH as Chat Indexer
+    participant WS as KaChat Webserver
+    participant APP as KaChat Clients
 
-    KN->>SKI: Send transactions via WebSocket
-    SKI->>DB: Store transactions in transactions table
-    DB->>DB: Database trigger fires on new transaction
-    DB->>NL: NOTIFY on transaction_channel
-    NL->>NQ: Forward transaction_id to queue
-    NQ->>WP: Distribute transaction_id to available worker
-    
-    WP->>DB: Fetch transaction details by ID
-    DB->>WP: Return transaction data
-    WP->>WP: Check if payload starts with "k:1:"
-    
-    WP->>DB: Parse and store data in K tables<br/>(k_posts, k_replies, k_votes, etc.)
-    
-    API->>WS: Request K protocol data
-    WS->>DB: Query K tables
-    DB->>WS: Return K protocol data
-    WS->>API: Serve JSON response
+    KN->>SKI: transactions via BORSH wRPC (17110)
+    SKI->>DB: store transactions
+    DB->>PR: NOTIFY on new transaction
+    PR->>PR: match kchat: payload (dual-reads legacy history)
+    PR->>DB: index KaPosts / broadcasts (posts, replies, votes, mentions…)
+    KN->>CH: chat traffic via BORSH wRPC
+    CH->>CH: index chats/groups into embedded store
+    APP->>WS: request data
+    WS->>DB: query
+    WS->>APP: JSON response
 ```
 
-## 📚 Protocol Documentation
+**Components** (all built from this repo, run under one supervisor in `kachat-app`):
 
-Technical specifications for the K protocol are available in the [official K repository](https://github.com/thesheepcat/K).
+- **Block ingester** — pulls transactions from the node into Postgres (via
+  [simply-kaspa-indexer](https://github.com/supertypo/simply-kaspa-indexer)).
+- **kachat-transaction-processor** — matches `kchat:` (and legacy) payloads and indexes KaPosts +
+  broadcasts.
+- **kachat-webserver** — the public REST API every KaChat client uses.
+- **Chat indexer** — indexes direct/group chats into an embedded store.
+- **kachat-admin** — the ops/admin dashboard.
+- **kachat-database-cleaner** / **kachat-content-remover** — optional retention & moderation tools
+  (see their folders).
 
 ---
 
-## 🛠️ Installation & Setup
+## 📖 Documentation
 
-### Prerequisites
+- **API reference:** [`API_TECHNICAL_SPECIFICATIONS.md`](API_TECHNICAL_SPECIFICATIONS.md)
+- **KaPosts:** [`KAPOSTS.md`](KAPOSTS.md) · **@mentions client contract:** [`KACHAT_KAPOST_MENTIONS_CLIENT_SPEC.md`](KACHAT_KAPOST_MENTIONS_CLIENT_SPEC.md)
+- **`kchat:` client migration:** [`KCHAT_CLIENT_MIGRATION.md`](KCHAT_CLIENT_MIGRATION.md)
+- **Notifications:** [`INDEXER_NOTIFICATIONS_REFERENCE.md`](INDEXER_NOTIFICATIONS_REFERENCE.md)
+- **Operator deploy notes:** [`docker/kachat/DEPLOY.md`](docker/kachat/DEPLOY.md) · **manual install:** [`INSTALL.md`](INSTALL.md)
 
-- Linux Ubuntu server (recommended)
-- Rust toolchain
-- Docker
-- Running rusty-kaspa node
+---
 
-### 📋 Step-by-Step Instructions
+## 🛠️ Manual / advanced setup
 
-To run the indexer, proceed in the following way:
-
-#### 1. **Activate Rusty-Kaspa Node**
-Follow the [documentation here on how to run rusty-kaspa](https://kaspa.aspectron.org/running-rusty-kaspa.html)
-
-**Required Node Parameters:**
-- `--utxoindex`: Enable UTXO indexing
-- `--rpclisten-borsh=0.0.0.0:17120`: Enable BORSH RPC on all interfaces
-
-#### 2. **Setup enviroment variables**
-Navigate to docker/PROD folder, open .env file and set the variables depending on your preferences:
+The one-command installer uses [`docker/kachat/selfhost/`](docker/kachat/selfhost/). To run it by hand:
 
 ```bash
-cd K-indexer/docker/PROD
-nano .env
-```
-##### Variables description
-| Variable | Default | Description |
-|-----------|---------|-------------|
-| `COMPOSE_PROFILES` | `public-indexer` | Indexer type: `public-indexer` or `personal-indexer` |
-| `DB_USER` | `username` | PostgreSQL database username |
-| `DB_PASSWORD` | `password` | PostgreSQL database password |
-| `DB_NAME` | `k-db` | PostgreSQL database name |
-| `DB_PORT` | `5432` | PostgreSQL database access port |
-| `WEBSERVER_PORT` | `3000` | kachat-webserver access port (used by K-webapp, to connect to K-indexer) |
-| `USER_PUBKEY` | - | Your Kaspa public key (required only for `personal-indexer`) |
-| `DATA_RETENTION` | `72h` | How long to keep content from non-followed users (required only for `personal-indexer`) |
-| `PURGE_INTERVAL` | `10m` | How often to run cleanup operations (required only for `personal-indexer`) |
-
-**IMPORTANT**:
-- Change `DB_USER` and `DB_PASSWORD` to secure values
-- Set `COMPOSE_PROFILES` to `personal-indexer` and configure `USER_PUBKEY`, `DATA_RETENTION`, and `PURGE_INTERVAL` if running a personal indexer with k-database-cleaner
-
-#### 3. **Activate all Services**
-Navigate to docker/PROD folder and use docker compose to activate all services:
-
-```bash
-cd K-indexer/docker/PROD
-docker compose up -d
-```
-The following services will be activated:
-- k-indexer-db (PostgreSQL database)
-- simply-kaspa-indexer
-- k-transaction-processor
-- k-webserver
-- k-database-cleaner (only if set as "personal indexer")
-- portainer (container management UI)
-
-#### 4. **Monitor Services with Portainer**
-
-Portainer provides a web-based interface to monitor and manage your Docker containers.
-
-Access Portainer at:
-```
-http://localhost:9000
+git clone https://github.com/KaspaSilver/kachat-indexer.git
+cd kachat-indexer/docker/kachat/selfhost
+cp .env.example .env          # then set DB_PASSWORD + INTERNAL_PUSH_SECRET
+docker compose --profile proxy --profile monitor up -d --build
 ```
 
-**First-time Setup:**
-- Create an admin password when prompted
-- Select "Get Started" to connect to the local Docker environment
-
-**What You Can Do:**
-- **Monitor container health**: Check running/stopped status of all services
-- **View logs**: Real-time and historical logs for troubleshooting
-- **Resource usage**: CPU, memory, and network statistics
-- **Restart containers**: Quick restart without terminal access
-- **Execute commands**: Access container shells directly from the browser
+To point at an **existing** Kaspa node instead of the bundled one, set `KASPA_NODE_ADDRESS` /
+`KASPA_NODE_PORT` in `.env` and drop the `kaspad` service. The operator stack that powers the live
+KaChat network lives in [`docker/kachat/`](docker/kachat/) (`DEPLOY.md`).
 
 ---
 
-## 📖 API Endpoints
+## 📜 Lineage & license
 
-Once running, K-indexer provides REST endpoints the K webapp.
+KaChat Indexer began as a fork of [thesheepcat/K-indexer](https://github.com/thesheepcat/K-indexer)
+and has since grown into KaChat's own indexer — its own `kchat:` network identifier, chat + group +
+broadcast indexing, @mention notifications, a unified admin dashboard, and this turnkey installer.
+Upstream lineage is preserved in git history. Licensed under the terms in [`LICENSE`](LICENSE).
 
-You can find all details of the API techical specification in the [API_TECHNICAL_SPECIFICATIONS.md](API_TECHNICAL_SPECIFICATIONS.md) document.
+## 💬 Support
 
----
-
-## 🧹 Personal Indexer with kachat-database-cleaner
-
-For users running a **personal indexer**, kachat-database-cleaner helps maintain a lightweight, efficient database by automatically removing unwanted data based on your preferences.
-
-### Why Use kachat-database-cleaner?
-
-When running a personal indexer, you may not want to store:
-- Content from users you've blocked
-- Old posts from users you don't follow
-- Orphaned replies and votes that reference deleted content
-- Follow/block records from other users
-
-kachat-database-cleaner runs periodic purge operations to keep your database clean and storage-efficient, retaining only the content that matters to you.
-
-### Key Features
-
-- **Automated Cleanup**: Runs at configurable intervals (default: every 10 minutes)
-- **Configurable Retention**: Set how long to keep content from non-followed users (default: 72 hours)
-- **Single Query per Operation**: Optimized CTEs for efficient purging
-- **Detailed Logging**: Reports exactly what was deleted in each cycle
-
-### Getting Started
-
-For full documentation on installation, configuration, and usage, see the [kachat-database-cleaner README](kachat-database-cleaner/README.md).
-
----
-
-## 🗑️ Content Removal with kachat-content-remover
-
-For operators running a **public indexer**, kachat-content-remover provides a simple way to remove harmful, spam, or unwanted content created by specific users from your database.
-
-### Why Use kachat-content-remover?
-
-Public indexers may need to remove:
-- Spam content from malicious users
-- Harmful or unwanted content from malicious users
-
-kachat-content-remover allows you to completely remove all content associated with a specific public key in a single, atomic operation.
-
-### Key Features
-
-- **One-time Execution**: Run on-demand when needed
-- **Dry-Run Mode**: Preview what will be deleted before committing
-- **Confirmation Required**: Safety prompt to prevent accidental deletions
-- **Atomic Transaction**: All-or-nothing deletion ensures database consistency
-- **Detailed Reporting**: Shows exactly what was removed from each table
-
-### Getting Started
-
-For full documentation on installation, configuration, and usage, see the [kachat-content-remover README](kachat-content-remover/README.md).
-
----
-
-## 📊 K-Webserver Performance Monitoring
-
-For operators running a **public indexer**, monitoring kachat-webserver performance is essential to ensure optimal API response times and identify potential bottlenecks.
-
-### Why Monitor K-Webserver?
-
-Public indexers should monitor:
-- **Request rates**: Track API endpoint usage and traffic patterns
-- **Response times**: Detect performance degradation and slow queries
-- **Resource utilization**: Identify endpoints that need optimization
-- **Error rates**: Monitor HTTP status codes and failures
-
-### Monitoring Stack
-
-The K-Webserver monitoring solution provides:
-- **Real-time dashboards**: Pre-configured Grafana dashboards for all API endpoints
-- **Prometheus metrics**: Automatic collection of performance metrics every 15 seconds
-- **Rolling window analytics**: 1-minute rolling averages for request rates and response times
-- **Easy setup**: Fully automated provisioning via Docker Compose
-
-### Getting Started
-
-For complete setup instructions, configuration options, and troubleshooting, see the [K-Webserver Monitoring Guide](docker/K-WEBSERVER-MONITORING/K-WEBSERVER-MONITORING.md).
-
----
-
-## ⚠️ Important
-
-**This code is a PROOF OF CONCEPT** designed to demonstrate K's potential to the Kaspa community and showcase a real solution to genuine problems faced by users worldwide.
-
-While K has the potential to become a feature-rich, widely-adopted platform, the current version is experimental and includes:
-- 🐛 Bugs and unexpected behaviors
-- 🐌 Inefficient processes in some areas
-- 🎨 User interface/experience improvements needed
-- 🔧 Missing features and functionality
-
-**By using K, you accept these limitations as part of the development process.**
-
----
-
-## 💬 Support & Community
-
-Need help or want to connect with other K users and developers?
-
-**Join the Kluster Discord server**: https://discord.gg/vuKyjtRGKB
-
----
+Questions or issues? Open a [GitHub issue](https://github.com/KaspaSilver/kachat-indexer/issues),
+or find the Kaspa community on [Discord](https://discord.gg/vuKyjtRGKB).
