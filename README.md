@@ -197,4 +197,4 @@ Upstream lineage is preserved in git history. Licensed under the terms in [`LICE
 ## 💬 Support
 
 Questions or issues? Open a [GitHub issue](https://github.com/KaspaSilver/kachat-indexer/issues),
-or find the Kaspa community on [Discord](https://discord.gg/vuKyjtRGKB).
+or email kaspasilver@gmail.com
