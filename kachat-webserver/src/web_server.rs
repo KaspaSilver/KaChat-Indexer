@@ -1,13 +1,19 @@
 use axum::{
     Router,
-    extract::{ConnectInfo, Query, State},
-    http::StatusCode,
-    response::Json,
+    extract::{ConnectInfo, Query, Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{Json, Response},
     routing::get,
 };
 use axum_prometheus::PrometheusMetricLayer;
 use serde::Deserialize;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{net::TcpListener, sync::RwLock, time::Instant};
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -301,6 +307,8 @@ impl WebServer {
                     .allow_methods(Any)
                     .allow_headers(Any),
             )
+            // Resolve the real client IP from proxy headers BEFORE handlers rate-limit on it.
+            .layer(middleware::from_fn(resolve_client_ip))
             .with_state(self.app_state.clone())
     }
 
@@ -349,6 +357,41 @@ async fn check_rate_limit(
     }
 
     Ok(())
+}
+
+/// Extract the real client IP from proxy headers. Prefers `X-Real-IP`, which our nginx front
+/// sets to the connecting client and clients cannot spoof (nginx overwrites it). Falls back to
+/// the last hop of `X-Forwarded-For` — the entry the immediate trusted proxy appended (the
+/// first hop is client-supplied and spoofable, so it is deliberately not used).
+fn client_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+    {
+        return Some(ip);
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next_back())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+}
+
+/// Middleware: rewrite `ConnectInfo<SocketAddr>` to the real client IP so per-IP rate limiting
+/// works behind nginx (otherwise every user shares the proxy's single IP). Port is normalized to
+/// 0 so the rate-limit map keys purely by client IP. Runs before handlers, which then rate-limit
+/// transparently via their existing `ConnectInfo` extractor — no per-handler changes needed.
+async fn resolve_client_ip(mut req: Request, next: Next) -> Response {
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    if let Some(ip) = client_ip_from_headers(req.headers()).or(peer_ip) {
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(ip, 0)));
+    }
+    next.run(req).await
 }
 
 // API Handler Functions
