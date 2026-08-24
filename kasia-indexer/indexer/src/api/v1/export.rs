@@ -188,6 +188,72 @@ pub async fn purge_all(State(state): State<ExportApi>) -> impl IntoResponse {
     }
 }
 
+/// POST /self-stash-gc-orphans — permanently remove `self_stash_by_owner` index keys whose
+/// payload row (`tx-id-to-self-stash`) is missing. These orphans made `/self-stash/by-owner`
+/// pages 500 before the read-path fix; this drops the dead index entries for good. Runs inside
+/// the indexer's own single-writer transaction (same store, no second process), so it cannot
+/// corrupt the LSM. Idempotent: a second run scans and removes nothing.
+pub async fn gc_self_stash_orphans(State(state): State<ExportApi>) -> impl IntoResponse {
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, usize)> {
+        let index = state
+            .tx_keyspace
+            .open_partition("self_stash_by_owner", PartitionCreateOptions::default())?;
+        let payload = state
+            .tx_keyspace
+            .open_partition("tx-id-to-self-stash", PartitionCreateOptions::default())?;
+
+        // Snapshot pass: collect index keys whose payload is missing. The tx_id is the trailing
+        // 32 bytes of the by-owner key; the payload partition is keyed by that tx_id. A key that
+        // is an orphan in this snapshot stays an orphan — the write pipeline always persists the
+        // payload at or before the index, so a payload can never appear for it later.
+        let mut scanned = 0usize;
+        let orphans: Vec<Vec<u8>> = {
+            let rtx = state.tx_keyspace.read_tx();
+            let mut acc = Vec::new();
+            for kv in rtx.iter(&index) {
+                let (k, _) = kv?;
+                scanned += 1;
+                if k.len() < 32 {
+                    continue;
+                }
+                let tx_id = &k[k.len() - 32..];
+                if rtx.get(&payload, tx_id)?.is_none() {
+                    acc.push(k.to_vec());
+                }
+            }
+            acc
+        };
+
+        // Removal pass: single write transaction, serialized with the live indexer's own writes.
+        let mut removed = 0usize;
+        if !orphans.is_empty() {
+            let mut wtx = state.tx_keyspace.write_tx()?;
+            for k in orphans {
+                wtx.remove(&index, k);
+                removed += 1;
+            }
+            if wtx.commit()?.is_err() {
+                anyhow::bail!("commit conflict during self-stash gc");
+            }
+        }
+        Ok((scanned, removed))
+    })
+    .await;
+
+    match res {
+        Ok(Ok((scanned, removed))) => (
+            StatusCode::OK,
+            format!("{{\"scanned\":{scanned},\"orphans_removed\":{removed}}}"),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{\"error\":\"self-stash gc failed\"}",
+        )
+            .into_response(),
+    }
+}
+
 fn decode_hex(s: &str) -> anyhow::Result<Vec<u8>> {
     if s.len() % 2 != 0 {
         anyhow::bail!("odd hex");
