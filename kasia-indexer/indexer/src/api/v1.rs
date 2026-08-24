@@ -258,6 +258,12 @@ impl Api {
                 "/personal/purge-all",
                 post(export::purge_all).with_state(self.export_api.clone()),
             )
+            // KaChat fork: GC self-stash index entries orphaned by a missing payload row.
+            // Top-level path (not under the "/self-stash" nest) to avoid a route conflict.
+            .route(
+                "/self-stash-gc-orphans",
+                post(export::gc_self_stash_orphans).with_state(self.export_api.clone()),
+            )
     }
 }
 
