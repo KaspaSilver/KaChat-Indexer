@@ -150,16 +150,48 @@ async fn get_self_stash_by_owner(
             .iter_by_owner_and_scope_from_block_time_rtx(&rtx, &scope_bytes, owner, cursor)
             .process_results(|iter| {
                 iter.filter(|self_stash_key| seen_tx_ids.insert(self_stash_key.tx_id))
-                    .take(limit)
-                    .map(|self_stash_key| {
+                    // Resolve the payload FIRST and skip orphaned index entries (index key present,
+                    // payload row missing) with a warning, instead of failing the whole page with a
+                    // 500. Orphans arise because the by-owner index and the payload are written on
+                    // separate paths/transactions (block_processor writes the payload; the deferred
+                    // index insert in virtual_chain_processor tolerates a missing payload), or when
+                    // store recovery dropped a payload segment. Filtering here — BEFORE take(limit)
+                    // — keeps each page returning up to `limit` valid rows and lets the block_time
+                    // cursor advance past orphan clusters (iOS paginates on it every sync cycle).
+                    // Genuine DB errors still propagate and fail the request.
+                    .filter_map(|self_stash_key| {
+                        let stash = match state
+                            .tx_id_to_self_stash_partition
+                            .get_rtx(&rtx, &self_stash_key.tx_id)
+                        {
+                            Ok(Some(stash)) => stash,
+                            Ok(None) => {
+                                tracing::warn!(
+                                    tx_id = %faster_hex::hex_string(&self_stash_key.tx_id),
+                                    "self-stash by-owner: skipping orphaned index entry (payload missing)"
+                                );
+                                return None;
+                            }
+                            Err(e) => return Some(Err(e)),
+                        };
+
                         let block_time = self_stash_key.block_time.get();
-                        let owner =
-                            to_rpc_address(&self_stash_key.owner, state.context.network_type)
-                                .context("Address conversion error")?
-                                .map(|addr| addr.to_string());
-                        let acceptance = state
+                        let owner = match to_rpc_address(
+                            &self_stash_key.owner,
+                            state.context.network_type,
+                        )
+                        .context("Address conversion error")
+                        {
+                            Ok(owner) => owner.map(|addr| addr.to_string()),
+                            Err(e) => return Some(Err(e)),
+                        };
+                        let acceptance = match state
                             .tx_id_to_acceptance_partition
-                            .acceptance_by_tx_id_rtx(&rtx, &self_stash_key.tx_id)?;
+                            .acceptance_by_tx_id_rtx(&rtx, &self_stash_key.tx_id)
+                        {
+                            Ok(acceptance) => acceptance,
+                            Err(e) => return Some(Err(e)),
+                        };
 
                         let (accepting_block, accepting_daa_score) = if let Some(key) = acceptance {
                             (
@@ -170,13 +202,9 @@ async fn get_self_stash_by_owner(
                             (None, None)
                         };
 
-                        let stash = state
-                            .tx_id_to_self_stash_partition
-                            .get_rtx(&rtx, &self_stash_key.tx_id)?
-                            .ok_or_else(|| anyhow::anyhow!("Self stash not found"))?;
                         let stashed_data_str = faster_hex::hex_string(stash.as_ref());
 
-                        Ok(SelfStashResponse {
+                        Some(Ok(SelfStashResponse {
                             tx_id: faster_hex::hex_string(&self_stash_key.tx_id),
                             owner,
                             scope: params.scope.clone(),
@@ -184,8 +212,9 @@ async fn get_self_stash_by_owner(
                             block_time,
                             accepting_block,
                             accepting_daa_score,
-                        })
+                        }))
                     })
+                    .take(limit)
                     .collect::<Result<Vec<_>, _>>()
             })
             .flatten()
