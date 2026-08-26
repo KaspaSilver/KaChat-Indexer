@@ -75,8 +75,8 @@ struct Args {
 
     #[arg(
         long,
-        help = "Days to retain KaChat broadcasts before pruning (default 3)",
-        default_value_t = 3
+        help = "Days to retain KaChat broadcasts before pruning (default 30)",
+        default_value_t = 30
     )]
     broadcast_retention_days: u64,
 }

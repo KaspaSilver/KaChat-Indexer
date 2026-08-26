@@ -24,9 +24,26 @@ use serde::{Deserialize, Serialize};
 /// "4oGg" (E2 81 A0 -> 4oGg), which the client relies on as well.
 pub const KACHAT_MARKER: &str = "\u{2060}";
 
-/// Channels the broadcast indexer tracks. Only these normalized names are stored; everything
-/// else on the `ciph_msg:1:bcast:` protocol is dropped.
-pub const BROADCAST_CHANNELS: [&str; 2] = ["kaspa", "kachat-bugs"];
+/// Channels the broadcast indexer tracks. Only these normalized names are stored; everything else
+/// on the canonical `kchat:1:bcast:` / legacy `ciph_msg:1:bcast:` protocol is dropped. Names must
+/// already be in normalized form (trimmed, lowercase) to match `process_broadcast`. The 11 language
+/// rooms below ship with KaChat iOS/Android 4.0; the accent-free spellings (espanol/francais/
+/// portugues) are deliberate so the names survive normalization.
+pub const BROADCAST_CHANNELS: [&str; 13] = [
+    "kaspa",
+    "kachat-bugs",
+    "kaspa-indonesia",
+    "kaspa-czech",
+    "kaspa-german",
+    "kaspa-espanol",
+    "kaspa-francais",
+    "kaspa-portugues",
+    "kaspa-slovak",
+    "kaspa-chinese",
+    "kaspa-japanese",
+    "kaspa-korean",
+    "kaspa-hebrew",
+];
 
 /// Runtime feature switches, refreshed from the `k_vars` table by a background task in
 /// `main.rs` (keys `feature_kaposts` / `feature_broadcasts`, value `off` to disable). Default
