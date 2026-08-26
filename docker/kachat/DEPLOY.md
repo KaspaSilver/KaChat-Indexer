@@ -123,8 +123,11 @@ sudo ufw enable
 
 The stack also serves KaChat **broadcast** history (`GET /get-broadcasts`) from the same
 webserver, so no second domain/proxy is needed. In the app, set **Broadcast Indexer URL** to
-the **same** value as the KaPost Indexer: `https://kaposts.duckdns.org`. Only `#kaspa` and
-`#kachat-bugs` are indexed. (Verify: `curl "https://kaposts.duckdns.org/get-broadcasts?channel=kaspa&limit=5"`.)
+the **same** value as the KaPost Indexer: `https://kaposts.duckdns.org`. Thirteen curated
+channels are indexed: `#kaspa`, `#kachat-bugs`, and 11 language rooms (`kaspa-indonesia`,
+`kaspa-czech`, `kaspa-german`, `kaspa-espanol`, `kaspa-francais`, `kaspa-portugues`,
+`kaspa-slovak`, `kaspa-chinese`, `kaspa-japanese`, `kaspa-korean`, `kaspa-hebrew`).
+(Verify: `curl "https://kaposts.duckdns.org/get-broadcasts?channel=kaspa&limit=5"`.)
 
 ## Running it as "everyone's default"
 

@@ -248,6 +248,14 @@ async fn get_health(State(state): State<AppState>) -> Result<Json<HealthResponse
 // /api/stats
 // ---------------------------------------------------------------------------
 
+/// One tracked broadcast channel and its stored-row count (for the admin dashboard's per-channel
+/// cards). Built from a `GROUP BY channel` so all channels are covered without hardcoding names.
+#[derive(Serialize)]
+struct ChannelCount {
+    channel: String,
+    count: i64,
+}
+
 #[derive(Serialize)]
 struct StatsResponse {
     posts: i64,
@@ -269,8 +277,9 @@ struct StatsResponse {
     // different subsystem from the KaPosts Postgres DB that `db_size_bytes` measures.
     chat_store_bytes: i64,
     bcast_total: i64,
-    bcast_kaspa: i64,
-    bcast_kachat_bugs: i64,
+    // Per-channel stored-row counts (only channels that currently have rows appear here; the UI
+    // merges these against the full tracked-channel list so empty rooms still render as 0).
+    bcast_by_channel: Vec<ChannelCount>,
 }
 
 /// Recursively sum file sizes under `path` (the chat indexer's fjall store). Metadata-only, so it's
@@ -320,9 +329,7 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
             (SELECT COUNT(*) FROM k_contents WHERE block_time >= $1)          AS ingest_last_5m,
             (SELECT COUNT(*) FROM k_contents WHERE block_time >= $2)          AS ingest_last_60m,
             pg_database_size(current_database())                             AS db_size_bytes,
-            (SELECT COUNT(*) FROM kachat_broadcasts)                          AS bcast_total,
-            (SELECT COUNT(*) FROM kachat_broadcasts WHERE channel = 'kaspa')  AS bcast_kaspa,
-            (SELECT COUNT(*) FROM kachat_broadcasts WHERE channel = 'kachat-bugs') AS bcast_kachat_bugs
+            (SELECT COUNT(*) FROM kachat_broadcasts)                          AS bcast_total
         "#,
     )
     .bind(cutoff_5m)
@@ -330,6 +337,22 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::db)?;
+
+    // Per-channel broadcast counts — one row per channel that has data. Avoids hardcoding channel
+    // names so newly-tracked rooms show up automatically. The UI fills in 0 for tracked-but-empty
+    // channels from its own channel list.
+    let bcast_by_channel = sqlx::query(
+        "SELECT channel, COUNT(*) AS count FROM kachat_broadcasts GROUP BY channel ORDER BY count DESC, channel",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::db)?
+    .into_iter()
+    .map(|r| ChannelCount {
+        channel: r.get("channel"),
+        count: r.get("count"),
+    })
+    .collect();
 
     // Chat store size is a filesystem walk — run it off the async runtime.
     let chat_dir = state.chat_data_dir.clone();
@@ -355,8 +378,7 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
         db_size_bytes: row.get("db_size_bytes"),
         chat_store_bytes,
         bcast_total: row.get("bcast_total"),
-        bcast_kaspa: row.get("bcast_kaspa"),
-        bcast_kachat_bugs: row.get("bcast_kachat_bugs"),
+        bcast_by_channel,
     }))
 }
 

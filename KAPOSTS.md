@@ -38,13 +38,16 @@ KaChat iOS app already speaks, and adds the KaChat-specific behaviour described 
    messages (a different protocol — `ciph_msg:1:bcast:<channel>:<content>`, no signatures,
    sender = the self-send address). Served from the **same webserver/host** as KaPosts, so
    the app's *Broadcast Indexer URL* is the same URL as the *KaPost Indexer URL*.
-   - Only the tracked channels **`#kaspa`** and **`#kachat-bugs`** are indexed; everything
-     else on the bcast protocol is dropped (`BROADCAST_CHANNELS` in `k_protocol.rs`).
+   - Thirteen curated channels are indexed — **`#kaspa`**, **`#kachat-bugs`**, and 11 language
+     rooms (`kaspa-indonesia`, `kaspa-czech`, `kaspa-german`, `kaspa-espanol`, `kaspa-francais`,
+     `kaspa-portugues`, `kaspa-slovak`, `kaspa-chinese`, `kaspa-japanese`, `kaspa-korean`,
+     `kaspa-hebrew`); everything else on the bcast protocol is dropped (`BROADCAST_CHANNELS` in
+     `k_protocol.rs`). The accent-free spellings are deliberate so names survive normalization.
    - Content is stored **verbatim** (text or reply/audio JSON envelopes) with a size cap
      (`MAX_BROADCAST_CONTENT_CHARS`); deduped by transaction id.
-   - **Retention: 3 days.** Unlike KaPosts content (kept forever), broadcasts are pruned by a
-     background task in the processor (`--broadcast-retention-days`, default 3); it deletes
-     rows older than the window every hour.
+   - **Retention: 30 days** (matches the app's "All messages persist for 30 days" UI). Unlike
+     KaPosts content (kept forever), broadcasts are pruned by a background task in the processor
+     (`--broadcast-retention-days`, default 30); it deletes rows older than the window every hour.
    - Endpoint: `GET /get-broadcasts?channel=<name>&limit=<n>[&before=<blockTimeMs>]` →
      `{ messages: [{ txId, channel, senderAddress, content, blockTime }], hasMore }`,
      newest-first (matches the app's `BroadcastIndexerClient`).

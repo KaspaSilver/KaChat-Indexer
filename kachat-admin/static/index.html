@@ -269,10 +269,9 @@
     <div class="card">
       <div class="row" style="margin-bottom:12px">
         <label class="muted" for="bcastChannel">Channel</label>
+        <!-- options populated by populateBroadcastChannelSelects() from TRACKED_BROADCAST_CHANNELS -->
         <select id="bcastChannel">
           <option value="">all tracked</option>
-          <option value="kaspa">#kaspa</option>
-          <option value="kachat-bugs">#kachat-bugs</option>
         </select>
         <button class="btn ghost" id="bcastRefresh">Refresh</button>
       </div>
@@ -283,7 +282,7 @@
         </table>
       </div>
     </div>
-    <div class="note">Only <b>#kaspa</b> and <b>#kachat-bugs</b> are indexed. Content is stored verbatim (text or reply/audio JSON envelopes); the preview shows the first 200 characters. Retention: 3 days.</div>
+    <div class="note">Thirteen curated channels are indexed (<b>#kaspa</b>, <b>#kachat-bugs</b>, and the language rooms). Content is stored verbatim (text or reply/audio JSON envelopes); the preview shows the first 200 characters. Retention: 30 days.</div>
   </section>
 
   <section id="chats" style="display:none">
@@ -364,7 +363,7 @@
         <label class="switch"><input type="checkbox" id="tgKaposts"><span class="slider"></span></label>
       </div>
       <div class="toggle-row">
-        <div class="tinfo"><div class="tname">Broadcasts</div><div class="tdesc">Public channel chatter for <code>#kaspa</code> and <code>#kachat-bugs</code> (<code>bcast</code>).</div></div>
+        <div class="tinfo"><div class="tname">Broadcasts</div><div class="tdesc">Public channel chatter for the 13 curated rooms — <code>#kaspa</code>, <code>#kachat-bugs</code> + language rooms (<code>bcast</code>).</div></div>
         <span class="saved" id="savedBroadcasts">saved ✓</span>
         <label class="switch"><input type="checkbox" id="tgBroadcasts"><span class="slider"></span></label>
       </div>
@@ -416,10 +415,8 @@
       <div class="field">
         <label>Purge broadcasts by channel</label>
         <div class="row">
-          <select id="purgeChannel">
-            <option value="kaspa">#kaspa</option>
-            <option value="kachat-bugs">#kachat-bugs</option>
-          </select>
+          <!-- options populated by populateBroadcastChannelSelects() from TRACKED_BROADCAST_CHANNELS -->
+          <select id="purgeChannel"></select>
           <button class="btn danger" id="purgeChannelBtn">Purge channel</button>
           <button class="btn danger" id="purgeAllBcastBtn">Purge ALL broadcasts</button>
         </div>
@@ -518,7 +515,7 @@ async function loadStats() {
       ["Indexed (last 5m)", fmtInt(s.ingest_last_5m)],
       ["Indexed (last 60m)", fmtInt(s.ingest_last_60m)],
       ["Newest content", fmtTime(s.newest_content_time)],
-      ["Broadcasts (3d)", fmtInt(s.bcast_total)],
+      ["Broadcasts (30d)", fmtInt(s.bcast_total)],
     ];
     $("#activityGrid").innerHTML = act.map(([l,v]) =>
       `<div class="card stat"><div class="label">${l}</div><div class="value small">${v}</div></div>`).join("");
@@ -543,12 +540,24 @@ async function loadRecent() {
   }
 }
 
+// The curated broadcast rooms the indexer tracks — mirror of BROADCAST_CHANNELS in
+// kachat-transaction-processor/src/k_protocol.rs. Single source for the dashboard's channel
+// dropdowns and per-channel stat cards, so adding a room is a one-line change here.
+const TRACKED_BROADCAST_CHANNELS = ["kaspa","kachat-bugs","kaspa-indonesia","kaspa-czech","kaspa-german","kaspa-espanol","kaspa-francais","kaspa-portugues","kaspa-slovak","kaspa-chinese","kaspa-japanese","kaspa-korean","kaspa-hebrew"];
+
+function populateBroadcastChannelSelects() {
+  const opts = TRACKED_BROADCAST_CHANNELS.map(c => `<option value="${c}">#${c}</option>`).join("");
+  const bc = $("#bcastChannel"); if (bc) bc.innerHTML = '<option value="">all tracked</option>' + opts;
+  const pc = $("#purgeChannel"); if (pc) pc.innerHTML = opts;
+}
+
 async function loadBroadcasts() {
   try {
     const s = await (await fetch("/api/stats")).json();
-    const cards = [
-      ["#kaspa", s.bcast_kaspa], ["#kachat-bugs", s.bcast_kachat_bugs], ["Total broadcasts", s.bcast_total],
-    ];
+    // Merge the GROUP BY counts against the full tracked list so empty rooms render as 0.
+    const counts = Object.fromEntries((s.bcast_by_channel || []).map(c => [c.channel, c.count]));
+    const cards = TRACKED_BROADCAST_CHANNELS.map(c => ["#" + c, counts[c] || 0]);
+    cards.push(["Total broadcasts", s.bcast_total]);
     $("#bcastGrid").innerHTML = cards.map(([l,v]) =>
       `<div class="card stat"><div class="label">${l}</div><div class="value">${fmtInt(v)}</div></div>`).join("");
   } catch (e) {}
@@ -916,6 +925,7 @@ $("#purgeChatBtn").onclick = async () => {
 };
 
 // Poll
+populateBroadcastChannelSelects();
 loadHealth(); loadStats(); loadServices(); loadSettings();
 setInterval(loadHealth, 10000);
 setInterval(loadServices, 10000);
