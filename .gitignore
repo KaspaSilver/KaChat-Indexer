@@ -9,6 +9,10 @@ kachat-webserver/target
 kachat-webserver/Cargo.lock
 kachat-webserver/locust/__pycache__
 Cargo.lock
+# Exception: kasia-indexer ships in the kachat-app container and is built from a fresh clone by
+# the Quick-Start panel. Commit its lockfile so builds are reproducible and a future crates.io
+# yank of a transitive dep can't break a fresh resolve (a locked version is always allowed).
+!kasia-indexer/Cargo.lock
 /target
 SKI_2.2.0_MIGRATION_ISSUES.md
 

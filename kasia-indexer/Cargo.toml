@@ -73,5 +73,9 @@ kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.
 kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0-rc.2" }
 kaspa-txscript = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0-rc.2" }
 kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0-rc.2" }
+# Every crates.io release of serde_nested_with is yanked; kaspa-rpc-core v1.1.0-rc.2 needs it
+# transitively (^0.2.5). Cargo won't SELECT a yanked version on a fresh resolve, so a clean clone
+# fails to build. Patching to the crate's own git source bypasses crates.io yanking entirely.
+serde_nested_with = { git = "https://github.com/murar8/serde_nested_with", tag = "0.2.6" }
 
 fjall = { git = "https://github.com/fjall-rs/fjall.git", branch = "improve-write-stalling" }
