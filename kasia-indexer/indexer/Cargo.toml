@@ -29,7 +29,7 @@ tracing-subscriber = { workspace = true, features = [
     "local-time",
 ] }
 utoipa = { workspace = true, features = ["axum_extras"] }
-utoipa-swagger-ui = { workspace = true, features = ["axum"] }
+utoipa-swagger-ui = { workspace = true, features = ["axum", "vendored"] }
 workflow-core = { workspace = true }
 itertools = { workspace = true }
 jsonwebtoken.workspace = true
