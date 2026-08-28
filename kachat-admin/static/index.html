@@ -263,13 +263,26 @@
 
   <section id="broadcasts" style="display:none">
     <h2>Broadcast channels</h2>
-    <div class="grid" id="bcastGrid"></div>
+    <div class="card settings-card">
+      <div class="note" style="margin-top:0">Turn channels on/off and add new ones. Changes apply within <b>~15s</b> (no restart). <b>Empty = nothing indexed.</b> Turning a channel off does <b>not</b> delete its stored messages (use the per-channel purge under Data management); adding one does <b>not</b> backfill older broadcasts.</div>
+      <div class="row" style="margin:4px 0 8px">
+        <span class="chip"><span id="bcastChanDot" class="dot"></span> <span id="bcastChanStatus">—</span></span>
+      </div>
+      <div class="grid" id="bcastChannelList"></div>
+      <div class="row" style="margin-top:12px">
+        <input id="bcastAddInput" type="text" placeholder="add a channel (e.g. kaspa-italiano)"
+          style="background:var(--surface-1);border:1px solid var(--card-border);color:var(--text);padding:8px 12px;border-radius:10px;font-family:ui-monospace,monospace;font-size:12.5px;flex:1;min-width:180px">
+        <button class="btn ghost" id="bcastAddBtn">Add</button>
+        <button class="btn" id="bcastSaveBtn">Save &amp; apply</button>
+        <span class="saved" id="savedBcast">saved ✓ · applies within ~15s</span>
+      </div>
+    </div>
 
     <h2>Recent broadcasts</h2>
     <div class="card">
       <div class="row" style="margin-bottom:12px">
         <label class="muted" for="bcastChannel">Channel</label>
-        <!-- options populated by populateBroadcastChannelSelects() from TRACKED_BROADCAST_CHANNELS -->
+        <!-- options populated by populateBroadcastChannelSelects() from the live tracked set -->
         <select id="bcastChannel">
           <option value="">all tracked</option>
         </select>
@@ -282,7 +295,7 @@
         </table>
       </div>
     </div>
-    <div class="note">Thirteen curated channels are indexed (<b>#kaspa</b>, <b>#kachat-bugs</b>, and the language rooms). Content is stored verbatim (text or reply/audio JSON envelopes); the preview shows the first 200 characters. Retention: 30 days.</div>
+    <div class="note">Tracked channels are managed above (defaults: <b>#kaspa</b>, <b>#kachat-bugs</b>, and the language rooms). Content is stored verbatim (text or reply/audio JSON envelopes); the preview shows the first 200 characters. Retention: 30 days.</div>
   </section>
 
   <section id="chats" style="display:none">
@@ -421,7 +434,7 @@
       <div class="field">
         <label>Purge broadcasts by channel</label>
         <div class="row">
-          <!-- options populated by populateBroadcastChannelSelects() from TRACKED_BROADCAST_CHANNELS -->
+          <!-- options populated by populateBroadcastChannelSelects() from the live tracked set -->
           <select id="purgeChannel"></select>
           <button class="btn danger" id="purgeChannelBtn">Purge channel</button>
           <button class="btn danger" id="purgeAllBcastBtn">Purge ALL broadcasts</button>
@@ -549,23 +562,48 @@ async function loadRecent() {
 // The curated broadcast rooms the indexer tracks — mirror of BROADCAST_CHANNELS in
 // kachat-transaction-processor/src/k_protocol.rs. Single source for the dashboard's channel
 // dropdowns and per-channel stat cards, so adding a room is a one-line change here.
-const TRACKED_BROADCAST_CHANNELS = ["kaspa","kachat-bugs","kaspa-indonesia","kaspa-czech","kaspa-german","kaspa-espanol","kaspa-francais","kaspa-portugues","kaspa-slovak","kaspa-chinese","kaspa-japanese","kaspa-korean","kaspa-hebrew"];
+// Bootstrap fallback for the channel dropdowns before the Broadcasts tab is first loaded; the
+// EFFECTIVE tracked set comes from /api/settings (available + configured) once loadBroadcasts runs.
+const DEFAULT_BCAST_CHANNELS = ["kaspa","kachat-bugs","kaspa-indonesia","kaspa-czech","kaspa-german","kaspa-espanol","kaspa-francais","kaspa-portugues","kaspa-slovak","kaspa-chinese","kaspa-japanese","kaspa-korean","kaspa-hebrew"];
+let bcastKnownChannels = DEFAULT_BCAST_CHANNELS.slice();
 
 function populateBroadcastChannelSelects() {
-  const opts = TRACKED_BROADCAST_CHANNELS.map(c => `<option value="${c}">#${c}</option>`).join("");
+  const opts = bcastKnownChannels.map(c => `<option value="${escapeHtml(c)}">#${escapeHtml(c)}</option>`).join("");
   const bc = $("#bcastChannel"); if (bc) bc.innerHTML = '<option value="">all tracked</option>' + opts;
   const pc = $("#purgeChannel"); if (pc) pc.innerHTML = opts;
 }
 
+function bcastChannelRow(c, on, count) {
+  return `<div class="card stat" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+    <div><div class="label">#${escapeHtml(c)}</div><div class="value">${fmtInt(count||0)}</div></div>
+    <label class="switch"><input type="checkbox" ${on?"checked":""} data-bcast-ch="${escapeHtml(c)}" onchange="updateBcastChanStatus()"><span class="slider"></span></label>
+  </div>`;
+}
+function updateBcastChanStatus() {
+  const on = [...document.querySelectorAll('[data-bcast-ch]')].filter(b => b.checked).length;
+  const dot = $("#bcastChanDot"), st = $("#bcastChanStatus");
+  if (!dot) return;
+  if (on === 0) { dot.className = "dot"; st.textContent = "no channels selected · nothing indexed"; }
+  else { dot.className = "dot good"; st.textContent = `${on} channel${on===1?"":"s"} indexed · applies within ~15s`; }
+}
+
 async function loadBroadcasts() {
   try {
-    const s = await (await fetch("/api/stats")).json();
-    // Merge the GROUP BY counts against the full tracked list so empty rooms render as 0.
+    const [s, cfg] = await Promise.all([
+      fetch("/api/stats").then(r => r.json()),
+      fetch("/api/settings").then(r => r.json()),
+    ]);
     const counts = Object.fromEntries((s.bcast_by_channel || []).map(c => [c.channel, c.count]));
-    const cards = TRACKED_BROADCAST_CHANNELS.map(c => ["#" + c, counts[c] || 0]);
-    cards.push(["Total broadcasts", s.bcast_total]);
-    $("#bcastGrid").innerHTML = cards.map(([l,v]) =>
-      `<div class="card stat"><div class="label">${l}</div><div class="value">${fmtInt(v)}</div></div>`).join("");
+    const configured = (cfg.broadcast_channels || "").split("\n").map(x => x.trim()).filter(Boolean);
+    const onSet = new Set(configured);
+    // Universe = configured ON channels ∪ the defaults (suggestions) ∪ channels that already have data.
+    const universe = [...new Set([...configured, ...(cfg.available_broadcast_channels || []), ...Object.keys(counts)])].sort();
+    bcastKnownChannels = universe;
+    $("#bcastChannelList").innerHTML =
+      universe.map(c => bcastChannelRow(c, onSet.has(c), counts[c])).join("") +
+      `<div class="card stat"><div class="label">Total broadcasts</div><div class="value">${fmtInt(s.bcast_total || 0)}</div></div>`;
+    updateBcastChanStatus();
+    populateBroadcastChannelSelects();
   } catch (e) {}
   const ch = $("#bcastChannel").value;
   const q = ch ? `?channel=${encodeURIComponent(ch)}&limit=50` : "?limit=50";
@@ -586,6 +624,29 @@ async function loadBroadcasts() {
 }
 $("#bcastChannel").onchange = loadBroadcasts;
 $("#bcastRefresh").onclick = loadBroadcasts;
+$("#bcastAddBtn").onclick = () => {
+  const raw = ($("#bcastAddInput").value || "").trim().toLowerCase();
+  if (!raw) return;
+  raw.split(/[\s,]+/).filter(Boolean).forEach(c => {
+    if (c.length > 36) return;
+    const existing = document.querySelector(`[data-bcast-ch="${CSS.escape(c)}"]`);
+    if (existing) { existing.checked = true; }
+    else { $("#bcastChannelList").insertAdjacentHTML("afterbegin", bcastChannelRow(c, true, 0)); }
+  });
+  $("#bcastAddInput").value = "";
+  updateBcastChanStatus();
+};
+$("#bcastAddInput").onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); $("#bcastAddBtn").click(); } };
+$("#bcastSaveBtn").onclick = async () => {
+  const btn = $("#bcastSaveBtn"); btn.disabled = true;
+  try {
+    const on = [...document.querySelectorAll('[data-bcast-ch]')].filter(b => b.checked)
+      .map(b => b.getAttribute("data-bcast-ch"));
+    await saveSetting({ broadcast_channels: on.join("\n") }, "#savedBcast");
+    await loadBroadcasts(); // re-render from persisted state + fresh counts
+  } catch (e) { alert("Failed: " + e); }
+  btn.disabled = false;
+};
 window.pickPubkey = pk => { $("#pk").value = pk; $("#btnRemove").disabled = true; document.querySelector('nav button[data-tab=kaposts]').click(); $("#pk").focus(); };
 
 // Per-item deletes

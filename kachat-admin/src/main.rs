@@ -1125,6 +1125,27 @@ fn chat_indexer_running() -> bool {
         .unwrap_or(false)
 }
 
+/// Default broadcast channels — the fallback the processor uses when `k_vars['broadcast_channels']`
+/// is unset. Kept in sync with `DEFAULT_BROADCAST_CHANNELS` in
+/// `kachat-transaction-processor/src/k_protocol.rs` (separate crate, so duplicated here). Exposed to
+/// the dashboard/panel as `available_broadcast_channels` so the UI shows suggestions without
+/// hardcoding them.
+const DEFAULT_BROADCAST_CHANNELS: [&str; 13] = [
+    "kaspa",
+    "kachat-bugs",
+    "kaspa-indonesia",
+    "kaspa-czech",
+    "kaspa-german",
+    "kaspa-espanol",
+    "kaspa-francais",
+    "kaspa-portugues",
+    "kaspa-slovak",
+    "kaspa-chinese",
+    "kaspa-japanese",
+    "kaspa-korean",
+    "kaspa-hebrew",
+];
+
 #[derive(Serialize)]
 struct SettingsResponse {
     instance_name: String,
@@ -1140,6 +1161,11 @@ struct SettingsResponse {
     group_personal_mode: bool,
     kaposts_operator_address: String,
     kaposts_personal_mode: bool,
+    // Effective tracked broadcast channels (newline-joined). Absent key => the defaults are active,
+    // so this returns the defaults; a present-but-empty value means "index nothing".
+    broadcast_channels: String,
+    // The defaults, offered as suggestions in the UI.
+    available_broadcast_channels: Vec<String>,
 }
 
 /// Read the personal-mode allowlist file (one address per line) into a newline-joined string.
@@ -1158,6 +1184,10 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
     let personal = read_personal_file(&state.personal_file);
     let personal_groups = read_personal_file(&state.personal_groups_file);
     let kaposts_op = kv_get(&state.pool, "kaposts_operator_addresses").await.unwrap_or_default();
+    // Absent key => defaults are active (show them). Present (even empty "") => return verbatim.
+    let broadcast_channels = kv_get(&state.pool, "broadcast_channels")
+        .await
+        .unwrap_or_else(|| DEFAULT_BROADCAST_CHANNELS.join("\n"));
     Json(SettingsResponse {
         instance_name: kv_get(&state.pool, "instance_name")
             .await
@@ -1174,6 +1204,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         personal_group_ids: personal_groups,
         kaposts_personal_mode: !kaposts_op.is_empty(),
         kaposts_operator_address: kaposts_op,
+        broadcast_channels,
+        available_broadcast_channels: DEFAULT_BROADCAST_CHANNELS.iter().map(|s| s.to_string()).collect(),
     })
 }
 
@@ -1193,6 +1225,10 @@ struct SettingsUpdate {
     /// Your kaspa address(es), newline/comma separated. Their on-chain blocks auto-drive the
     /// KaPosts denylist. Empty string turns KaPosts personal mode off.
     kaposts_operator_address: Option<String>,
+    /// Newline/comma/space separated broadcast channel names to index. Present-but-empty = index
+    /// nothing; omit the field entirely to leave the setting unchanged (absent => defaults active).
+    /// Applied by the processor within ~15s — no restart.
+    broadcast_channels: Option<String>,
 }
 
 async fn post_settings(
@@ -1258,6 +1294,22 @@ async fn post_settings(
             .await
             .map_err(ApiError::db)?;
         info!("kachat-admin set {} KaPosts operator address(es)", addrs.len());
+    }
+    if let Some(raw) = &req.broadcast_channels {
+        // Runtime tracked-channel set. Normalize (trim/lowercase, non-empty, <=36 to fit the
+        // kachat_broadcasts.channel VARCHAR(36) column), dedupe. No restart — the processor's k_vars
+        // refresher applies it within ~15s. Present-but-empty writes "" = index nothing.
+        let mut channels: Vec<String> = Vec::new();
+        for tok in raw.split(['\n', '\r', ',', ' ', '\t']) {
+            let c = tok.trim().to_lowercase();
+            if !c.is_empty() && c.len() <= 36 && !channels.contains(&c) {
+                channels.push(c);
+            }
+        }
+        kv_set(&state.pool, "broadcast_channels", &channels.join("\n"))
+            .await
+            .map_err(ApiError::db)?;
+        info!("kachat-admin set {} tracked broadcast channel(s)", channels.len());
     }
     if let Some(b) = req.chat_indexer {
         // Start/stop the whole vendored chat indexer (1:1 + group + payments + handshakes).

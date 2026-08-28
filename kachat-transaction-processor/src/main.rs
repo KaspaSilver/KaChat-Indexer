@@ -210,7 +210,7 @@ async fn main() -> Result<()> {
         use sqlx::Row;
         loop {
             if let Ok(rows) = sqlx::query(
-                "SELECT key, value FROM k_vars WHERE key IN ('feature_kaposts', 'feature_broadcasts', 'kaposts_operator_addresses')",
+                "SELECT key, value FROM k_vars WHERE key IN ('feature_kaposts', 'feature_broadcasts', 'kaposts_operator_addresses', 'broadcast_channels')",
             )
             .fetch_all(&flags_pool)
             .await
@@ -234,6 +234,16 @@ async fn main() -> Result<()> {
                                 .filter_map(operator_address_to_xonly)
                                 .collect();
                             k_protocol::set_kaposts_operators(ops);
+                        }
+                        "broadcast_channels" => {
+                            // Runtime-configurable tracked-channel set (present, even empty). Absent
+                            // key never reaches here → the processor keeps the compile-time defaults.
+                            let channels: Vec<String> = value
+                                .split(['\n', '\r', ',', ' ', '\t'])
+                                .map(|s| s.trim().to_lowercase())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            k_protocol::set_broadcast_channels(channels);
                         }
                         _ => {}
                     }
