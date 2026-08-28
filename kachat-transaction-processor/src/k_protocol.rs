@@ -24,12 +24,12 @@ use serde::{Deserialize, Serialize};
 /// "4oGg" (E2 81 A0 -> 4oGg), which the client relies on as well.
 pub const KACHAT_MARKER: &str = "\u{2060}";
 
-/// Channels the broadcast indexer tracks. Only these normalized names are stored; everything else
-/// on the canonical `kchat:1:bcast:` / legacy `ciph_msg:1:bcast:` protocol is dropped. Names must
-/// already be in normalized form (trimmed, lowercase) to match `process_broadcast`. The 11 language
-/// rooms below ship with KaChat iOS/Android 4.0; the accent-free spellings (espanol/francais/
-/// portugues) are deliberate so the names survive normalization.
-pub const BROADCAST_CHANNELS: [&str; 13] = [
+/// Default broadcast channels — the fallback used when no `broadcast_channels` key is configured in
+/// `k_vars` (fresh/upgraded installs). Only normalized names (trimmed, lowercase) so they match
+/// `process_broadcast`. The 11 language rooms ship with KaChat iOS/Android 4.0; the accent-free
+/// spellings (espanol/francais/portugues) are deliberate so the names survive normalization.
+/// The *effective* tracked set is `channel_is_tracked` (runtime-configurable — see below).
+pub const DEFAULT_BROADCAST_CHANNELS: [&str; 13] = [
     "kaspa",
     "kachat-bugs",
     "kaspa-indonesia",
@@ -44,6 +44,34 @@ pub const BROADCAST_CHANNELS: [&str; 13] = [
     "kaspa-korean",
     "kaspa-hebrew",
 ];
+
+/// The channels the indexer currently tracks, refreshed from `k_vars['broadcast_channels']` by the
+/// background task in `main.rs` (every 15s, no restart). `None` = key not configured → fall back to
+/// `DEFAULT_BROADCAST_CHANNELS` (upgrade-safe). `Some(list)` = exactly that list, where an EMPTY list
+/// means "index nothing" (the list controls WHICH channels; the global `FEATURE_BROADCASTS` switch
+/// controls WHETHER broadcasts index at all). Names are stored normalized (trimmed, lowercase).
+static BROADCAST_CHANNELS_RUNTIME: std::sync::RwLock<Option<Vec<String>>> =
+    std::sync::RwLock::new(None);
+
+/// Replace the tracked-channel set from the admin dashboard. An empty vec = index nothing; to fall
+/// back to the defaults, the `broadcast_channels` key must be absent (which never calls this).
+pub fn set_broadcast_channels(list: Vec<String>) {
+    if let Ok(mut guard) = BROADCAST_CHANNELS_RUNTIME.write() {
+        *guard = Some(list);
+    }
+}
+
+/// Whether `channel` (already trimmed + lowercased by the caller) is in the effective tracked set.
+/// Not configured → the compile-time defaults; configured → exact membership (empty → nothing).
+pub fn channel_is_tracked(channel: &str) -> bool {
+    match BROADCAST_CHANNELS_RUNTIME.read() {
+        Ok(guard) => match &*guard {
+            Some(list) => list.iter().any(|c| c == channel),
+            None => DEFAULT_BROADCAST_CHANNELS.contains(&channel),
+        },
+        Err(_) => DEFAULT_BROADCAST_CHANNELS.contains(&channel),
+    }
+}
 
 /// Runtime feature switches, refreshed from the `k_vars` table by a background task in
 /// `main.rs` (keys `feature_kaposts` / `feature_broadcasts`, value `off` to disable). Default
@@ -846,9 +874,10 @@ impl KProtocolProcessor {
             }
         };
 
-        // Normalize + allowlist: only the tracked channels are indexed.
+        // Normalize + allowlist: only the tracked channels are indexed (runtime-configurable via
+        // the admin dashboard; falls back to DEFAULT_BROADCAST_CHANNELS when not configured).
         let channel = channel_raw.trim().to_lowercase();
-        if !BROADCAST_CHANNELS.contains(&channel.as_str()) {
+        if !channel_is_tracked(&channel) {
             info!(
                 "Broadcast {} on non-tracked channel '{}', skipping",
                 transaction_id, channel
@@ -2156,5 +2185,43 @@ impl KProtocolProcessor {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod broadcast_channel_tests {
+    use super::*;
+
+    // One test mutates the process-global runtime set in sequence (reset at the end) so it's correct
+    // regardless of test parallelism.
+    #[test]
+    fn channel_is_tracked_rules() {
+        // Not configured (None) -> the compile-time defaults.
+        set_broadcast_channels_reset_to_default_for_test();
+        assert!(channel_is_tracked("kaspa"));
+        assert!(channel_is_tracked("kaspa-hebrew"));
+        assert!(!channel_is_tracked("not-a-default-room"));
+
+        // Configured with an explicit list -> exact membership (defaults NOT implied).
+        set_broadcast_channels(vec!["kaspa".to_string(), "my-new-room".to_string()]);
+        assert!(channel_is_tracked("kaspa"));
+        assert!(channel_is_tracked("my-new-room"));
+        assert!(!channel_is_tracked("kaspa-hebrew")); // a default, but not in the configured list
+
+        // Configured empty -> index nothing (not the defaults).
+        set_broadcast_channels(Vec::new());
+        assert!(!channel_is_tracked("kaspa"));
+        assert!(!channel_is_tracked("my-new-room"));
+
+        // Reset to not-configured so other tests / real runs are unaffected.
+        set_broadcast_channels_reset_to_default_for_test();
+    }
+
+    // Helper: put the runtime set back to None (not configured). Only the test needs this — the
+    // real refresher only ever moves it to Some(...).
+    fn set_broadcast_channels_reset_to_default_for_test() {
+        if let Ok(mut guard) = BROADCAST_CHANNELS_RUNTIME.write() {
+            *guard = None;
+        }
     }
 }
