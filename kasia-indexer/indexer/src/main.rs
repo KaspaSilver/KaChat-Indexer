@@ -99,6 +99,45 @@ fn load_personal_addresses() {
     indexer_actors::set_personal_addresses(addrs);
 }
 
+/// Load the personal-mode GROUP allowlist (KaChat fork). The admin dashboard writes one 64-char
+/// hex blinded group id per line to `KASIA_PERSONAL_GROUPS_FILE` (default
+/// `/app/data/personal_group_ids.txt`) and restarts this process; an absent/empty file means no
+/// group filtering. Parallel to `load_personal_addresses`.
+fn load_personal_group_ids() {
+    const GID_LEN: usize = indexer_db::messages::group_message::BLINDED_GROUP_ID_LEN;
+    let path = std::env::var("KASIA_PERSONAL_GROUPS_FILE")
+        .unwrap_or_else(|_| "/app/data/personal_group_ids.txt".to_string());
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => {
+            indexer_actors::set_personal_group_ids(std::collections::HashSet::new());
+            return;
+        }
+    };
+    let mut ids = std::collections::HashSet::new();
+    for token in content.split(['\n', '\r', ',', ' ', '\t']) {
+        let t = token.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let mut id = [0u8; GID_LEN];
+        if t.len() == GID_LEN * 2 && faster_hex::hex_decode(t.as_bytes(), &mut id).is_ok() {
+            ids.insert(id);
+        } else {
+            tracing::warn!("Group personal mode: skipping unparseable group id '{t}'");
+        }
+    }
+    if ids.is_empty() {
+        info!("Group personal mode OFF (no group ids configured) — indexing all group messages");
+    } else {
+        info!(
+            "Group personal mode ON — restricting group-message storage to {} group id(s)",
+            ids.len()
+        );
+    }
+    indexer_actors::set_personal_group_ids(ids);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ignore faillures as .env might not be present at runtime, and this use-case is tolerated
@@ -114,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Using DB Path: {}", context.db_path.to_string_lossy());
 
     load_personal_addresses();
+    load_personal_group_ids();
 
     let config = Config::new(context.clone().db_path).max_write_buffer_size(512 * 1024 * 1024);
     let tx_keyspace = config.open_transactional()?;

@@ -67,6 +67,9 @@ struct Args {
     /// File the chat indexer reads its personal-mode address allowlist from (shared volume).
     #[arg(long, default_value = "/app/data/personal_addresses.txt")]
     personal_file: String,
+    /// File the chat indexer reads its personal-mode GROUP-id allowlist from (shared volume).
+    #[arg(long, default_value = "/app/data/personal_group_ids.txt")]
+    personal_groups_file: String,
     /// The chat indexer's fjall store directory; its on-disk size is shown on the dashboard
     /// overview (the chat messages live here, separate from the KaPosts Postgres DB).
     #[arg(long, default_value = "/app/data/mainnet")]
@@ -87,6 +90,7 @@ struct AppState {
     chat_import_file_url: String,
     chat_purge_url: String,
     personal_file: String,
+    personal_groups_file: String,
     chat_data_dir: String,
 }
 
@@ -139,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         chat_import_file_url: args.chat_import_file_url.clone(),
         chat_purge_url: args.chat_purge_url.clone(),
         personal_file: args.personal_file.clone(),
+        personal_groups_file: args.personal_groups_file.clone(),
         chat_data_dir: args.chat_data_dir.clone(),
     };
 
@@ -1131,6 +1136,8 @@ struct SettingsResponse {
     chat_indexer: bool,
     personal_addresses: String,
     personal_mode: bool,
+    personal_group_ids: String,
+    group_personal_mode: bool,
     kaposts_operator_address: String,
     kaposts_personal_mode: bool,
 }
@@ -1149,6 +1156,7 @@ fn read_personal_file(path: &str) -> String {
 async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
     let on = |v: Option<String>| v.map(|s| s.trim().to_lowercase() != "off").unwrap_or(true);
     let personal = read_personal_file(&state.personal_file);
+    let personal_groups = read_personal_file(&state.personal_groups_file);
     let kaposts_op = kv_get(&state.pool, "kaposts_operator_addresses").await.unwrap_or_default();
     Json(SettingsResponse {
         instance_name: kv_get(&state.pool, "instance_name")
@@ -1162,6 +1170,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         chat_indexer: chat_indexer_running(),
         personal_mode: !personal.is_empty(),
         personal_addresses: personal,
+        group_personal_mode: !personal_groups.is_empty(),
+        personal_group_ids: personal_groups,
         kaposts_personal_mode: !kaposts_op.is_empty(),
         kaposts_operator_address: kaposts_op,
     })
@@ -1177,6 +1187,9 @@ struct SettingsUpdate {
     chat_indexer: Option<bool>,
     /// Newline/comma/space separated kaspa: addresses. Empty string turns personal mode off.
     personal_addresses: Option<String>,
+    /// Newline/comma/space separated 64-char hex blinded group ids. Empty string turns group
+    /// personal mode off.
+    personal_group_ids: Option<String>,
     /// Your kaspa address(es), newline/comma separated. Their on-chain blocks auto-drive the
     /// KaPosts denylist. Empty string turns KaPosts personal mode off.
     kaposts_operator_address: Option<String>,
@@ -1201,9 +1214,11 @@ async fn post_settings(
     if let Some(b) = req.feature_broadcasts {
         kv_set(&state.pool, "feature_broadcasts", if b { "on" } else { "off" }).await.map_err(ApiError::db)?;
     }
+    // Personal-mode allowlist files the chat indexer reads on startup. Writing either one means we
+    // must restart the chat process so it reloads — but only ONCE, even if both are saved together.
+    let mut restart_chat = false;
     if let Some(raw) = &req.personal_addresses {
-        // Normalize into one kaspa: address per line; write the file the chat indexer reads,
-        // then restart it so the new allowlist takes effect.
+        // Normalize into one kaspa: address per line; write the file the chat indexer reads.
         let normalized: Vec<String> = raw
             .split(['\n', '\r', ',', ' ', '\t'])
             .map(|s| s.trim())
@@ -1212,11 +1227,24 @@ async fn post_settings(
             .collect();
         std::fs::write(&state.personal_file, normalized.join("\n"))
             .map_err(|e| ApiError::server(&format!("write personal file: {e}")))?;
+        restart_chat = true;
+        info!("kachat-admin set {} personal address(es)", normalized.len());
+    }
+    if let Some(raw) = &req.personal_group_ids {
+        // Normalize into one 64-char lowercase hex blinded group id per line (32-byte ids).
+        let normalized: Vec<String> = raw
+            .split(['\n', '\r', ',', ' ', '\t'])
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect();
+        std::fs::write(&state.personal_groups_file, normalized.join("\n"))
+            .map_err(|e| ApiError::server(&format!("write personal groups file: {e}")))?;
+        restart_chat = true;
+        info!("kachat-admin set {} personal group id(s)", normalized.len());
+    }
+    if restart_chat {
         let _ = tokio::task::spawn_blocking(|| supervisorctl("restart", "chat")).await;
-        info!(
-            "kachat-admin set {} personal address(es); restarted chat indexer",
-            normalized.len()
-        );
+        info!("kachat-admin restarted chat indexer to reload personal-mode allowlist(s)");
     }
     if let Some(raw) = &req.kaposts_operator_address {
         // Store your kaspa address(es); the processor decodes each to an x-only pubkey and
