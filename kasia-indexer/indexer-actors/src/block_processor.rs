@@ -453,11 +453,28 @@ impl BlockProcessor {
         let (amount, receiver) = resolve_primary_receiver(&tx.outputs, sender)?;
         debug!(receiver=?receiver, "Handling transaction");
         let mut entries: SmallVec<[_; 1]> = SmallVec::new();
-        // Personal indexing mode: when a personal-address allowlist is configured, only store
-        // chat content for transactions that involve one of those addresses. The acceptance
-        // record below is still written unconditionally so sender resolution for OTHER (personal)
-        // transactions that spend these outputs keeps working.
-        let store_content = crate::personal_allows(sender.as_ref(), &receiver);
+        // Personal indexing mode: when an allowlist is configured, only store chat content that is
+        // mine. Handshakes / 1:1 messages / payments / self-stash / group-control are matched by
+        // address (sender or receiver). Group MESSAGES can't be matched by address — a group tx's
+        // receiver is the sender's own change address — so they are matched by blinded group id OR
+        // sender instead. With nothing configured, everything is stored (public default). The
+        // acceptance record below is still written unconditionally so sender resolution for OTHER
+        // (personal) transactions that spend these outputs keeps working.
+        let store_content = match &op {
+            SealedOperation::GroupMessageV1(gm) => {
+                // Decode the blinded id for the allowlist check; if it's malformed, fall back to
+                // the sender-is-mine half (the handler will reject the malformed id again at :896).
+                let bid = decode_fixed_hex::<BLINDED_GROUP_ID_LEN>(gm.blinded_group_id).ok();
+                match &bid {
+                    Some(bid) => crate::personal_group_message_allows(sender.as_ref(), bid),
+                    None => {
+                        !crate::personal_filtering_active()
+                            || sender.as_ref().is_some_and(|s| crate::is_personal_address(s))
+                    }
+                }
+            }
+            _ => crate::personal_allows(sender.as_ref(), &receiver),
+        };
         if store_content {
         iter::once(op).try_for_each(|op| match op {
             SealedOperation::SealedMessageOrSealedHandshakeVNone(hk) => {

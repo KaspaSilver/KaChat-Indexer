@@ -376,20 +376,26 @@
 
     <h2>Personal indexing</h2>
     <div class="card settings-card">
-      <div class="note" style="margin-top:0">Index <b>only your own chats</b>. Add your KaChat address(es) below and the chat indexer will store only 1:1 and group data involving you — everyone else's traffic is skipped. Leave empty to index everything (public-indexer default). Saving <b>restarts the chat indexer</b> so the change takes effect.</div>
+      <div class="note" style="margin-top:0">Index <b>only your own chats</b>. Add your KaChat address(es) and/or group ids below and the chat indexer stores only data involving you — everyone else's traffic is skipped. Leave <b>both</b> empty to index everything (public-indexer default). Saving <b>restarts the chat indexer</b> so the change takes effect.</div>
       <div class="row" style="margin:4px 0 6px">
         <span class="chip"><span id="personalDot" class="dot"></span> <span id="personalStatus">—</span></span>
+        <span class="chip"><span id="groupPersonalDot" class="dot"></span> <span id="groupPersonalStatus">—</span></span>
       </div>
       <div class="field">
         <label for="personalAddrs">Your addresses (one per line)</label>
         <textarea id="personalAddrs" rows="3" placeholder="kaspa:q..."
           style="background:var(--surface-1);border:1px solid var(--card-border);color:var(--text);padding:10px 14px;border-radius:12px;font-family:ui-monospace,monospace;font-size:12.5px;resize:vertical;width:100%"></textarea>
       </div>
+      <div class="field">
+        <label for="personalGroupIds">Your group ids (one 64-char hex per line)</label>
+        <textarea id="personalGroupIds" rows="3" placeholder="aabbcc…  (get these from KaChat)"
+          style="background:var(--surface-1);border:1px solid var(--card-border);color:var(--text);padding:10px 14px;border-radius:12px;font-family:ui-monospace,monospace;font-size:12.5px;resize:vertical;width:100%"></textarea>
+      </div>
       <div class="row">
         <button class="btn" id="personalSaveBtn">Save &amp; apply</button>
         <span class="saved" id="savedPersonal">saved ✓ · restarting indexer</span>
       </div>
-      <div class="note">Group capture is best-effort: your <i>sent</i> group messages and control messages addressed to you are stored; capturing every message in a group you're in needs membership tracking that's a follow-up. After enabling, use <b>Export / Import → Import chat history</b> to backfill your DM history.</div>
+      <div class="note">Group ids are per-(group, member) blinded ids that KaChat computes — listing yours reliably captures <i>your</i> messages in those groups (plus anything you send). Capturing <i>every</i> member's messages in a group needs roster knowledge the indexer is designed not to have. After enabling, use <b>Export / Import → Import chat history</b> to backfill your DM history.</div>
     </div>
 
     <h2 class="danger-h">Data management</h2>
@@ -829,8 +835,10 @@ async function loadSettings() {
     $("#tgBroadcasts").checked = !!s.feature_broadcasts;
     $("#tgChat").checked = !!s.chat_indexer;
     $("#personalAddrs").value = s.personal_addresses || "";
+    $("#personalGroupIds").value = s.personal_group_ids || "";
     applyKapPersonal(s);
     applyPersonalStatus(s);
+    applyGroupPersonalStatus(s);
   } catch (e) {}
 }
 function applyKapPersonal(s) {
@@ -853,6 +861,16 @@ function applyPersonalStatus(s) {
     $("#personalStatus").textContent = "personal mode OFF · indexing all chats";
   }
 }
+function applyGroupPersonalStatus(s) {
+  const n = (s.personal_group_ids || "").split("\n").filter(x => x.trim()).length;
+  if (s.group_personal_mode) {
+    $("#groupPersonalDot").className = "dot good";
+    $("#groupPersonalStatus").textContent = `group mode ON · ${n} group${n===1?"":"s"}`;
+  } else {
+    $("#groupPersonalDot").className = "dot";
+    $("#groupPersonalStatus").textContent = "group mode OFF · all group messages";
+  }
+}
 async function saveSetting(body, savedId) {
   const r = await fetch("/api/settings", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
   const s = await r.json();
@@ -864,12 +882,17 @@ $("#setSaveBtn").onclick = () => saveSetting({
   instance_name: $("#setName").value, instance_tagline: $("#setTagline").value, instance_url: $("#setUrl").value
 }, "#setSaved");
 $("#personalSaveBtn").onclick = async () => {
-  const val = $("#personalAddrs").value;
   const btn = $("#personalSaveBtn"); btn.disabled = true;
   try {
-    const s = await saveSetting({ personal_addresses: val }, "#savedPersonal");
+    // Save addresses + group ids together so the chat indexer restarts once.
+    const s = await saveSetting({
+      personal_addresses: $("#personalAddrs").value,
+      personal_group_ids: $("#personalGroupIds").value
+    }, "#savedPersonal");
     $("#personalAddrs").value = s.personal_addresses || "";
+    $("#personalGroupIds").value = s.personal_group_ids || "";
     applyPersonalStatus(s);
+    applyGroupPersonalStatus(s);
   } catch (e) { alert("Failed: " + e); }
   btn.disabled = false;
 };
