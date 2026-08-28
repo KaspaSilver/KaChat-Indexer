@@ -1,5 +1,17 @@
 # KaChat Indexer
 
+> ## 🖥️ Looking for the app? → **[Quick-Start-Kaspa](https://github.com/KaspaSilver/Quick-Start-Kaspa)**
+>
+> **[Quick-Start-Kaspa](https://github.com/KaspaSilver/Quick-Start-Kaspa)** is the web control
+> panel — one command brings up a Kaspa node with a friendly GUI where you switch on services
+> like KaChat. It references and manages the backend repos (this one included) for you, so
+> setup and updates happen from the panel.
+>
+> **This repository is the backend — the engine under the hood.** It documents and houses the
+> KaChat *indexer*: the services that read the chain and serve KaChat's APIs. Read on to
+> understand how KaChat works internally or to run the indexer directly. For the actual web app,
+> head to **[Quick-Start-Kaspa](https://github.com/KaspaSilver/Quick-Start-Kaspa)**.
+
 **KaChat Indexer** is the engine behind **KaChat** — the cross-platform Kaspa messenger and
 social network (iPhone, Android, and the [KaChat Desktop web app](https://github.com/KaspaSilver/KaChat-Desktop)).
 It reads the Kaspa chain and turns KaChat's on-chain `kchat:` traffic into fast REST APIs
@@ -21,6 +33,10 @@ reading legacy history so nothing from before the rebrand is lost.
 ---
 
 ## 🚀 Run your own KaChat Indexer — one command
+
+> Most people should use **[Quick-Start-Kaspa](https://github.com/KaspaSilver/Quick-Start-Kaspa)**
+> instead — it wraps this in a GUI. The command below runs the indexer backend **directly**, no
+> panel, for operators who want just the engine.
 
 This downloads Docker (if needed), a full Kaspa node, Postgres, the KaChat app, plus
 **Portainer** (monitoring) and **nginx-proxy-manager** (HTTPS) — and starts all of it in Docker.
