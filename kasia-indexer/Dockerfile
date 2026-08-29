@@ -2,7 +2,7 @@ FROM rust:1.89.0-alpine3.20 AS builder
 
 WORKDIR /usr/src
 
-RUN apk add --no-cache pcc-libs-dev musl-dev pkgconfig openssl-dev openssl-libs-static curl
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static curl
 
 COPY . .
 
