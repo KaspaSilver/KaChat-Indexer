@@ -9,6 +9,8 @@ kachat-webserver/target
 kachat-webserver/Cargo.lock
 kachat-webserver/locust/__pycache__
 Cargo.lock
+# Local one-off recovery tool (wipes a pruned chat-indexer resume cursor); kept out of git.
+/scratch-cursor-reset/
 # Exception: kasia-indexer ships in the kachat-app container and is built from a fresh clone by
 # the Quick-Start panel. Commit its lockfile so builds are reproducible and a future crates.io
 # yank of a transitive dep can't break a fresh resolve (a locked version is always allowed).
