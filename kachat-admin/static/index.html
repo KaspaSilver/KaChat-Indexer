@@ -197,6 +197,16 @@
       <div class="note">Freshness is derived from the <code>transactions</code> table (node → block ingest). Per-service status is shown above. KaChat content lags legitimately when nobody has posted recently.</div>
     </div>
 
+    <h2>Translation</h2>
+    <div class="card">
+      <div class="row" style="gap:16px;align-items:center;flex-wrap:wrap">
+        <span class="chip"><span id="translateDot" class="dot"></span> <span id="translateStatus">—</span></span>
+        <div><span class="label muted">Cached translations</span> <span id="translateCached" class="mono">—</span></div>
+      </div>
+      <div style="margin-top:8px"><span class="label muted">Languages loaded</span> <span id="translateLangs" class="mono">—</span></div>
+      <div class="note">Server-side KaPost translation (LibreTranslate behind <code>/translate</code>), reachable by the apps at the KaPost Indexer URL. Translations are cached permanently per (post, language). Status from <code>/api/translate-status</code>.</div>
+    </div>
+
     <h2>Content indexed</h2>
     <div class="grid" id="statGrid"></div>
 
@@ -508,6 +518,21 @@ async function loadHealth() {
   } catch (e) {
     $("#statusDot").className = "dot bad";
     $("#statusLine").textContent = "API unreachable";
+  }
+}
+
+async function loadTranslateStatus() {
+  try {
+    const s = await (await fetch("/api/translate-status")).json();
+    const ok = !!s.libretranslate_ok;
+    $("#translateDot").className = ok ? "dot good" : "dot bad";
+    $("#translateStatus").textContent = ok ? "online" : "offline";
+    $("#translateCached").textContent = fmtInt(s.cached_translations || 0);
+    const langs = s.languages || [];
+    $("#translateLangs").textContent = langs.length ? langs.join(", ") : "—";
+  } catch (e) {
+    $("#translateDot").className = "dot bad";
+    $("#translateStatus").textContent = "unavailable";
   }
 }
 
@@ -1010,8 +1035,8 @@ $("#purgeChatBtn").onclick = async () => {
 
 // Poll
 populateBroadcastChannelSelects();
-loadHealth(); loadStats(); loadServices(); loadSettings();
-setInterval(loadHealth, 10000);
+loadHealth(); loadStats(); loadServices(); loadSettings(); loadTranslateStatus();
+setInterval(() => { loadHealth(); loadTranslateStatus(); }, 10000);
 setInterval(loadServices, 10000);
 setInterval(loadStats, 30000);
 </script>
