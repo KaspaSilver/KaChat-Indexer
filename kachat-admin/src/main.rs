@@ -74,6 +74,9 @@ struct Args {
     /// overview (the chat messages live here, separate from the KaPosts Postgres DB).
     #[arg(long, default_value = "/app/data/mainnet")]
     chat_data_dir: String,
+
+    #[arg(long, default_value = "http://127.0.0.1:5000")]
+    libretranslate_url: String,
 }
 
 #[derive(Clone)]
@@ -92,6 +95,7 @@ struct AppState {
     personal_file: String,
     personal_groups_file: String,
     chat_data_dir: String,
+    libretranslate_url: String,
 }
 
 fn now_ms() -> i64 {
@@ -145,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         personal_file: args.personal_file.clone(),
         personal_groups_file: args.personal_groups_file.clone(),
         chat_data_dir: args.chat_data_dir.clone(),
+        libretranslate_url: args.libretranslate_url.clone(),
     };
 
     let app = Router::new()
@@ -166,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/kaposts/denylist/add", post(post_denylist_add))
         .route("/api/kaposts/denylist/remove", post(post_denylist_remove))
         .route("/api/chat/purge", post(post_chat_purge))
+        .route("/api/translate-status", get(get_translate_status))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -1354,6 +1360,62 @@ struct BroadcastDelete {
 #[derive(Serialize)]
 struct DeleteResult {
     deleted: u64,
+}
+
+#[derive(Serialize)]
+struct TranslateStatus {
+    /// LibreTranslate reachable + serving its language list.
+    libretranslate_ok: bool,
+    /// Languages currently loaded (bare BCP-47 subtags).
+    languages: Vec<String>,
+    /// Number of post translations cached in `post_translations`.
+    cached_translations: i64,
+}
+
+/// GET /api/translate-status — ops view for the control panel (Quick-Start): is the /translate
+/// backend up, which languages are loaded, and how many translations are cached. Degrades to
+/// `libretranslate_ok=false` (never errors) when LibreTranslate is unreachable.
+async fn get_translate_status(
+    State(state): State<AppState>,
+) -> Result<Json<TranslateStatus>, ApiError> {
+    // Cached-translation count (fork table; tolerate its absence on older DBs → 0).
+    let cached_translations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM post_translations")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+
+    let mut libretranslate_ok = false;
+    let mut languages: Vec<String> = Vec::new();
+    let url = format!("{}/languages", state.libretranslate_url);
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                if let Ok(arr) = resp.json::<serde_json::Value>().await {
+                    if let Some(list) = arr.as_array() {
+                        let mut set = std::collections::BTreeSet::new();
+                        for item in list {
+                            if let Some(code) = item.get("code").and_then(|c| c.as_str()) {
+                                set.insert(
+                                    code.split(['-', '_']).next().unwrap_or(code).to_lowercase(),
+                                );
+                            }
+                        }
+                        languages = set.into_iter().collect();
+                        libretranslate_ok = true;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(TranslateStatus {
+        libretranslate_ok,
+        languages,
+        cached_translations,
+    }))
 }
 
 async fn post_broadcast_delete(
