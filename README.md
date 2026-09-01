@@ -181,6 +181,7 @@ sequenceDiagram
 - **API reference:** [`API_TECHNICAL_SPECIFICATIONS.md`](API_TECHNICAL_SPECIFICATIONS.md)
 - **KaPosts:** [`KAPOSTS.md`](KAPOSTS.md) · **@mentions client contract:** [`KACHAT_KAPOST_MENTIONS_CLIENT_SPEC.md`](KACHAT_KAPOST_MENTIONS_CLIENT_SPEC.md)
 - **`kchat:` client migration:** [`KCHAT_CLIENT_MIGRATION.md`](KCHAT_CLIENT_MIGRATION.md)
+- **Post translation API:** [`POST_TRANSLATION_API.md`](POST_TRANSLATION_API.md)
 - **Notifications:** [`INDEXER_NOTIFICATIONS_REFERENCE.md`](INDEXER_NOTIFICATIONS_REFERENCE.md)
 - **Operator deploy notes:** [`docker/kachat/DEPLOY.md`](docker/kachat/DEPLOY.md) · **manual install:** [`INSTALL.md`](INSTALL.md)
 
