@@ -3,6 +3,7 @@ mod config;
 mod database_postgres_impl;
 mod database_trait;
 mod models;
+mod translate;
 mod web_server;
 
 use clap::Parser;
@@ -64,6 +65,13 @@ struct Args {
         help = "Server bind address"
     )]
     bind_address: String,
+
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:5000",
+        help = "LibreTranslate base URL for the /translate endpoint"
+    )]
+    libretranslate_url: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -168,6 +168,9 @@ impl KDbClient {
         // Step 1c: idempotently ensure the KaPosts personal-mode block/mute denylist exists.
         self.create_denylist_schema().await?;
 
+        // Step 1d: idempotently ensure the post-translation cache table exists (fork addition).
+        self.create_translations_schema().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -208,6 +211,29 @@ impl KDbClient {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_bcast_channel_time \
              ON kachat_broadcasts(channel, block_time DESC, id DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Post-translation cache (fork addition). A KaPost is immutable, so a translation of
+    /// (transaction_id, target_lang) is correct permanently — no TTL, no invalidation. Only the
+    /// server's own verified copy of a post is ever cached here (see the /translate handler); text
+    /// supplied in a request is never written under a txid. `post_id` is BYTEA to match
+    /// `k_contents.transaction_id`.
+    async fn create_translations_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS post_translations (
+                post_id BYTEA NOT NULL,
+                target_lang TEXT NOT NULL,
+                source_lang TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at BIGINT NOT NULL,
+                PRIMARY KEY (post_id, target_lang)
+            )
+            "#,
         )
         .execute(&self.pool)
         .await?;

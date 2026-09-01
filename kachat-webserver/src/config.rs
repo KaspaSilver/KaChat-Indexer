@@ -19,6 +19,7 @@ pub struct ServerConfig {
     pub bind_address: String,
     pub request_timeout: u64,
     pub rate_limit: u32,
+    pub libretranslate_url: String,
 }
 
 impl AppConfig {
@@ -40,6 +41,7 @@ impl AppConfig {
                 bind_address: args.bind_address.clone(),
                 request_timeout: args.request_timeout,
                 rate_limit: args.rate_limit,
+                libretranslate_url: args.libretranslate_url.clone(),
             },
         }
     }
