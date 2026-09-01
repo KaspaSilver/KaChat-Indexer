@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Json, Response},
-    routing::get,
+    routing::{get, post},
 };
 use axum_prometheus::PrometheusMetricLayer;
 use serde::Deserialize;
@@ -44,6 +44,10 @@ pub struct AppState {
     pub rate_limit_map: RateLimitMap,
     pub server_config: ServerConfig,
     pub db: Arc<dyn DatabaseInterface>,
+    /// Shared outbound HTTP client (LibreTranslate calls for /translate).
+    pub http: reqwest::Client,
+    /// Separate per-IP limiter for /translate (requests + posts).
+    pub translate_rate_limit_map: crate::translate::TranslateRateLimitMap,
 }
 
 pub struct WebServer {
@@ -248,12 +252,19 @@ impl WebServer {
     pub async fn new(db: Arc<dyn DatabaseInterface>, server_config: ServerConfig) -> Self {
         let api_handlers = ApiHandlers::new(db.clone());
         let rate_limit_map = Arc::new(RwLock::new(HashMap::new()));
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        let translate_rate_limit_map = Arc::new(RwLock::new(HashMap::new()));
 
         let app_state = Arc::new(AppState {
             api_handlers,
             rate_limit_map,
             server_config,
             db,
+            http,
+            translate_rate_limit_map,
         });
 
         Self { app_state }
@@ -298,9 +309,15 @@ impl WebServer {
             .route("/get-notifications", get(handle_get_notifications))
             .route("/get-hashtag-content", get(handle_get_hashtag_content))
             .route("/get-trending-hashtags", get(handle_get_trending_hashtags))
+            .route("/translate", post(crate::translate::handle_translate))
+            .route(
+                "/translate/languages",
+                get(crate::translate::handle_translate_languages),
+            )
             .layer(prometheus_layer)
             .layer(TimeoutLayer::new(timeout_duration))
-            .layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1MB limit
+            // 2MB: /translate accepts up to 50 posts × 25k chars.
+            .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
             .layer(
                 CorsLayer::new()
                     .allow_origin(Any)

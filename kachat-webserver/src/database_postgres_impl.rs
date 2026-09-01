@@ -3830,4 +3830,57 @@ impl DatabaseInterface for PostgresDbManager {
 
         Ok(trending_hashtags)
     }
+
+    async fn get_post_base64_message(&self, tx_id_hex: &str) -> DatabaseResult<Option<String>> {
+        let tx_id = Self::decode_hex_to_bytes(tx_id_hex)?;
+        let row = sqlx::query(
+            "SELECT base64_encoded_message FROM k_contents WHERE transaction_id = $1 LIMIT 1",
+        )
+        .bind(tx_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch post message: {}", e)))?;
+        Ok(row.map(|r| r.get::<String, _>("base64_encoded_message")))
+    }
+
+    async fn get_cached_translation(
+        &self,
+        tx_id_hex: &str,
+        target_lang: &str,
+    ) -> DatabaseResult<Option<(String, String)>> {
+        let tx_id = Self::decode_hex_to_bytes(tx_id_hex)?;
+        let row = sqlx::query(
+            "SELECT source_lang, text FROM post_translations WHERE post_id = $1 AND target_lang = $2",
+        )
+        .bind(tx_id)
+        .bind(target_lang)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch cached translation: {}", e)))?;
+        Ok(row.map(|r| (r.get::<String, _>("source_lang"), r.get::<String, _>("text"))))
+    }
+
+    async fn insert_translation(
+        &self,
+        tx_id_hex: &str,
+        target_lang: &str,
+        source_lang: &str,
+        text: &str,
+        created_at_ms: i64,
+    ) -> DatabaseResult<()> {
+        let tx_id = Self::decode_hex_to_bytes(tx_id_hex)?;
+        sqlx::query(
+            "INSERT INTO post_translations (post_id, target_lang, source_lang, text, created_at) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (post_id, target_lang) DO NOTHING",
+        )
+        .bind(tx_id)
+        .bind(target_lang)
+        .bind(source_lang)
+        .bind(text)
+        .bind(created_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(format!("Failed to insert translation: {}", e)))?;
+        Ok(())
+    }
 }

@@ -229,6 +229,30 @@ pub trait DatabaseInterface: Send + Sync {
         to_time: u64,
         limit: u32,
     ) -> DatabaseResult<Vec<(String, u64)>>;
+
+    // --- Post translation (/translate endpoint) ---
+
+    // The server's own copy of a post's message (raw stored base64, marker not stripped), by txid.
+    // None if the post is not in the indexer's k_contents. Used to translate the VERIFIED text and
+    // never trust request-supplied text under a txid.
+    async fn get_post_base64_message(&self, tx_id_hex: &str) -> DatabaseResult<Option<String>>;
+
+    // Cached translation of (txid, target_lang), if any. Returns (source_lang, text).
+    async fn get_cached_translation(
+        &self,
+        tx_id_hex: &str,
+        target_lang: &str,
+    ) -> DatabaseResult<Option<(String, String)>>;
+
+    // Insert a verified translation into the permanent (txid, target) cache. Idempotent.
+    async fn insert_translation(
+        &self,
+        tx_id_hex: &str,
+        target_lang: &str,
+        source_lang: &str,
+        text: &str,
+        created_at_ms: i64,
+    ) -> DatabaseResult<()>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

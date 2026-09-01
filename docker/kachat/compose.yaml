@@ -82,6 +82,8 @@ services:
       FCM_SERVICE_ACCOUNT_PATH: /app/data/fcm/service-account.json
       # shared secret guarding the internal broadcast/KaPosts push-injection endpoints
       INTERNAL_PUSH_SECRET: ${INTERNAL_PUSH_SECRET}
+      # LibreTranslate base URL for the /translate endpoint (sibling container on host loopback).
+      LIBRETRANSLATE_URL: ${LIBRETRANSLATE_URL:-http://127.0.0.1:5000}
       RUST_LOG: info
     volumes:
       - /var/kachat-chat-data:/app/data
@@ -97,3 +99,35 @@ services:
       timeout: 10s
       retries: 3
       start_period: 90s
+
+  # Self-hosted translation engine behind the webserver's /translate endpoint. Bridge network with
+  # a loopback port publish so the host-network kachat-app reaches it at http://127.0.0.1:5000.
+  # LT_LOAD_ONLY preloads a modest language set (each pair is a model in memory) — expand only as
+  # RAM headroom allows. mem_limit caps it so it can never OOM-pressure the Kaspa node.
+  libretranslate:
+    profiles: ["public-indexer"]
+    container_name: libretranslate
+    image: libretranslate/libretranslate:latest
+    restart: unless-stopped
+    # Run as root so it can write models to the root-owned named volume (the image's non-root user
+    # uid 1032 can't; the argos dir isn't baked into the image, so Docker doesn't chown the volume).
+    # Self-healing on fresh installs — no manual chown needed. Container is loopback-only + isolated.
+    user: "0:0"
+    ports:
+      - "127.0.0.1:5000:5000"
+    mem_limit: 4g
+    environment:
+      LT_LOAD_ONLY: ${LT_LOAD_ONLY:-en,es,pt,fr,de,ru,zh,ja,ko,ar}
+      LT_DISABLE_WEB_UI: "true"
+      LT_THREADS: "4"
+    volumes:
+      - libretranslate-models:/home/libretranslate/.local/share/argos-translate
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/languages', timeout=5).status==200 else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+volumes:
+  libretranslate-models:
