@@ -493,11 +493,53 @@ impl VirtualProcessor {
             ack_rx,
             self.command_tx.clone(),
         );
+        // Cloned handles for the self-heal path below (both are cheap Arc-backed clones).
+        let tx_keyspace = self.tx_keyspace.clone();
+        let metadata_partition = self.metadata_partition.clone();
         self.runtime.spawn(async move {
-            _ = syncer
-                .process()
-                .await
-                .inspect_err(|err| error!("Error in syncer: {err}"));
+            if let Err(err) = syncer.process().await {
+                error!("Error in syncer: {err:#}");
+                // Self-heal a pruned resume point: if the saved virtual-chain cursor points at a
+                // block the node has pruned, `getVirtualChainFromBlock` fails with "cannot find
+                // header ...". Without this, the process exits and supervisord restarts it straight
+                // back onto the same dead cursor — an endless crash loop. Clear the cursor here,
+                // BEFORE `syncer` is dropped (its Drop sends `Stopped`, which makes the processor
+                // exit), so the commit is guaranteed to land first; the next start then takes the
+                // existing "no cursor -> sync from pruning point" path and recovers on its own.
+                if format!("{err:#}").contains("cannot find header") {
+                    warn!(
+                        "Virtual-chain resume block was pruned by the node; clearing \
+                         LatestAcceptingBlockCursor to self-heal (next start resyncs from the \
+                         pruning point)"
+                    );
+                    match tx_keyspace.write_tx() {
+                        Ok(mut wtx) => {
+                            if let Err(e) =
+                                metadata_partition.remove_latest_accepting_block_cursor(&mut wtx)
+                            {
+                                error!("Self-heal: failed to remove accepting-block cursor: {e}");
+                            } else {
+                                match wtx.commit() {
+                                    Ok(res) if res.is_ok() => info!(
+                                        "Self-heal: cleared LatestAcceptingBlockCursor; restart \
+                                         will resync from pruning point"
+                                    ),
+                                    Ok(_) => error!(
+                                        "Self-heal: cursor-removal commit conflicted; will retry \
+                                         next cycle"
+                                    ),
+                                    Err(e) => {
+                                        error!("Self-heal: cursor-removal commit io error: {e}")
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => error!("Self-heal: failed to open write tx to clear cursor: {e}"),
+                    }
+                }
+            }
+            // `syncer` drops here -> its Drop sends `Stopped` -> processor exits (now with the
+            // cursor already cleared in the pruned case).
         });
         ack_tx
     }
