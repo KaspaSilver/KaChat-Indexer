@@ -166,6 +166,27 @@ pub const MAX_BROADCAST_AUDIO_CHARS: usize = 1_000_000;
 /// this length), so long-form text is fine while embedded blobs are still rejected.
 pub const MAX_KACHAT_MESSAGE_CHARS: usize = 25_000;
 
+/// "Text-as-image" art gate. Posts built out of box-drawing / block / braille / mosaic glyphs render
+/// arbitrary pictures (including offensive imagery) as plain text, bypassing the data-URI/base64
+/// media checks because on-chain it is "just characters". We reject a body when it is *predominantly*
+/// such glyphs: at least `MIN_ART_GLYPHS` of them AND at least `ART_GLYPH_PERCENT`% of the
+/// non-whitespace characters. Normal prose — including CJK, Arabic, Hebrew, emoji — contains none of
+/// these ranges, so the count+ratio gate has negligible false-positive risk (a stray bullet or box
+/// char in real text stays well under both thresholds).
+const MIN_ART_GLYPHS: usize = 30;
+const ART_GLYPH_PERCENT: usize = 30;
+
+/// Whether `c` is a "drawing" glyph used to build text-as-image art (see [`MIN_ART_GLYPHS`]).
+fn is_image_art_glyph(c: char) -> bool {
+    matches!(c as u32,
+        0x2500..=0x257F   // Box Drawing        ─ │ ┌ ┐ └ ┘ ├ ┤ ┼ …
+        | 0x2580..=0x259F // Block Elements     █ ▀ ▄ ▌ ▐ ░ ▒ ▓ …
+        | 0x25A0..=0x25FF // Geometric Shapes   ■ □ ▲ ▼ ● ○ ◆ …
+        | 0x2800..=0x28FF // Braille Patterns   ⠀..⣿  (dot-grid image art)
+        | 0x1FB00..=0x1FBFF // Symbols for Legacy Computing (sextant/mosaic blocks)
+    )
+}
+
 /// Validate that a base64-encoded message is acceptable KaChat content and gate every content
 /// insert (post / reply / quote / repost) on it. KaPosts is text-only; this enforces that
 /// server-side regardless of which client produced the transaction. A message is accepted
@@ -174,7 +195,8 @@ pub const MAX_KACHAT_MESSAGE_CHARS: usize = 25_000;
 ///   - prefixed with the KaChat exclusivity marker (U+2060),
 ///   - within `MAX_KACHAT_MESSAGE_CHARS`,
 ///   - free of embedded media / data URIs (`data:image/…`, `;base64,`, etc.),
-///   - free of control characters other than tab / newline / carriage-return.
+///   - free of control characters other than tab / newline / carriage-return,
+///   - not "text-as-image" art (predominantly drawing/braille/block glyphs — see [`MIN_ART_GLYPHS`]).
 /// Returns `Err(reason)` describing why a message was rejected. (A plain repost — body that is
 /// exactly the marker — has an empty body and passes.)
 pub fn validate_kachat_message(base64_encoded_message: &str) -> Result<(), &'static str> {
@@ -207,6 +229,22 @@ pub fn validate_kachat_message(base64_encoded_message: &str) -> Result<(), &'sta
         .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
     {
         return Err("contains control characters");
+    }
+
+    // Reject "text-as-image" art (predominantly drawing/braille/block/mosaic glyphs).
+    let mut art_glyphs = 0usize;
+    let mut non_ws = 0usize;
+    for c in body.chars() {
+        if c.is_whitespace() {
+            continue;
+        }
+        non_ws += 1;
+        if is_image_art_glyph(c) {
+            art_glyphs += 1;
+        }
+    }
+    if art_glyphs >= MIN_ART_GLYPHS && non_ws > 0 && art_glyphs * 100 / non_ws >= ART_GLYPH_PERCENT {
+        return Err("image-like art (drawing glyphs) not allowed");
     }
 
     Ok(())
@@ -2225,5 +2263,63 @@ mod broadcast_channel_tests {
         if let Ok(mut guard) = BROADCAST_CHANNELS_RUNTIME.write() {
             *guard = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod content_validation_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose};
+
+    /// Base64 of the KaChat marker followed by `body` — the wire form `validate_kachat_message` sees.
+    fn encode(body: &str) -> String {
+        let mut s = String::new();
+        s.push_str(KACHAT_MARKER);
+        s.push_str(body);
+        general_purpose::STANDARD.encode(s.as_bytes())
+    }
+
+    #[test]
+    fn accepts_normal_text() {
+        // Latin, CJK, Arabic, emoji, and a stray bullet/box char in real prose all pass.
+        assert!(validate_kachat_message(&encode("Just a normal post about Kaspa! 🚀")).is_ok());
+        assert!(validate_kachat_message(&encode("你好，欢迎来到 KaChat")).is_ok());
+        assert!(validate_kachat_message(&encode("مرحبا بكم في كاشات")).is_ok());
+        assert!(validate_kachat_message(&encode("Roadmap ► phase 1 ● done, phase 2 ○ next")).is_ok());
+        // Plain repost (marker only, empty body) passes.
+        assert!(validate_kachat_message(&encode("")).is_ok());
+    }
+
+    #[test]
+    fn rejects_braille_image_art() {
+        let art: String = std::iter::repeat('⣿').take(200).collect();
+        assert_eq!(
+            validate_kachat_message(&encode(&art)),
+            Err("image-like art (drawing glyphs) not allowed")
+        );
+    }
+
+    #[test]
+    fn rejects_block_element_art() {
+        // A grid of block glyphs with newlines, like the reported bitcoin "ASCII" art.
+        let art = "████░░░░▓▓▓▓\n".repeat(20);
+        assert_eq!(
+            validate_kachat_message(&encode(&art)),
+            Err("image-like art (drawing glyphs) not allowed")
+        );
+    }
+
+    #[test]
+    fn ratio_guard_spares_mostly_text() {
+        // 40 drawing glyphs but dwarfed by 500 chars of text (~7%) -> under the ratio -> allowed.
+        let body = format!("{}{}", "a".repeat(500), "─".repeat(40));
+        assert!(validate_kachat_message(&encode(&body)).is_ok());
+    }
+
+    #[test]
+    fn count_guard_spares_tiny_glyph_runs() {
+        // Under MIN_ART_GLYPHS even at 100% ratio -> too small to be a picture -> allowed.
+        let small: String = std::iter::repeat('█').take(20).collect();
+        assert!(validate_kachat_message(&encode(&small)).is_ok());
     }
 }
