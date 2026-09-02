@@ -26,10 +26,11 @@ pub const KACHAT_MARKER: &str = "\u{2060}";
 
 /// Default broadcast channels — the fallback used when no `broadcast_channels` key is configured in
 /// `k_vars` (fresh/upgraded installs). Only normalized names (trimmed, lowercase) so they match
-/// `process_broadcast`. The 11 language rooms ship with KaChat iOS/Android 4.0; the accent-free
-/// spellings (espanol/francais/portugues) are deliberate so the names survive normalization.
+/// `process_broadcast`. The original 11 language rooms ship with KaChat iOS/Android 4.0; the
+/// accent-free spellings (espanol/francais/portugues) are deliberate so the names survive
+/// normalization. `kaspa-romania` was added later (server-tracked default).
 /// The *effective* tracked set is `channel_is_tracked` (runtime-configurable — see below).
-pub const DEFAULT_BROADCAST_CHANNELS: [&str; 13] = [
+pub const DEFAULT_BROADCAST_CHANNELS: [&str; 14] = [
     "kaspa",
     "kachat-bugs",
     "kaspa-indonesia",
@@ -43,6 +44,7 @@ pub const DEFAULT_BROADCAST_CHANNELS: [&str; 13] = [
     "kaspa-japanese",
     "kaspa-korean",
     "kaspa-hebrew",
+    "kaspa-romania",
 ];
 
 /// The channels the indexer currently tracks, refreshed from `k_vars['broadcast_channels']` by the

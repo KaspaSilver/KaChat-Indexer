@@ -38,10 +38,10 @@ KaChat iOS app already speaks, and adds the KaChat-specific behaviour described 
    messages (a different protocol — `ciph_msg:1:bcast:<channel>:<content>`, no signatures,
    sender = the self-send address). Served from the **same webserver/host** as KaPosts, so
    the app's *Broadcast Indexer URL* is the same URL as the *KaPost Indexer URL*.
-   - Thirteen curated channels are indexed — **`#kaspa`**, **`#kachat-bugs`**, and 11 language
+   - Fourteen curated channels are indexed — **`#kaspa`**, **`#kachat-bugs`**, and 12 language
      rooms (`kaspa-indonesia`, `kaspa-czech`, `kaspa-german`, `kaspa-espanol`, `kaspa-francais`,
      `kaspa-portugues`, `kaspa-slovak`, `kaspa-chinese`, `kaspa-japanese`, `kaspa-korean`,
-     `kaspa-hebrew`); everything else on the bcast protocol is dropped (`BROADCAST_CHANNELS` in
+     `kaspa-hebrew`, `kaspa-romania`); everything else on the bcast protocol is dropped (`BROADCAST_CHANNELS` in
      `k_protocol.rs`). The accent-free spellings are deliberate so names survive normalization.
    - Content is stored **verbatim** (text or reply/audio JSON envelopes) with a size cap
      (`MAX_BROADCAST_CONTENT_CHARS`); deduped by transaction id.
