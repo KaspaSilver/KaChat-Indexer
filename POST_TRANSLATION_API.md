@@ -76,7 +76,7 @@ has loaded — see `LT_LOAD_ONLY` below.)
 ## Backend / operator notes
 - Engine: self-hosted **LibreTranslate** (`docker/kachat/compose.yaml`), reachable by the webserver
   at `LIBRETRANSLATE_URL` (default `http://127.0.0.1:5000`). Languages preloaded via `LT_LOAD_ONLY`
-  (default `en,es,pt,fr,de,ru,zh,ja,ko,ar`). The contract is engine-agnostic — DeepL/Google could be
+  (default `en,es,pt,fr,de,ru,zh,ja,ko,ar,vi`). The contract is engine-agnostic — DeepL/Google could be
   swapped behind it without touching clients.
 - Cache table `post_translations (post_id BYTEA, target_lang, source_lang, text, created_at)`,
   created by the processor's schema init.
