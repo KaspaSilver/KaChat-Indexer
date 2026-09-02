@@ -187,6 +187,25 @@ fn is_image_art_glyph(c: char) -> bool {
     )
 }
 
+/// Whether `body` is predominantly text-as-image art: at least [`MIN_ART_GLYPHS`] drawing glyphs AND
+/// at least [`ART_GLYPH_PERCENT`]% of its non-whitespace characters. Shared by the KaPosts content
+/// gate ([`validate_kachat_message`]) and the broadcast path. Base64/JSON/plain text score ~0% and
+/// pass; only actual glyph pictures trip it.
+pub fn is_image_art(body: &str) -> bool {
+    let mut art_glyphs = 0usize;
+    let mut non_ws = 0usize;
+    for c in body.chars() {
+        if c.is_whitespace() {
+            continue;
+        }
+        non_ws += 1;
+        if is_image_art_glyph(c) {
+            art_glyphs += 1;
+        }
+    }
+    art_glyphs >= MIN_ART_GLYPHS && non_ws > 0 && art_glyphs * 100 / non_ws >= ART_GLYPH_PERCENT
+}
+
 /// Validate that a base64-encoded message is acceptable KaChat content and gate every content
 /// insert (post / reply / quote / repost) on it. KaPosts is text-only; this enforces that
 /// server-side regardless of which client produced the transaction. A message is accepted
@@ -232,18 +251,7 @@ pub fn validate_kachat_message(base64_encoded_message: &str) -> Result<(), &'sta
     }
 
     // Reject "text-as-image" art (predominantly drawing/braille/block/mosaic glyphs).
-    let mut art_glyphs = 0usize;
-    let mut non_ws = 0usize;
-    for c in body.chars() {
-        if c.is_whitespace() {
-            continue;
-        }
-        non_ws += 1;
-        if is_image_art_glyph(c) {
-            art_glyphs += 1;
-        }
-    }
-    if art_glyphs >= MIN_ART_GLYPHS && non_ws > 0 && art_glyphs * 100 / non_ws >= ART_GLYPH_PERCENT {
+    if is_image_art(body) {
         return Err("image-like art (drawing glyphs) not allowed");
     }
 
@@ -937,6 +945,17 @@ impl KProtocolProcessor {
                 "Broadcast {} exceeds max content length ({} cap), skipping",
                 transaction_id,
                 if is_audio { "audio" } else { "text" }
+            );
+            return Ok(());
+        }
+
+        // Same text-as-image art gate as KaPosts. Broadcasts are stored verbatim (plain text, JSON
+        // reaction/reply envelopes, or base64 audio) — none of which contain drawing glyphs — so this
+        // only trips on actual glyph pictures posted to a channel.
+        if is_image_art(content) {
+            info!(
+                "Broadcast {} is image-like art (drawing glyphs), skipping",
+                transaction_id
             );
             return Ok(());
         }
@@ -2321,5 +2340,16 @@ mod content_validation_tests {
         // Under MIN_ART_GLYPHS even at 100% ratio -> too small to be a picture -> allowed.
         let small: String = std::iter::repeat('█').take(20).collect();
         assert!(validate_kachat_message(&encode(&small)).is_ok());
+    }
+
+    #[test]
+    fn is_image_art_helper_matches_broadcast_shapes() {
+        // The shared helper the broadcast path uses: glyph art trips, real broadcast payloads don't.
+        assert!(is_image_art(&"⣿".repeat(200)));
+        assert!(is_image_art(&"█▀▄░▒▓".repeat(30)));
+        // Plain text, a JSON reaction/reply envelope, and a base64 audio blob all pass.
+        assert!(!is_image_art("Ahoj je tu niekto zo Slovenska ??"));
+        assert!(!is_image_art("{\"type\":\"reaction\",\"emoji\":\"❤️\",\"targetTxId\":\"abc123\"}"));
+        assert!(!is_image_art(&format!("data:audio/webm;base64,{}", "A".repeat(5000))));
     }
 }
