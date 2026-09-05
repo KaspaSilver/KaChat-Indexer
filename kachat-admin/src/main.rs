@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse},
+    response::IntoResponse,
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
@@ -153,7 +153,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let app = Router::new()
-        .route("/", get(serve_index))
         .route("/api/health", get(get_health))
         .route("/api/stats", get(get_stats))
         .route("/api/moderation/recent", get(get_recent))
@@ -180,10 +179,6 @@ async fn main() -> anyhow::Result<()> {
     info!("kachat-admin dashboard listening on http://{}", args.bind_address);
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn serve_index() -> Html<&'static str> {
-    Html(include_str!("../static/index.html"))
 }
 
 // ---------------------------------------------------------------------------
