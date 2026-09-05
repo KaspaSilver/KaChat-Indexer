@@ -1,0 +1,10 @@
+/home/vahome/kachat-indexer/tools/reseed-metadata/target/debug/deps/xxhash_rust-72f2c800ba6bb7fa.d: /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/lib.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/utils.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh32_common.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh64_common.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3_common.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3.rs
+
+/home/vahome/kachat-indexer/tools/reseed-metadata/target/debug/deps/libxxhash_rust-72f2c800ba6bb7fa.rmeta: /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/lib.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/utils.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh32_common.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh64_common.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3_common.rs /home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3.rs
+
+/home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/lib.rs:
+/home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/utils.rs:
+/home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh32_common.rs:
+/home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh64_common.rs:
+/home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3_common.rs:
+/home/vahome/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3.rs:
