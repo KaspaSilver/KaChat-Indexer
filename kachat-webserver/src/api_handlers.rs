@@ -2,7 +2,8 @@ use crate::database_trait::{DatabaseInterface, QueryOptions};
 use crate::models::{
     ApiError, ContentRecord, NotificationPost, PaginatedEngagementResponse,
     PaginatedNotificationsResponse, PaginatedPostsResponse, PaginatedRepliesResponse,
-    PaginatedUsersResponse, PostDetailsResponse, ServerPost, ServerReply, ServerUserPost,
+    GetThreadResponse, PaginatedUsersResponse, PostDetailsResponse, ServerPost, ServerReply,
+    ServerUserPost,
 };
 use serde_json;
 use std::sync::Arc;
@@ -1002,6 +1003,137 @@ impl ApiHandlers {
                 ))
             }
         }
+    }
+
+    /// Shared validation for the by-id read endpoints: a 64-hex content id and a
+    /// 66-hex compressed requester pubkey (02/03 prefix).
+    fn validate_content_request(
+        &self,
+        content_id: &str,
+        requester_pubkey: &str,
+    ) -> Result<(), String> {
+        if content_id.len() != 64 || !content_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(self.create_error_response(
+                "Invalid content ID format. Must be 64 hex characters.",
+                "INVALID_POST_ID",
+            ));
+        }
+        if requester_pubkey.len() != 66
+            || !requester_pubkey.chars().all(|c| c.is_ascii_hexdigit())
+            || !(requester_pubkey.starts_with("02") || requester_pubkey.starts_with("03"))
+        {
+            return Err(self.create_error_response(
+                "Invalid requester public key format. Must be 66 hex characters starting with 02 or 03.",
+                "INVALID_USER_KEY",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Turns any content row into the feed's ServerPost shape. A post keeps a
+    /// null parent, a reply carries the id of what it replies to (the link the
+    /// thread walk follows), and a vote is rendered the same way get-post-details
+    /// renders it.
+    fn content_to_server_post(record: ContentRecord, is_blocked: bool) -> ServerPost {
+        match record {
+            ContentRecord::Post(r) => {
+                ServerPost::from_enriched_k_post_record_with_block_status(&r, is_blocked)
+            }
+            ContentRecord::Reply(r) => {
+                ServerReply::from_enriched_k_reply_record_with_block_status(&r, is_blocked)
+            }
+            ContentRecord::Vote(v) => ServerPost {
+                id: v.transaction_id.clone(),
+                user_public_key: v.sender_pubkey.clone(),
+                post_content: String::new(),
+                signature: v.sender_signature.clone(),
+                timestamp: v.block_time,
+                replies_count: 0,
+                quotes_count: 0,
+                up_votes_count: 0,
+                down_votes_count: 0,
+                reposts_count: 0,
+                parent_post_id: Some(v.post_id.clone()),
+                mentioned_pubkeys: Vec::new(),
+                is_upvoted: None,
+                is_downvoted: None,
+                user_nickname: v.user_nickname.clone(),
+                user_profile_image: v.user_profile_image.clone(),
+                blocked_user: Some(is_blocked),
+                content_type: Some("vote".to_string()),
+                is_quote: false,
+                quote: None,
+            },
+        }
+    }
+
+    /// GET /get-thread?id={postId}&requesterPubkey={requesterPubkey}
+    /// The requested post plus its chain of parents, walked server-side one
+    /// level at a time via parentPostId. Ancestors come back ROOT FIRST and
+    /// exclude the requested post. The chain is capped at 25; a longer chain is
+    /// truncated from the root end, keeping the 25 parents nearest the post.
+    pub async fn get_thread(
+        &self,
+        content_id: &str,
+        requester_pubkey: &str,
+    ) -> Result<String, String> {
+        self.validate_content_request(content_id, requester_pubkey)?;
+
+        const MAX_ANCESTORS: usize = 25;
+        const MAX_WALK: usize = 200; // hard stop against a corrupt or cyclic chain
+
+        let post = match self.db.get_content_by_id(content_id, requester_pubkey).await {
+            Ok(Some((record, is_blocked))) => Self::content_to_server_post(record, is_blocked),
+            Ok(None) => return Err(self.create_error_response("Content not found", "NOT_FOUND")),
+            Err(err) => {
+                log_error!("Database error while querying content by ID {}: {}", content_id, err);
+                return Err(self.create_error_response("Internal server error", "DATABASE_ERROR"));
+            }
+        };
+
+        // Walk upward, nearest parent first.
+        let mut ancestors: Vec<ServerPost> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(post.id.clone());
+        let mut next_parent = post.parent_post_id.clone();
+        let mut steps = 0usize;
+
+        while let Some(parent_id) = next_parent {
+            steps += 1;
+            if steps > MAX_WALK {
+                break;
+            }
+            // A parent we have already seen means a cycle; stop rather than loop.
+            if !seen.insert(parent_id.clone()) {
+                break;
+            }
+            match self.db.get_content_by_id(&parent_id, requester_pubkey).await {
+                Ok(Some((record, is_blocked))) => {
+                    let parent = Self::content_to_server_post(record, is_blocked);
+                    next_parent = parent.parent_post_id.clone();
+                    ancestors.push(parent);
+                }
+                // A parent that is not indexed ends the chain honestly.
+                Ok(None) => break,
+                Err(err) => {
+                    log_error!("Database error while walking thread parent {}: {}", parent_id, err);
+                    break;
+                }
+            }
+        }
+
+        // Keep the parents nearest the post, then present them root first.
+        ancestors.truncate(MAX_ANCESTORS);
+        ancestors.reverse();
+
+        let response = GetThreadResponse { ancestors, post };
+        serde_json::to_string(&response).map_err(|err| {
+            log_error!("Failed to serialize thread response: {}", err);
+            self.create_error_response(
+                "Internal server error during serialization",
+                "SERIALIZATION_ERROR",
+            )
+        })
     }
 
     /// GET /get-post-details?id={postId}&requesterPubkey={requesterPubkey}

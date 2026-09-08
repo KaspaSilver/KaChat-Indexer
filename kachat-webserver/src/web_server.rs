@@ -26,9 +26,9 @@ use crate::api_handlers::ApiHandlers;
 use crate::config::ServerConfig;
 use crate::database_trait::DatabaseInterface;
 use crate::models::{
-    ApiError, BroadcastsResponse, PaginatedEngagementResponse, PaginatedNotificationsResponse,
-    PaginatedPostsResponse, PaginatedRepliesResponse, PaginatedUsersResponse, PostDetailsResponse,
-    ServerUserPost, TrendingHashtagsResponse,
+    ApiError, BroadcastsResponse, GetThreadResponse, PaginatedEngagementResponse,
+    PaginatedNotificationsResponse, PaginatedPostsResponse, PaginatedRepliesResponse,
+    PaginatedUsersResponse, PostDetailsResponse, ServerUserPost, TrendingHashtagsResponse,
 };
 
 #[derive(Debug, Clone)]
@@ -284,6 +284,11 @@ impl WebServer {
             )
             .route("/get-posts", get(handle_get_posts))
             .route("/get-post-details", get(handle_get_post_details))
+            // Fetch one post by id, any age or author, in the feed's KPost shape.
+            // Same contract as get-post-details; named for what the apps call.
+            .route("/get-post", get(handle_get_post_details))
+            // The post plus its parent chain, walked server-side.
+            .route("/get-thread", get(handle_get_thread))
             .route("/get-posts-watching", get(handle_get_posts_watching))
             .route(
                 "/get-contents-following",
@@ -640,6 +645,72 @@ async fn handle_get_post_details(
                 }
             }
         }
+    }
+}
+
+async fn handle_get_thread(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<GetPostDetailsQuery>,
+) -> Result<Json<GetThreadResponse>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+
+    let post_id = match params.id {
+        Some(id) => id,
+        None => {
+            let error = ApiError {
+                error: "Missing required parameter: id".to_string(),
+                code: "MISSING_PARAMETER".to_string(),
+            };
+            return Err((StatusCode::BAD_REQUEST, Json(error)));
+        }
+    };
+    let requester_pubkey = match params.requester_pubkey {
+        Some(pubkey) => pubkey,
+        None => {
+            let error = ApiError {
+                error: "Missing required parameter: requesterPubkey".to_string(),
+                code: "MISSING_PARAMETER".to_string(),
+            };
+            return Err((StatusCode::BAD_REQUEST, Json(error)));
+        }
+    };
+
+    match app_state
+        .api_handlers
+        .get_thread(&post_id, &requester_pubkey)
+        .await
+    {
+        Ok(response_json) => match serde_json::from_str::<GetThreadResponse>(&response_json) {
+            Ok(thread_response) => Ok(Json(thread_response)),
+            Err(err) => {
+                log_error!("Failed to parse thread response: {}", err);
+                let error = ApiError {
+                    error: "Internal server error".to_string(),
+                    code: "INTERNAL_ERROR".to_string(),
+                };
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)))
+            }
+        },
+        Err(error_json) => match serde_json::from_str::<ApiError>(&error_json) {
+            Ok(api_error) => {
+                let status_code = match api_error.code.as_str() {
+                    "MISSING_PARAMETER" | "INVALID_POST_ID" | "INVALID_USER_KEY" => {
+                        StatusCode::BAD_REQUEST
+                    }
+                    "NOT_FOUND" => StatusCode::NOT_FOUND,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                Err((status_code, Json(api_error)))
+            }
+            Err(_) => {
+                let error = ApiError {
+                    error: "Internal server error".to_string(),
+                    code: "INTERNAL_ERROR".to_string(),
+                };
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)))
+            }
+        },
     }
 }
 

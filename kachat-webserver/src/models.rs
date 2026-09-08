@@ -383,6 +383,14 @@ pub struct PostDetailsResponse {
     pub post: ServerPost,
 }
 
+/// Response for GET /get-thread: the ancestor chain plus the requested post.
+/// `ancestors` is ROOT FIRST and excludes the requested post itself.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetThreadResponse {
+    pub ancestors: Vec<ServerPost>,
+    pub post: ServerPost,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
