@@ -961,20 +961,38 @@ impl KProtocolProcessor {
         }
 
         // Sender = the self-send address (broadcasts pay back to the author). simply-kaspa's
-        // addresses_transactions stores the bech32 payload without the hrp; prefix it. Rows
-        // commit together with the transaction row, so the address is present by now.
+        // addresses_transactions stores the bech32 payload without the hrp; prefix it.
+        //
+        // RACE: this worker is woken by a LISTEN/NOTIFY the instant the *transaction* row
+        // lands, but simply-kaspa writes the address rows a moment later -- so a first
+        // lookup often misses them, and the broadcast used to be dropped for good
+        // ("no indexed sender address, skipping"). Poll briefly (up to ~6s) for the row
+        // before giving up; it normally shows within a second or two.
         let transaction_id_bytes = hex::decode(transaction_id)?;
-        let addr: Option<String> = sqlx::query_scalar(
-            "SELECT address FROM addresses_transactions WHERE transaction_id = $1 LIMIT 1",
-        )
-        .bind(&transaction_id_bytes)
-        .fetch_optional(&self.db_pool)
-        .await?;
+        let mut addr: Option<String> = None;
+        for attempt in 0..12u32 {
+            addr = sqlx::query_scalar(
+                "SELECT address FROM addresses_transactions WHERE transaction_id = $1 LIMIT 1",
+            )
+            .bind(&transaction_id_bytes)
+            .fetch_optional(&self.db_pool)
+            .await?;
+            if addr.is_some() {
+                break;
+            }
+            if attempt == 0 {
+                info!(
+                    "Broadcast {} sender address not indexed yet, waiting for the address index",
+                    transaction_id
+                );
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
         let sender_address = match addr {
             Some(a) => format!("{}:{}", self.address_hrp(), a),
             None => {
                 warn!(
-                    "Broadcast {} has no indexed sender address, skipping",
+                    "Broadcast {} still has no indexed sender address after waiting, skipping",
                     transaction_id
                 );
                 return Ok(());
