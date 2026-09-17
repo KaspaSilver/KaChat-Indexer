@@ -32,12 +32,34 @@ pub enum ExtensionPushEvent {
         /// Action kind (like/dislike/comment/repost/follow) for per-type toggle filtering; `None`
         /// = always notify.
         action: Option<String>,
+        /// Fine-grained kind (vote_up/vote_down/reply/quote/repost/follow/mention) forwarded to the
+        /// client so it can render the notification precisely; `None` for old callers.
+        kaposts_kind: Option<String>,
         subtitle: String,
         body: String,
         /// Target content txid (present when the action targets content; omitted for follows).
         post_id: Option<String>,
         /// Action txid — APNs collapse-id.
         tx_id: String,
+    },
+    /// VoIP call ring: a caller (`sender`) is ringing every device registered under callee
+    /// `to_address`. Rides the extension channel; the dispatcher looks up the callee's VoIP tokens
+    /// and sends a `voip` APNs push. No dedup (each ring is intentional).
+    Ring {
+        /// Callee's canonical kaspa (primary) address — the devices to ring.
+        to_address: String,
+        /// Opaque call identifier chosen by the caller.
+        call_id: String,
+        /// Call kind (e.g. "offer"/"cancel"), forwarded verbatim.
+        kind: String,
+        /// Video call flag.
+        video: bool,
+        /// Caller's canonical wallet address.
+        sender: String,
+        /// Server timestamp (ms) when the ring was queued.
+        timestamp: u64,
+        /// Opaque payload (hex) forwarded to the callee (e.g. SDP/handshake blob).
+        payload: String,
     },
 }
 

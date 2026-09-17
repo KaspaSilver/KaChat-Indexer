@@ -110,6 +110,8 @@ impl PushRegistry {
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
         watch_only_addresses: Vec<String>,
+        apns_environment: Option<String>,
+        voip_token: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -137,11 +139,18 @@ impl PushRegistry {
         let normalized_hidden_senders = normalize_hidden_broadcast_senders(hidden_broadcast_senders);
         let normalized_kaposts_pubkey = normalize_kaposts_pubkey(kaposts_pubkey);
         let (normalized_watch_only, _) = normalize_watch_only_addresses(watch_only_addresses);
+        let requested_apns_environment = normalize_apns_environment(apns_environment);
+        let requested_voip_token = normalize_voip_token(voip_token);
         if addresses.is_empty() && group_ids.is_empty() {
             anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
         }
 
         let existing = self.get_registration(&token)?;
+        // Keep the stored value when the request omits these (don't clobber on a partial update).
+        let normalized_apns_environment = requested_apns_environment
+            .or_else(|| existing.as_ref().and_then(|reg| reg.apns_environment.clone()));
+        let normalized_voip_token = requested_voip_token
+            .or_else(|| existing.as_ref().and_then(|reg| reg.voip_token.clone()));
         let effective_wallet_binding = resolve_wallet_binding(existing.as_ref(), wallet_binding)?;
         let effective_wallet_pubkey = effective_wallet_binding
             .as_ref()
@@ -214,6 +223,8 @@ impl PushRegistry {
                     && reg.kaposts_pubkey == normalized_kaposts_pubkey
                     && reg.kaposts_notify == kaposts_notify
                     && reg.watch_only_addresses == normalized_watch_only
+                    && reg.apns_environment == normalized_apns_environment
+                    && reg.voip_token == normalized_voip_token
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -257,6 +268,8 @@ impl PushRegistry {
             kaposts_pubkey: normalized_kaposts_pubkey,
             kaposts_notify,
             watch_only_addresses: normalized_watch_only,
+            apns_environment: normalized_apns_environment,
+            voip_token: normalized_voip_token,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -404,6 +417,8 @@ impl PushRegistry {
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
         watch_only_addresses: Vec<String>,
+        apns_environment: Option<String>,
+        voip_token: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -430,11 +445,18 @@ impl PushRegistry {
         let normalized_hidden_senders = normalize_hidden_broadcast_senders(hidden_broadcast_senders);
         let normalized_kaposts_pubkey = normalize_kaposts_pubkey(kaposts_pubkey);
         let (normalized_watch_only, _) = normalize_watch_only_addresses(watch_only_addresses);
+        let requested_apns_environment = normalize_apns_environment(apns_environment);
+        let requested_voip_token = normalize_voip_token(voip_token);
         if addresses.is_empty() && group_ids.is_empty() {
             anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
         }
 
         let existing = self.get_registration(&token)?;
+        // Keep the stored value when the request omits these (don't clobber on a partial update).
+        let normalized_apns_environment = requested_apns_environment
+            .or_else(|| existing.as_ref().and_then(|reg| reg.apns_environment.clone()));
+        let normalized_voip_token = requested_voip_token
+            .or_else(|| existing.as_ref().and_then(|reg| reg.voip_token.clone()));
         let effective_wallet_binding = resolve_wallet_binding(existing.as_ref(), wallet_binding)?;
         let effective_wallet_pubkey = effective_wallet_binding
             .as_ref()
@@ -507,6 +529,8 @@ impl PushRegistry {
                     && reg.kaposts_pubkey == normalized_kaposts_pubkey
                     && reg.kaposts_notify == kaposts_notify
                     && reg.watch_only_addresses == normalized_watch_only
+                    && reg.apns_environment == normalized_apns_environment
+                    && reg.voip_token == normalized_voip_token
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -548,6 +572,8 @@ impl PushRegistry {
             kaposts_pubkey: normalized_kaposts_pubkey,
             kaposts_notify,
             watch_only_addresses: normalized_watch_only,
+            apns_environment: normalized_apns_environment,
+            voip_token: normalized_voip_token,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -1091,6 +1117,77 @@ impl PushRegistry {
         Ok(map)
     }
 
+    /// Each token's stored APNs environment ("sandbox"/"production"), or `None` when unknown. Used
+    /// by the dispatcher to route each APNs push to the right host (and to skip the host-fallback
+    /// probe for devices whose environment is already known).
+    fn apns_environment_for_tokens(
+        &self,
+        tokens: &[String],
+    ) -> anyhow::Result<HashMap<String, Option<String>>> {
+        let mut map = HashMap::with_capacity(tokens.len());
+        for token in tokens {
+            if let Some(registration) = self.get_registration(token)? {
+                map.insert(token.clone(), registration.apns_environment);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Persist a discovered APNs environment onto a device record (read-modify-write of the JSON
+    /// value only — no index touched). Used by the learn-and-cache host fallback in the dispatcher.
+    fn set_apns_environment(&mut self, token: &str, environment: String) -> anyhow::Result<()> {
+        let token = normalize_device_token(token)?;
+        let Some(mut registration) = self.get_registration(&token)? else {
+            return Ok(());
+        };
+        if registration.apns_environment.as_deref() == Some(environment.as_str()) {
+            return Ok(());
+        }
+        registration.apns_environment = Some(environment);
+        let registration_bytes = serde_json::to_vec(&registration)?;
+        self.metrics.increment_db_write_ops_total(1);
+        let mut wtx = self.tx_keyspace.write_tx()?;
+        self.device_partition
+            .insert_wtx(&mut wtx, token.as_bytes(), &registration_bytes);
+        match wtx.commit() {
+            Ok(result) if result.is_ok() => Ok(()),
+            Ok(_) => {
+                self.metrics.increment_db_commit_conflicts_total();
+                self.metrics.increment_db_errors_total();
+                anyhow::bail!("Commit conflict")
+            }
+            Err(err) => {
+                self.metrics.increment_db_errors_total();
+                Err(err.into())
+            }
+        }
+    }
+
+    /// VoIP: every device registered under primary `address` that carries a VoIP token, as
+    /// `(device_token, voip_token, apns_environment)`. Iterates all registrations (calls are
+    /// infrequent vs chat, so no reverse index). `address` must be canonical bech32.
+    fn voip_tokens_for_primary_address(
+        &self,
+        address: &str,
+    ) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+        let rtx = self.tx_keyspace.read_tx();
+        let mut out = Vec::new();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let value = entry?;
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            if reg.primary_address.as_deref() != Some(address) {
+                continue;
+            }
+            let Some(voip_token) = reg.voip_token.clone() else {
+                continue;
+            };
+            out.push((reg.device_token, voip_token, reg.apns_environment));
+        }
+        Ok(out)
+    }
+
     fn token_allows_alias(&mut self, token: &str, alias: &str) -> bool {
         if let Some(aliases) = self.alias_cache.get(token) {
             return aliases.is_empty() || aliases.contains(alias);
@@ -1248,6 +1345,8 @@ enum PushRegistryCommand {
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
         watch_only_addresses: Vec<String>,
+        apns_environment: Option<String>,
+        voip_token: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1264,6 +1363,8 @@ enum PushRegistryCommand {
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
         watch_only_addresses: Vec<String>,
+        apns_environment: Option<String>,
+        voip_token: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1320,6 +1421,23 @@ enum PushRegistryCommand {
         sender: Option<AddressPayload>,
         response: RegistryResponse<Vec<String>>,
     },
+    ApnsEnvironmentForTokens {
+        tokens: Vec<String>,
+        response: RegistryResponse<HashMap<String, Option<String>>>,
+    },
+    SetApnsEnvironment {
+        token: String,
+        environment: String,
+        response: RegistryResponse<()>,
+    },
+    VoipTokensForPrimaryAddress {
+        address: String,
+        response: RegistryResponse<Vec<(String, String, Option<String>)>>,
+    },
+    RegistrationForToken {
+        token: String,
+        response: RegistryResponse<Option<DeviceRegistration>>,
+    },
 }
 
 pub struct PushRegistryActor {
@@ -1357,6 +1475,8 @@ impl PushRegistryActor {
                     kaposts_pubkey,
                     kaposts_notify,
                     watch_only_addresses,
+                    apns_environment,
+                    voip_token,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1374,6 +1494,8 @@ impl PushRegistryActor {
                         kaposts_pubkey,
                         kaposts_notify,
                         watch_only_addresses,
+                        apns_environment,
+                        voip_token,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1391,6 +1513,8 @@ impl PushRegistryActor {
                     kaposts_pubkey,
                     kaposts_notify,
                     watch_only_addresses,
+                    apns_environment,
+                    voip_token,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1407,6 +1531,8 @@ impl PushRegistryActor {
                         kaposts_pubkey,
                         kaposts_notify,
                         watch_only_addresses,
+                        apns_environment,
+                        voip_token,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1492,6 +1618,26 @@ impl PushRegistryActor {
                     let result = self.registry.watch_only_tokens(&address, sender.as_ref());
                     let _ = response.send(result);
                 }
+                PushRegistryCommand::ApnsEnvironmentForTokens { tokens, response } => {
+                    let result = self.registry.apns_environment_for_tokens(&tokens);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::SetApnsEnvironment {
+                    token,
+                    environment,
+                    response,
+                } => {
+                    let result = self.registry.set_apns_environment(&token, environment);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::VoipTokensForPrimaryAddress { address, response } => {
+                    let result = self.registry.voip_tokens_for_primary_address(&address);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::RegistrationForToken { token, response } => {
+                    let result = self.registry.get_registration(&token);
+                    let _ = response.send(result);
+                }
             }
         }
         info!("[PushRegistry] actor stopped");
@@ -1534,6 +1680,8 @@ impl PushRegistryHandle {
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
         watch_only_addresses: Vec<String>,
+        apns_environment: Option<String>,
+        voip_token: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1550,6 +1698,8 @@ impl PushRegistryHandle {
             kaposts_pubkey,
             kaposts_notify,
             watch_only_addresses,
+            apns_environment,
+            voip_token,
             wallet_binding,
             device_key_binding,
             response,
@@ -1571,6 +1721,8 @@ impl PushRegistryHandle {
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
         watch_only_addresses: Vec<String>,
+        apns_environment: Option<String>,
+        voip_token: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1586,6 +1738,8 @@ impl PushRegistryHandle {
             kaposts_pubkey,
             kaposts_notify,
             watch_only_addresses,
+            apns_environment,
+            voip_token,
             wallet_binding,
             device_key_binding,
             response,
@@ -1716,6 +1870,47 @@ impl PushRegistryHandle {
         .await
     }
 
+    /// Map each token to its stored APNs environment ("sandbox"/"production"/None-if-unknown).
+    pub async fn apns_environment_for_tokens(
+        &self,
+        tokens: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, Option<String>>> {
+        self.request(|response| PushRegistryCommand::ApnsEnvironmentForTokens { tokens, response })
+            .await
+    }
+
+    /// Persist a discovered APNs environment ("sandbox"/"production") onto a device record.
+    pub async fn set_apns_environment(
+        &self,
+        token: String,
+        environment: String,
+    ) -> anyhow::Result<()> {
+        self.request(|response| PushRegistryCommand::SetApnsEnvironment {
+            token,
+            environment,
+            response,
+        })
+        .await
+    }
+
+    /// VoIP-capable devices registered under primary `address`: `(device_token, voip_token, env)`.
+    pub async fn voip_tokens_for_primary_address(
+        &self,
+        address: String,
+    ) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+        self.request(|response| PushRegistryCommand::VoipTokensForPrimaryAddress { address, response })
+            .await
+    }
+
+    /// Fetch a full device registration by (already-normalized) token.
+    pub async fn registration_for_token(
+        &self,
+        token: String,
+    ) -> anyhow::Result<Option<DeviceRegistration>> {
+        self.request(|response| PushRegistryCommand::RegistrationForToken { token, response })
+            .await
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
     }
@@ -1793,6 +1988,13 @@ pub struct DeviceRegistration {
     // Normalized canonical bech32; stored on the value only (feeds the in-memory watch-only index).
     #[serde(default)]
     pub watch_only_addresses: Vec<String>,
+    // Per-device APNs environment ("sandbox"/"production"). None = unknown; the dispatcher learns
+    // and caches it via the BadDeviceToken host-fallback. Stored on the value only.
+    #[serde(default)]
+    pub apns_environment: Option<String>,
+    // VoIP (PushKit) push token for incoming-call rings. None = no VoIP capability. Value only.
+    #[serde(default)]
+    pub voip_token: Option<String>,
     #[serde(default)]
     pub app_attest_key_id: Option<String>,
     #[serde(default)]
@@ -1906,12 +2108,16 @@ impl PushDispatcher {
 
     async fn handle_extension_event(&mut self, event: ExtensionPushEvent) -> anyhow::Result<()> {
         // Dedup by tx id (same 60s window as chat pushes) so a broadcast/KaPosts action that the
-        // processor happens to reprocess doesn't fire a second push.
+        // processor happens to reprocess doesn't fire a second push. VoIP rings carry no tx id and
+        // are intentional, so they bypass the dedup gate.
         let event_tx_id = match &event {
-            ExtensionPushEvent::Broadcast { tx_id, .. } => tx_id.clone(),
-            ExtensionPushEvent::KaPosts { tx_id, .. } => tx_id.clone(),
+            ExtensionPushEvent::Broadcast { tx_id, .. }
+            | ExtensionPushEvent::KaPosts { tx_id, .. } => Some(tx_id.clone()),
+            ExtensionPushEvent::Ring { .. } => None,
         };
-        if !self.sent_cache.mark_seen(&event_tx_id) {
+        if let Some(event_tx_id) = &event_tx_id
+            && !self.sent_cache.mark_seen(event_tx_id)
+        {
             self.metrics.increment_push_dedup_dropped_total();
             return Ok(());
         }
@@ -1944,8 +2150,10 @@ impl PushDispatcher {
                         },
                         sound: "default",
                         thread_id: format!("broadcast:{channel}"),
+                        mutable_content: None,
                     },
                     post_id: None,
+                    kaposts_kind: None,
                 };
                 // FCM data-only mirror (Android builds the notification from these fields).
                 let mut data = BTreeMap::new();
@@ -1963,6 +2171,7 @@ impl PushDispatcher {
                 target_pubkey,
                 actor_pubkey,
                 action,
+                kaposts_kind,
                 subtitle,
                 body,
                 post_id,
@@ -2004,8 +2213,11 @@ impl PushDispatcher {
                         },
                         sound: "default",
                         thread_id: "kaposts".to_string(),
+                        // Let the client's notification-service extension mutate the payload.
+                        mutable_content: Some(1),
                     },
                     post_id: post_id.clone(),
+                    kaposts_kind: kaposts_kind.clone(),
                 };
                 let mut data = BTreeMap::new();
                 data.insert("type".to_string(), "kaposts".to_string());
@@ -2017,7 +2229,72 @@ impl PushDispatcher {
                 if let Some(post_id) = post_id {
                     data.insert("post_id".to_string(), post_id);
                 }
+                if let Some(kaposts_kind) = kaposts_kind {
+                    data.insert("kaposts_kind".to_string(), kaposts_kind);
+                }
                 self.deliver(tokens, &payload, &data, Some(&tx_id), true).await;
+                Ok(())
+            }
+            ExtensionPushEvent::Ring {
+                to_address,
+                call_id,
+                kind,
+                video,
+                sender,
+                timestamp,
+                payload,
+            } => {
+                // VoIP rings need APNs (PushKit). No FCM equivalent here.
+                let Some(apns) = self.apns.as_ref() else {
+                    return Ok(());
+                };
+                let devices = self
+                    .registry
+                    .voip_tokens_for_primary_address(to_address)
+                    .await
+                    .unwrap_or_default();
+                if devices.is_empty() {
+                    return Ok(());
+                }
+                let ring = RingPayload {
+                    call_id,
+                    kind,
+                    video,
+                    sender,
+                    timestamp,
+                    payload,
+                };
+                let ring_ref = &ring;
+                let results = stream::iter(devices.into_iter().map(
+                    |(device_token, voip_token, env)| {
+                        // Route by the device's known environment; unknown => default host.
+                        let endpoint = match env.as_deref() {
+                            Some("sandbox") => ApnsClient::SANDBOX,
+                            Some("production") => ApnsClient::PROD,
+                            _ => apns.endpoint.as_str(),
+                        }
+                        .to_string();
+                        async move {
+                            let result = apns.send_voip(&endpoint, &voip_token, ring_ref).await;
+                            (device_token, result)
+                        }
+                    },
+                ))
+                .buffer_unordered(APNS_SEND_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+                for (device_token, result) in results {
+                    match result {
+                        Ok(()) => self.metrics.increment_push_sent_ok_total(),
+                        Err(err) => {
+                            let tail = device_token
+                                .get(device_token.len().saturating_sub(8)..)
+                                .unwrap_or(&device_token);
+                            self.metrics.increment_push_send_failed_total();
+                            warn!("[Push][VoIP] ring failed for device ...{}: {}", tail, err);
+                        }
+                    }
+                }
                 Ok(())
             }
         }
@@ -2070,8 +2347,10 @@ impl PushDispatcher {
                     },
                     sound: "default",
                     thread_id: thread_id.clone(),
+                    mutable_content: None,
                 },
                 post_id: None,
+                kaposts_kind: None,
             };
             let mut data = BTreeMap::new();
             data.insert("type".to_string(), "address_activity".to_string());
@@ -2161,14 +2440,36 @@ impl PushDispatcher {
         if let Some(apns) = self.apns.as_ref()
             && !apns_tokens.is_empty()
         {
-            let results = stream::iter(apns_tokens.into_iter().map(|token| async move {
-                let result = apns.send_collapsible(&token, apns_payload, collapse_id).await;
-                (token, DeliveryOutcome::from_apns(result))
+            // Per-device host routing: known environment => that host directly; unknown => default
+            // host with a one-shot fallback to the other host on BadDeviceToken (learn-and-cache).
+            let envs = self
+                .registry
+                .apns_environment_for_tokens(apns_tokens.clone())
+                .await
+                .unwrap_or_default();
+            let results = stream::iter(apns_tokens.into_iter().map(|token| {
+                let stored_env = envs.get(&token).cloned().flatten();
+                async move {
+                    let (result, learned) = apns
+                        .send_routed(&token, apns_payload, collapse_id, stored_env.as_deref())
+                        .await;
+                    (token, DeliveryOutcome::from_apns(result), learned)
+                }
             }))
             .buffer_unordered(APNS_SEND_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
-            outcomes.extend(results);
+            for (token, outcome, learned) in results {
+                if let Some(env) = learned {
+                    let token_tail = token.get(token.len().saturating_sub(8)..).unwrap_or(&token);
+                    info!(
+                        "[Push][APNs] learned environment {} for token ...{}",
+                        env, token_tail
+                    );
+                    let _ = self.registry.set_apns_environment(token.clone(), env).await;
+                }
+                outcomes.push((token, outcome));
+            }
         }
 
         if let Some(fcm) = self.fcm.as_ref()
@@ -2497,6 +2798,9 @@ struct ExtensionPayload {
     aps: ExtensionAps,
     #[serde(rename = "postId", skip_serializing_if = "Option::is_none")]
     post_id: Option<String>,
+    // KaPosts fine kind (vote_up/reply/quote/...) forwarded to the client; omitted for broadcasts.
+    #[serde(rename = "kaposts_kind", skip_serializing_if = "Option::is_none")]
+    kaposts_kind: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2505,6 +2809,9 @@ struct ExtensionAps {
     sound: &'static str,
     #[serde(rename = "thread-id")]
     thread_id: String,
+    // KaPosts sets this so the client's notification-service extension can mutate the payload.
+    #[serde(rename = "mutable-content", skip_serializing_if = "Option::is_none")]
+    mutable_content: Option<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2513,6 +2820,18 @@ struct ExtensionAlert {
     #[serde(skip_serializing_if = "Option::is_none")]
     subtitle: Option<String>,
     body: String,
+}
+
+// VoIP ring payload — top-level custom keys only (PushKit delivers the raw dictionary; there is no
+// `aps` alert). The client uses these to present the incoming-call UI via CallKit.
+#[derive(Debug, Serialize)]
+struct RingPayload {
+    call_id: String,
+    kind: String,
+    video: bool,
+    sender: String,
+    timestamp: u64,
+    payload: String,
 }
 
 const MAX_PUSH_PAYLOAD_BYTES: usize = 3_500;
@@ -2608,10 +2927,13 @@ impl std::fmt::Display for ApnsError {
 
 struct ApnsClient {
     client: reqwest::Client,
+    /// Default host (from config) — the global fallback for devices with an unknown environment.
     endpoint: String,
     key_id: String,
     team_id: String,
     topic: String,
+    /// Topic for VoIP (PushKit) pushes — `apns_topic + ".voip"` unless overridden.
+    voip_topic: String,
     key: EncodingKey,
     auth_cache: Mutex<Option<AuthCache>>,
 }
@@ -2628,6 +2950,11 @@ struct ApnsClaims<'a> {
 }
 
 impl ApnsClient {
+    /// Production APNs host.
+    const PROD: &'static str = "https://api.push.apple.com";
+    /// Sandbox (development) APNs host.
+    const SANDBOX: &'static str = "https://api.sandbox.push.apple.com";
+
     fn from_context(context: &IndexerContext) -> anyhow::Result<Self> {
         let config = &context.config;
         let team_id = config
@@ -2647,9 +2974,17 @@ impl ApnsClient {
         let key = EncodingKey::from_ec_pem(key_pem.as_bytes())?;
 
         let endpoint = match config.apns_environment {
-            ApnsEnvironment::Sandbox => "https://api.sandbox.push.apple.com",
-            ApnsEnvironment::Production => "https://api.push.apple.com",
+            ApnsEnvironment::Sandbox => Self::SANDBOX,
+            ApnsEnvironment::Production => Self::PROD,
         };
+
+        // VoIP topic: explicit override, else the alert topic with the ".voip" suffix Apple expects.
+        let voip_topic = config
+            .apns_voip_topic
+            .clone()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| format!("{topic}.voip"));
 
         let client = reqwest::Client::builder().build()?;
 
@@ -2659,6 +2994,7 @@ impl ApnsClient {
             key_id: key_id.clone(),
             team_id: team_id.clone(),
             topic: topic.clone(),
+            voip_topic,
             key,
             auth_cache: Mutex::new(None),
         })
@@ -2690,8 +3026,23 @@ impl ApnsClient {
         Ok(token)
     }
 
+    /// Send an alert push to the default host. Retained for callers that don't route per-device.
+    #[allow(dead_code)]
     async fn send_collapsible<T: Serialize>(
         &self,
+        token: &str,
+        payload: &T,
+        collapse_id: Option<&str>,
+    ) -> Result<(), ApnsError> {
+        self.send_collapsible_to(&self.endpoint, token, payload, collapse_id)
+            .await
+    }
+
+    /// Send an alert push to an explicit host. The JWT auth is host-independent, so one client can
+    /// target either the production or sandbox host.
+    async fn send_collapsible_to<T: Serialize>(
+        &self,
+        endpoint: &str,
         token: &str,
         payload: &T,
         collapse_id: Option<&str>,
@@ -2700,7 +3051,7 @@ impl ApnsClient {
             .auth_token()
             .await
             .map_err(|err| ApnsError::Auth(err.to_string()))?;
-        let url = format!("{}/3/device/{}", self.endpoint, token);
+        let url = format!("{}/3/device/{}", endpoint, token);
         let mut req = self
             .client
             .post(url)
@@ -2747,12 +3098,106 @@ impl ApnsClient {
                 "[Push][APNs] device token rejected: reason={} status={} endpoint={} topic={} token=...{}",
                 reason.as_deref().unwrap_or("unknown"),
                 status,
-                self.endpoint,
+                endpoint,
                 self.topic,
                 token_tail,
             );
         }
 
+        match reason.as_deref() {
+            Some("Unregistered") => Err(ApnsError::Unregistered),
+            Some("BadDeviceToken") | Some("DeviceTokenNotForTopic") => Err(ApnsError::InvalidToken),
+            _ => Err(ApnsError::Rejected { status, reason }),
+        }
+    }
+
+    /// Route an alert push to the right host and self-heal an unknown environment. If `stored_env`
+    /// is known ("sandbox"/"production") it targets that host directly (no fallback). If unknown, it
+    /// sends to the default host first; on InvalidToken (BadDeviceToken) it retries the OTHER host
+    /// once, and if that succeeds it returns the learned environment so the caller can cache it.
+    async fn send_routed<T: Serialize>(
+        &self,
+        token: &str,
+        payload: &T,
+        collapse_id: Option<&str>,
+        stored_env: Option<&str>,
+    ) -> (Result<(), ApnsError>, Option<String>) {
+        match stored_env {
+            Some("sandbox") => (
+                self.send_collapsible_to(Self::SANDBOX, token, payload, collapse_id)
+                    .await,
+                None,
+            ),
+            Some("production") => (
+                self.send_collapsible_to(Self::PROD, token, payload, collapse_id)
+                    .await,
+                None,
+            ),
+            _ => {
+                let first = self
+                    .send_collapsible_to(&self.endpoint, token, payload, collapse_id)
+                    .await;
+                if !matches!(first, Err(ApnsError::InvalidToken)) {
+                    return (first, None);
+                }
+                // The default host rejected the token — try the other host once.
+                let (other_host, other_env) = if self.endpoint == Self::SANDBOX {
+                    (Self::PROD, "production")
+                } else {
+                    (Self::SANDBOX, "sandbox")
+                };
+                match self
+                    .send_collapsible_to(other_host, token, payload, collapse_id)
+                    .await
+                {
+                    Ok(()) => (Ok(()), Some(other_env.to_string())),
+                    // Both hosts rejected it — report the original InvalidToken.
+                    Err(_) => (first, None),
+                }
+            }
+        }
+    }
+
+    /// Send a VoIP (PushKit) push to an explicit host. Same JWT auth as alerts, but the VoIP topic
+    /// and the `voip` push type; high priority; no expiry (ring immediately or drop). No collapse.
+    async fn send_voip<T: Serialize>(
+        &self,
+        endpoint: &str,
+        token: &str,
+        payload: &T,
+    ) -> Result<(), ApnsError> {
+        let auth_token = self
+            .auth_token()
+            .await
+            .map_err(|err| ApnsError::Auth(err.to_string()))?;
+        let url = format!("{}/3/device/{}", endpoint, token);
+        let resp = self
+            .client
+            .post(url)
+            .header("authorization", format!("bearer {}", auth_token))
+            .header("apns-topic", &self.voip_topic)
+            .header("apns-push-type", "voip")
+            .header("apns-priority", "10")
+            .header("apns-expiration", "0")
+            .json(payload)
+            .send()
+            .await
+            .map_err(ApnsError::Request)?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        let reason = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string())
+            });
         match reason.as_deref() {
             Some("Unregistered") => Err(ApnsError::Unregistered),
             Some("BadDeviceToken") | Some("DeviceTokenNotForTopic") => Err(ApnsError::InvalidToken),
@@ -3199,6 +3644,22 @@ fn normalize_kaposts_pubkey(pubkey: Option<String>) -> Option<String> {
     }
 }
 
+/// Canonicalize a requested APNs environment to the stored form: "development"/"sandbox" =>
+/// "sandbox", "production" => "production", anything else (incl. empty) => None (unknown).
+fn normalize_apns_environment(env: Option<String>) -> Option<String> {
+    match env?.trim().to_ascii_lowercase().as_str() {
+        "development" | "sandbox" => Some("sandbox".to_string()),
+        "production" => Some("production".to_string()),
+        _ => None,
+    }
+}
+
+/// Trim a VoIP token; empty => None.
+fn normalize_voip_token(token: Option<String>) -> Option<String> {
+    let token = token?.trim().to_string();
+    if token.is_empty() { None } else { Some(token) }
+}
+
 const LAST_SEEN_BASE_REFRESH_SECS: u64 = 3 * 24 * 60 * 60;
 const LAST_SEEN_JITTER_MIN_SECS: u64 = 24 * 60 * 60;
 const LAST_SEEN_JITTER_MAX_SECS: u64 = 72 * 60 * 60;
@@ -3458,6 +3919,8 @@ mod tests {
                 vec![],
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .expect("registration succeeds");
@@ -3499,6 +3962,8 @@ mod tests {
                 None,
                 None,
                 vec![],
+                None,
+                None,
                 None,
                 None,
             )

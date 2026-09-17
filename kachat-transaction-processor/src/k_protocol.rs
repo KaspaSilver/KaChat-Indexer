@@ -1522,6 +1522,7 @@ impl KProtocolProcessor {
                 &target,
                 &k_reply.sender_pubkey,
                 "comment",
+                "reply",
                 body,
                 Some(k_reply.post_id.clone()),
                 transaction_id,
@@ -1671,15 +1672,19 @@ impl KProtocolProcessor {
         if let Some(target) = self.content_author_pubkey(&k_quote.content_id).await {
             let snippet =
                 crate::push_notify::kachat_snippet(&k_quote.base64_encoded_message).unwrap_or_default();
-            let body = if snippet.is_empty() {
+            // Empty snippet = a plain repost; otherwise the user quoted with commentary.
+            let is_plain_repost = snippet.is_empty();
+            let body = if is_plain_repost {
                 "reposted your post".to_string()
             } else {
                 format!("quoted your post: {snippet}")
             };
+            let kind = if is_plain_repost { "repost" } else { "quote" };
             crate::push_notify::notify_kaposts(
                 &target,
                 &k_quote.sender_pubkey,
                 "repost",
+                kind,
                 body,
                 Some(k_quote.content_id.clone()),
                 transaction_id,
@@ -1892,16 +1897,17 @@ impl KProtocolProcessor {
         // KaPosts push: notify the post's author of an up/down vote (skip unvote). Carries the
         // action kind so the push service can honor the like/dislike toggles.
         let vote_action = match vote_for_log.as_str() {
-            "upvote" => Some(("like", "liked your post")),
-            "downvote" => Some(("dislike", "disliked your post")),
+            "upvote" => Some(("like", "vote_up", "liked your post")),
+            "downvote" => Some(("dislike", "vote_down", "disliked your post")),
             _ => None,
         };
-        if let Some((action, vote_body)) = vote_action {
+        if let Some((action, kind, vote_body)) = vote_action {
             if let Some(target) = self.content_author_pubkey(&post_id_for_log).await {
                 crate::push_notify::notify_kaposts(
                     &target,
                     &k_vote.sender_pubkey,
                     action,
+                    kind,
                     vote_body.to_string(),
                     Some(post_id_for_log.clone()),
                     transaction_id,
@@ -2223,6 +2229,7 @@ impl KProtocolProcessor {
                     crate::push_notify::notify_kaposts(
                         &k_follow.followed_user_pubkey,
                         &k_follow.sender_pubkey,
+                        "follow",
                         "follow",
                         "followed you".to_string(),
                         None,

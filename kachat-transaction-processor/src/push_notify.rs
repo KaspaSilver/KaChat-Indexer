@@ -142,12 +142,15 @@ pub fn notify_broadcast(channel: &str, sender_address: &str, body: String, tx_id
 
 /// Notify the push service of a KaPosts action targeting `target_pubkey`'s content.
 /// `actor_pubkey` is the actor (skipped from delivery); `post_id` is the target content txid.
-/// `action` is the machine-readable kind (`like`/`dislike`/`comment`/`repost`/`follow`) so the
-/// push service can honor per-type KaPosts notification toggles (kaposts_notify).
+/// `action` is the coarse machine-readable kind (`like`/`dislike`/`comment`/`repost`/`follow`) so
+/// the push service can honor per-type KaPosts notification toggles (kaposts_notify). `kind` is the
+/// FINE kind (`vote_up`/`vote_down`/`reply`/`quote`/`repost`/`follow`/`mention`) forwarded to the
+/// client for precise rendering.
 pub fn notify_kaposts(
     target_pubkey: &str,
     actor_pubkey: &str,
     action: &str,
+    kind: &str,
     body: String,
     post_id: Option<String>,
     tx_id: &str,
@@ -168,6 +171,7 @@ pub fn notify_kaposts(
             "target_pubkey": target_pubkey.trim().to_lowercase(),
             "actor_pubkey": actor_pubkey.trim().to_lowercase(),
             "action": action,
+            "kaposts_kind": kind,
             "subtitle": subtitle,
             "body": body,
             "post_id": post_id,

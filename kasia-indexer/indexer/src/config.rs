@@ -16,6 +16,9 @@ pub struct IndexerConfig {
     pub apns_topic: Option<String>,
     pub apns_key_path: Option<PathBuf>,
     pub apns_key: Option<String>,
+    // Optional explicit VoIP APNs topic. If unset, derived as `apns_topic + ".voip"`.
+    #[serde(default)]
+    pub apns_voip_topic: Option<String>,
     #[serde(default = "default_apns_environment")]
     pub apns_environment: ApnsEnvironment,
     #[serde(default = "default_push_auth_mode")]
