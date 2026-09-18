@@ -148,6 +148,19 @@ struct SearchUsersQuery {
     searched_user_nickname: Option<String>,
 }
 
+/// Fork addition (§5.6): unified content/people search — GET /search?q=&type=posts|users.
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+    #[serde(rename = "type")]
+    search_type: Option<String>,
+    #[serde(rename = "requesterPubkey")]
+    requester_pubkey: Option<String>,
+    limit: Option<u32>,
+    before: Option<String>,
+    after: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GetMentionsQuery {
     user: Option<String>,
@@ -302,6 +315,8 @@ impl WebServer {
             .route("/get-most-active-users", get(handle_get_most_active_users))
             .route("/get-users-count", get(handle_get_users_count))
             .route("/search-users", get(handle_search_users))
+            // Unified content/people search (§5.6). type=posts (default) | users.
+            .route("/search", get(handle_search))
             .route("/get-user-details", get(handle_get_user_details))
             .route("/get-followed-users", get(handle_get_followed_users))
             .route("/get-users-following", get(handle_get_users_following))
@@ -1208,6 +1223,126 @@ async fn handle_get_most_active_users(
                 Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)))
             }
         },
+    }
+}
+
+/// GET /search?q=&type=posts|users (§5.6). Dispatches to post-content or user search; both share
+/// the feed's pagination envelope. Returns a raw JSON value since the two payloads differ in shape.
+async fn handle_search(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<SearchQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+
+    // Required: non-empty q.
+    let query_text = params.q.unwrap_or_default();
+    let query_text = query_text.trim();
+    if query_text.is_empty() {
+        let error = ApiError {
+            error: "Missing required parameter: q".to_string(),
+            code: "MISSING_PARAMETER".to_string(),
+        };
+        return Err((StatusCode::BAD_REQUEST, Json(error)));
+    }
+
+    // Required: limit in 1..=100.
+    let limit = match params.limit {
+        Some(limit) if (1..=100).contains(&limit) => limit,
+        Some(_) => {
+            let error = ApiError {
+                error: "Limit parameter must be between 1 and 100".to_string(),
+                code: "INVALID_LIMIT".to_string(),
+            };
+            return Err((StatusCode::BAD_REQUEST, Json(error)));
+        }
+        None => {
+            let error = ApiError {
+                error: "Missing required parameter: limit".to_string(),
+                code: "MISSING_PARAMETER".to_string(),
+            };
+            return Err((StatusCode::BAD_REQUEST, Json(error)));
+        }
+    };
+
+    // Required: requesterPubkey (used for per-viewer decoration).
+    let requester_pubkey = match params.requester_pubkey {
+        Some(pubkey) => pubkey,
+        None => {
+            let error = ApiError {
+                error: "Missing required parameter: requesterPubkey".to_string(),
+                code: "MISSING_PARAMETER".to_string(),
+            };
+            return Err((StatusCode::BAD_REQUEST, Json(error)));
+        }
+    };
+
+    let search_type = params
+        .search_type
+        .unwrap_or_else(|| "posts".to_string())
+        .to_lowercase();
+
+    let result = match search_type.as_str() {
+        "users" => {
+            app_state
+                .api_handlers
+                .search_users_posted_paginated(
+                    &requester_pubkey,
+                    query_text,
+                    limit,
+                    params.before,
+                    params.after,
+                )
+                .await
+        }
+        // Default and "posts" both search post/quote content.
+        _ => {
+            app_state
+                .api_handlers
+                .search_posts_paginated(
+                    &requester_pubkey,
+                    query_text,
+                    limit,
+                    params.before,
+                    params.after,
+                )
+                .await
+        }
+    };
+
+    match result {
+        Ok(response_json) => match serde_json::from_str::<serde_json::Value>(&response_json) {
+            Ok(value) => Ok(Json(value)),
+            Err(err) => {
+                log_error!("Failed to parse search response: {}", err);
+                let error = ApiError {
+                    error: "Internal server error".to_string(),
+                    code: "INTERNAL_ERROR".to_string(),
+                };
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)))
+            }
+        },
+        Err(error_json) => {
+            let (status_code, api_error) = match serde_json::from_str::<ApiError>(&error_json) {
+                Ok(api_error) => {
+                    let status = match api_error.code.as_str() {
+                        "DATABASE_ERROR" | "SERIALIZATION_ERROR" => {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                        _ => StatusCode::BAD_REQUEST,
+                    };
+                    (status, api_error)
+                }
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiError {
+                        error: "Internal server error".to_string(),
+                        code: "INTERNAL_ERROR".to_string(),
+                    },
+                ),
+            };
+            Err((status_code, Json(api_error)))
+        }
     }
 }
 

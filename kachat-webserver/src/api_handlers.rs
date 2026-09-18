@@ -535,6 +535,148 @@ impl ApiHandlers {
         }
     }
 
+    /// GET /search?type=posts — full-text search over post/quote content (§5.6).
+    /// Same enriched KPost shape and pagination envelope as the global feed.
+    pub async fn search_posts_paginated(
+        &self,
+        requester_pubkey: &str,
+        query_text: &str,
+        limit: u32,
+        before: Option<String>,
+        after: Option<String>,
+    ) -> Result<String, String> {
+        if let Err(e) = Self::validate_requester_pubkey(requester_pubkey) {
+            return Err(self.create_error_response(&e, "INVALID_USER_KEY"));
+        }
+
+        let options = QueryOptions {
+            limit: Some(limit as u64),
+            before,
+            after,
+            sort_descending: true,
+        };
+
+        let posts_result = match self.db.search_posts(requester_pubkey, query_text, options).await {
+            Ok(result) => result,
+            Err(err) => {
+                log_error!("Database error while searching posts: {}", err);
+                return Err(self.create_error_response(
+                    "Internal server error during database query",
+                    "DATABASE_ERROR",
+                ));
+            }
+        };
+
+        let all_posts: Vec<ServerPost> = posts_result
+            .items
+            .iter()
+            .map(|post_record| {
+                ServerPost::from_enriched_k_post_record_with_block_status(post_record, false)
+            })
+            .collect();
+
+        let response = PaginatedPostsResponse {
+            posts: all_posts,
+            pagination: posts_result.pagination,
+        };
+
+        match serde_json::to_string(&response) {
+            Ok(json) => Ok(json),
+            Err(err) => {
+                log_error!("Failed to serialize search posts response: {}", err);
+                Err(self.create_error_response(
+                    "Internal server error during serialization",
+                    "SERIALIZATION_ERROR",
+                ))
+            }
+        }
+    }
+
+    /// GET /search?type=users — search users by nickname/pubkey who have posted at least once
+    /// (§5.6). `contentsCount` carries each user's post count. Same envelope as get-users.
+    pub async fn search_users_posted_paginated(
+        &self,
+        requester_pubkey: &str,
+        query_text: &str,
+        limit: u32,
+        before: Option<String>,
+        after: Option<String>,
+    ) -> Result<String, String> {
+        if let Err(e) = Self::validate_requester_pubkey(requester_pubkey) {
+            return Err(self.create_error_response(&e, "INVALID_USER_KEY"));
+        }
+
+        let options = QueryOptions {
+            limit: Some(limit as u64),
+            before,
+            after,
+            sort_descending: true,
+        };
+
+        let result = match self
+            .db
+            .search_users_posted(requester_pubkey, query_text, options)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                log_error!("Database error while searching users: {}", err);
+                return Err(self.create_error_response(
+                    "Internal server error during database query",
+                    "DATABASE_ERROR",
+                ));
+            }
+        };
+
+        let mut all_posts = Vec::new();
+        for (k_broadcast_record, is_blocked, is_followed, post_count) in result.items {
+            let mut server_user_post = ServerUserPost::from_k_broadcast_record_with_block_status(
+                &k_broadcast_record,
+                is_blocked,
+            );
+            server_user_post.user_nickname = Some(k_broadcast_record.base64_encoded_nickname);
+            server_user_post.user_profile_image = k_broadcast_record.base64_encoded_profile_image;
+            server_user_post.followed_user = Some(is_followed);
+            server_user_post.contents_count = Some(post_count);
+            all_posts.push(server_user_post);
+        }
+
+        let response = PaginatedUsersResponse {
+            posts: all_posts,
+            pagination: result.pagination,
+        };
+
+        match serde_json::to_string(&response) {
+            Ok(json) => Ok(json),
+            Err(err) => {
+                log_error!("Failed to serialize search users response: {}", err);
+                Err(self.create_error_response(
+                    "Internal server error during serialization",
+                    "SERIALIZATION_ERROR",
+                ))
+            }
+        }
+    }
+
+    /// Shared requester-pubkey validation (66 hex chars, compressed 02/03 prefix).
+    fn validate_requester_pubkey(requester_pubkey: &str) -> Result<(), String> {
+        if requester_pubkey.len() != 66 {
+            return Err("Invalid requester public key format. Must be 66 hex characters.".to_string());
+        }
+        if !requester_pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(
+                "Invalid requester public key format. Must contain only hex characters.".to_string(),
+            );
+        }
+        if !requester_pubkey.starts_with("02") && !requester_pubkey.starts_with("03") {
+            return Err(
+                "Invalid requester public key format. Compressed public key must start with 02 or 03."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// GET /get-replies with pagination (Post Replies Mode)
     /// Fetch paginated replies for a specific post with cursor-based pagination and voting status
     pub async fn get_replies_paginated(

@@ -131,6 +131,25 @@ pub trait DatabaseInterface: Send + Sync {
         options: QueryOptions,
     ) -> DatabaseResult<PaginatedResult<KPostRecord>>;
 
+    // Fork addition (§5.6 search): full-text search over post/quote content. Matches `query_text`
+    // (case-insensitive substring) against the decoded message of every indexed post/quote,
+    // newest first, in the same enriched KPostRecord shape as get_all_posts. Blocked users excluded.
+    async fn search_posts(
+        &self,
+        requester_pubkey: &str,
+        query_text: &str,
+        options: QueryOptions,
+    ) -> DatabaseResult<PaginatedResult<KPostRecord>>;
+
+    // Fork addition (§5.6 search): search users whose nickname or pubkey matches `query_text` AND
+    // who have posted at least once (product requirement). The trailing i64 is the user's post count.
+    async fn search_users_posted(
+        &self,
+        requester_pubkey: &str,
+        query_text: &str,
+        options: QueryOptions,
+    ) -> DatabaseResult<PaginatedResult<(KBroadcastRecord, bool, bool, i64)>>;
+
     // NEW: k_contents table - Get contents mentioning a specific user using unified content table (excludes blocked users)
     async fn get_contents_mentioning_user(
         &self,
