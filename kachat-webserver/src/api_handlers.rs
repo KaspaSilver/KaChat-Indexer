@@ -1006,6 +1006,7 @@ impl ApiHandlers {
                         content_type: Some("vote".to_string()),
                         is_quote: false,
                         quote: None,
+                        edited_at: None,
                     }
                 }
             })
@@ -1205,6 +1206,7 @@ impl ApiHandlers {
                 content_type: Some("vote".to_string()),
                 is_quote: false,
                 quote: None,
+                edited_at: None,
             },
         }
     }
@@ -1372,6 +1374,7 @@ impl ApiHandlers {
                             content_type: Some("vote".to_string()),
                             is_quote: false,
                             quote: None,
+                            edited_at: None,
                         };
                         PostDetailsResponse { post: server_vote }
                     }

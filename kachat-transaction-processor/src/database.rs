@@ -171,6 +171,10 @@ impl KDbClient {
         // Step 1d: idempotently ensure the post-translation cache table exists (fork addition).
         self.create_translations_schema().await?;
 
+        // Step 1e: idempotently ensure the edit support (fork addition, §5.7) exists — the
+        // `edited_at` column on k_contents and the k_edits audit table.
+        self.create_edits_schema().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -234,6 +238,41 @@ impl KDbClient {
                 PRIMARY KEY (post_id, target_lang)
             )
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Edit support (fork addition, §5.7). A post/reply/quote can be edited by its author within
+    /// 2h of posting; the chain keeps every version but the indexer's interpretation is the latest
+    /// accepted edit. We apply edits in place: `k_contents.base64_encoded_message` is overwritten
+    /// and `edited_at` (edit's chain time, ms) is stamped, so ALL read paths (feeds, replies,
+    /// threads, search, and quote embeds) serve the edited text with no query changes. `k_edits`
+    /// keeps an audit row per accepted edit and dedupes re-processing via a UNIQUE signature.
+    /// Index name is intentionally NOT `idx_k_%` so the schema verifier's K-index count is unaffected.
+    async fn create_edits_schema(&self) -> Result<()> {
+        sqlx::query("ALTER TABLE k_contents ADD COLUMN IF NOT EXISTS edited_at BIGINT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS k_edits (
+                id BIGSERIAL PRIMARY KEY,
+                transaction_id BYTEA UNIQUE NOT NULL,
+                block_time BIGINT NOT NULL,
+                sender_pubkey BYTEA NOT NULL,
+                sender_signature BYTEA UNIQUE NOT NULL,
+                post_id BYTEA NOT NULL,
+                base64_encoded_message TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_edits_post_time \
+             ON k_edits(post_id, block_time DESC, id DESC)",
         )
         .execute(&self.pool)
         .await?;

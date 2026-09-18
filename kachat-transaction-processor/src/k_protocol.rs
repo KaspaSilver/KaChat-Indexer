@@ -3,6 +3,7 @@ use crate::hashtag_extractor::extract_hashtags_from_base64;
 use anyhow::Result;
 use hex;
 use serde_json;
+use sqlx::Row;
 use tracing::{error, info, warn};
 
 // Kaspa message signature verification imports (from main K-indexer)
@@ -270,6 +271,9 @@ pub enum KActionType {
     /// Removal counter-action: withdraws the sender's prior quote/repost of a content id
     /// (fork addition; mirrors follow/unfollow). Payload: unquote:pubkey:sig:content_id
     Unquote(KUnquote),
+    /// Author edit of their own post/reply/quote within the 2h window (fork addition, §5.7).
+    /// Payload: edit:pubkey:sig:post_id:b64_message:mentions_json
+    Edit(KEdit),
     Unknown(String),
 }
 
@@ -285,6 +289,7 @@ fn action_sender_pubkey(action: &KActionType) -> Option<&str> {
         KActionType::Quote(k) => Some(&k.sender_pubkey),
         KActionType::Follow(k) => Some(&k.sender_pubkey),
         KActionType::Unquote(k) => Some(&k.sender_pubkey),
+        KActionType::Edit(k) => Some(&k.sender_pubkey),
         KActionType::Unknown(_) => None,
     }
 }
@@ -362,6 +367,21 @@ pub struct KUnquote {
     pub sender_pubkey: String,
     pub sender_signature: String,
     pub content_id: String,
+}
+
+/// Author edit of an existing post/reply/quote (fork addition, §5.7). The signature is over
+/// `edit:<post_id>:<b64_message>:<mentions_json>` (note the literal `edit:` prefix inside the
+/// signed string — it prevents a reply to your own post being replayed as an edit of it).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct KEdit {
+    pub sender_pubkey: String,
+    pub sender_signature: String,
+    pub post_id: String,
+    pub base64_encoded_message: String,
+    pub mentioned_pubkeys: Vec<String>,
+    /// Whether the payload arrived under the canonical `kchat:1:` prefix (vs legacy `k:1:`).
+    #[serde(default)]
+    pub is_kchat: bool,
 }
 
 // Database record structures for PostgreSQL
@@ -778,6 +798,45 @@ impl KProtocolProcessor {
                     content_id: parts[3].to_string(),
                 }))
             }
+            "edit" => {
+                // Expected format: edit:sender_pubkey:sender_signature:post_id:base64_message:mentioned_pubkeys_json
+                if parts.len() < 5 {
+                    return Err(anyhow::anyhow!(
+                        "Invalid edit format: expected at least 5 parts, got {}",
+                        parts.len()
+                    ));
+                }
+
+                let sender_pubkey = parts[1].to_string();
+                let sender_signature = parts[2].to_string();
+                let post_id = parts[3].to_string();
+                let base64_encoded_message = parts[4].to_string();
+
+                let mentioned_pubkeys: Vec<String> = if parts.len() > 5 {
+                    let mentioned_pubkeys_json = parts[5];
+                    match serde_json::from_str::<Vec<String>>(mentioned_pubkeys_json) {
+                        Ok(pubkeys) => pubkeys,
+                        Err(err) => {
+                            error!(
+                                "Failed to parse edit mentioned_pubkeys JSON '{}': {}",
+                                mentioned_pubkeys_json, err
+                            );
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                Ok(KActionType::Edit(KEdit {
+                    sender_pubkey,
+                    sender_signature,
+                    post_id,
+                    base64_encoded_message,
+                    mentioned_pubkeys,
+                    is_kchat,
+                }))
+            }
             _ => Ok(KActionType::Unknown(action.to_string())),
         }
     }
@@ -883,6 +942,10 @@ impl KProtocolProcessor {
                 }
                 KActionType::Unquote(k_unquote) => {
                     self.process_k_unquote_in_database(transaction, k_unquote)
+                        .await?;
+                }
+                KActionType::Edit(k_edit) => {
+                    self.process_k_edit_in_database(transaction, k_edit)
                         .await?;
                 }
                 KActionType::Unknown(action) => {
@@ -1970,6 +2033,167 @@ impl KProtocolProcessor {
             hex::encode(&sender_pubkey_bytes),
             k_unquote.content_id,
             delete_result.rows_affected()
+        );
+        Ok(())
+    }
+
+    /// Process a K edit action (§5.7). Applies an author's edit of their own post/reply/quote in
+    /// place: overwrites the stored message and stamps `edited_at`, so every read path serves the
+    /// edited text. Accepted only when the signature verifies, the target is already indexed and
+    /// authored by the same pubkey, and the edit's chain time is within 2h of the ORIGINAL post.
+    /// The latest edit by chain time wins (monotonic guard), so out-of-order delivery is safe.
+    pub async fn process_k_edit_in_database(
+        &self,
+        transaction: &Transaction,
+        k_edit: KEdit,
+    ) -> Result<()> {
+        let transaction_id = &transaction.transaction_id;
+
+        // Signature is over "edit:<post_id>:<b64_message>:<mentions_json>" (literal edit: prefix).
+        let mentions_json =
+            serde_json::to_string(&k_edit.mentioned_pubkeys).unwrap_or_else(|_| "[]".to_string());
+        let message_to_verify = format!(
+            "edit:{}:{}:{}",
+            k_edit.post_id, k_edit.base64_encoded_message, mentions_json
+        );
+        if !self.verify_kaspa_signature(
+            &message_to_verify,
+            &k_edit.sender_signature,
+            &k_edit.sender_pubkey,
+        ) {
+            error!("Invalid signature for edit {}, skipping", transaction_id);
+            return Ok(());
+        }
+
+        // Same content policy as a post: must decode, be non-empty once the marker is stripped,
+        // and pass the text-only (anti-image-art) gate.
+        if let Err(reason) = validate_kachat_message(&k_edit.base64_encoded_message) {
+            info!("Edit {} rejected ({}), skipping", transaction_id, reason);
+            return Ok(());
+        }
+
+        let edit_block_time = transaction.block_time.unwrap_or(0);
+        let transaction_id_bytes = hex::decode(transaction_id)?;
+        let sender_pubkey_bytes = hex::decode(&k_edit.sender_pubkey)?;
+        let sender_signature_bytes = hex::decode(&k_edit.sender_signature)?;
+        let post_id_bytes = hex::decode(&k_edit.post_id)?;
+
+        // Look up the target content: original author, original chain time, and content type.
+        let original = sqlx::query(
+            "SELECT sender_pubkey, block_time, content_type FROM k_contents WHERE transaction_id = $1 LIMIT 1",
+        )
+        .bind(&post_id_bytes)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        let original = match original {
+            Some(row) => row,
+            None => {
+                info!(
+                    "Edit {} targets content {} that is not indexed, skipping",
+                    transaction_id, k_edit.post_id
+                );
+                return Ok(());
+            }
+        };
+        let original_author: Vec<u8> = original.get("sender_pubkey");
+        let original_time: i64 = original.get("block_time");
+        let content_type: String = original.get("content_type");
+
+        // Author-only: an author edits only their own content.
+        if original_author != sender_pubkey_bytes {
+            info!(
+                "Edit {} is not by the author of {}, skipping",
+                transaction_id, k_edit.post_id
+            );
+            return Ok(());
+        }
+
+        // Two-hour window, measured from the ORIGINAL post's time (not a previous edit's).
+        const EDIT_WINDOW_MS: i64 = 7_200_000;
+        if edit_block_time > original_time + EDIT_WINDOW_MS {
+            info!(
+                "Edit {} is past the 2h window for {}, skipping",
+                transaction_id, k_edit.post_id
+            );
+            return Ok(());
+        }
+
+        // Audit row + idempotency (re-processing the same edit tx is a no-op).
+        sqlx::query(
+            r#"
+            INSERT INTO k_edits (
+                transaction_id, block_time, sender_pubkey, sender_signature, post_id, base64_encoded_message
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (sender_signature) DO NOTHING
+            "#,
+        )
+        .bind(&transaction_id_bytes)
+        .bind(edit_block_time)
+        .bind(&sender_pubkey_bytes)
+        .bind(&sender_signature_bytes)
+        .bind(&post_id_bytes)
+        .bind(&k_edit.base64_encoded_message)
+        .execute(&self.db_pool)
+        .await?;
+
+        // Apply in place. The guard keeps the latest edit by chain time regardless of the order
+        // edits are processed in (COALESCE(edited_at, block_time) is the current effective time).
+        let applied = sqlx::query(
+            r#"
+            UPDATE k_contents
+            SET base64_encoded_message = $1, edited_at = $2
+            WHERE transaction_id = $3 AND ($2 > COALESCE(edited_at, block_time))
+            "#,
+        )
+        .bind(&k_edit.base64_encoded_message)
+        .bind(edit_block_time)
+        .bind(&post_id_bytes)
+        .execute(&self.db_pool)
+        .await?;
+
+        if applied.rows_affected() == 0 {
+            info!(
+                "Edit {} superseded by a newer edit of {}, keeping the newer version",
+                transaction_id, k_edit.post_id
+            );
+            return Ok(());
+        }
+
+        // Mentions added by the edit (kchat only): notify newly-added pubkeys, but do not
+        // re-notify anyone the content already mentioned.
+        if k_edit.is_kchat && !k_edit.mentioned_pubkeys.is_empty() {
+            let mention_type = match content_type.as_str() {
+                "reply" => "reply",
+                "quote" => "quote",
+                _ => "post",
+            };
+            for pk_hex in &k_edit.mentioned_pubkeys {
+                let pk_bytes = match hex::decode(pk_hex) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                sqlx::query(
+                    r#"
+                    INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey)
+                    SELECT $1, $2, $3, $4, $5
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM k_mentions WHERE content_id = $1 AND mentioned_pubkey = $3
+                    )
+                    "#,
+                )
+                .bind(&post_id_bytes)
+                .bind(mention_type)
+                .bind(&pk_bytes)
+                .bind(edit_block_time)
+                .bind(&sender_pubkey_bytes)
+                .execute(&self.db_pool)
+                .await?;
+            }
+        }
+
+        info!(
+            "Applied K edit: {} edited {} (editedAt {})",
+            transaction_id, k_edit.post_id, edit_block_time
         );
         Ok(())
     }

@@ -62,6 +62,8 @@ pub struct KPostRecord {
     pub base64_encoded_message: String,
     pub mentioned_pubkeys: Vec<String>,
     pub content_type: Option<String>,
+    // §5.7: chain time (ms) of the latest accepted edit, or None if never edited.
+    pub edited_at: Option<i64>,
     // Optional enriched metadata fields for optimized queries
     pub replies_count: Option<u64>,
     pub up_votes_count: Option<u64>,
@@ -100,6 +102,8 @@ pub struct KReplyRecord {
     pub base64_encoded_message: String,
     pub mentioned_pubkeys: Vec<String>,
     pub content_type: Option<String>,
+    // §5.7: chain time (ms) of the latest accepted edit, or None if never edited.
+    pub edited_at: Option<i64>,
     // Optional enriched metadata fields for optimized queries
     pub replies_count: Option<u64>,
     pub up_votes_count: Option<u64>,
@@ -213,6 +217,10 @@ pub struct ServerPost {
     pub is_quote: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quote: Option<QuoteData>,
+    /// §5.7: chain time (ms) of the latest accepted edit; absent when the content was never edited.
+    /// The apps show an "edited" label when this is present.
+    #[serde(rename = "editedAt", skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -451,6 +459,7 @@ impl ServerPost {
             content_type: record.content_type.clone(),
             is_quote,
             quote,
+            edited_at: record.edited_at.map(|v| v as u64),
         }
     }
 }
@@ -646,6 +655,7 @@ impl ServerReply {
             content_type: record.content_type.clone(),
             is_quote: false,
             quote: None,
+            edited_at: record.edited_at.map(|v| v as u64),
         }
     }
 }

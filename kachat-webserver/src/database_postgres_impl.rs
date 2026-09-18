@@ -343,6 +343,7 @@ impl PostgresDbManager {
                 sender_signature: Self::encode_bytes_to_hex(&sender_signature),
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
+                edited_at: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -362,6 +363,8 @@ impl PostgresDbManager {
             posts.push(post_record);
         }
 
+        // §5.7: fill editedAt for this page (non-fatal).
+        let _ = self.enrich_edited_at(&mut posts).await;
         let pagination = self.create_compound_pagination_metadata(&posts, limit as u32, has_more);
 
         Ok(PaginatedResult {
@@ -441,6 +444,72 @@ impl HasCompoundCursor for EngagementActor {
 
     fn get_id(&self) -> i64 {
         self.id
+    }
+}
+
+/// §5.7: records whose `editedAt` can be filled in from k_contents.edited_at after fetch.
+trait HasEditedAt {
+    fn edit_tx_id(&self) -> &str;
+    fn set_edited_at(&mut self, value: Option<i64>);
+}
+
+impl HasEditedAt for KPostRecord {
+    fn edit_tx_id(&self) -> &str {
+        &self.transaction_id
+    }
+    fn set_edited_at(&mut self, value: Option<i64>) {
+        self.edited_at = value;
+    }
+}
+
+impl HasEditedAt for KReplyRecord {
+    fn edit_tx_id(&self) -> &str {
+        &self.transaction_id
+    }
+    fn set_edited_at(&mut self, value: Option<i64>) {
+        self.edited_at = value;
+    }
+}
+
+impl PostgresDbManager {
+    /// Fill `edited_at` on a page of records with one batched lookup (§5.7). Content is served
+    /// edited regardless (the message is overwritten in place at ingest); this only surfaces the
+    /// "edited" timestamp/label. Failures are swallowed by callers so a cold-start race (column
+    /// not yet added) simply leaves editedAt absent.
+    async fn enrich_edited_at<T: HasEditedAt>(&self, items: &mut [T]) -> DatabaseResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = items
+            .iter()
+            .filter_map(|it| hex::decode(it.edit_tx_id()).ok())
+            .collect();
+        let rows = sqlx::query(
+            "SELECT encode(transaction_id, 'hex') as tid, edited_at \
+             FROM k_contents WHERE transaction_id = ANY($1::bytea[]) AND edited_at IS NOT NULL",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let tid: String = row.get("tid");
+            let edited_at: Option<i64> = row.get("edited_at");
+            if let Some(v) = edited_at {
+                map.insert(tid, v);
+            }
+        }
+        for it in items.iter_mut() {
+            if let Some(v) = map.get(it.edit_tx_id()) {
+                it.set_edited_at(Some(*v));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1826,6 +1895,7 @@ impl DatabaseInterface for PostgresDbManager {
                 sender_signature: Self::encode_bytes_to_hex(&sender_signature),
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_raw,
+                edited_at: None,
                 content_type: row.try_get("content_type").ok(),
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 up_votes_count: Some(row.get::<i64, _>("up_votes_count") as u64),
@@ -1846,6 +1916,8 @@ impl DatabaseInterface for PostgresDbManager {
         }
 
         // Build pagination metadata
+        // §5.7: fill editedAt for this page (non-fatal).
+        let _ = self.enrich_edited_at(&mut items).await;
         let pagination = if items.is_empty() {
             PaginationMetadata {
                 has_more: false,
@@ -2113,6 +2185,7 @@ impl DatabaseInterface for PostgresDbManager {
                         sender_signature: Self::encode_bytes_to_hex(&sender_signature),
                         base64_encoded_message: row.get("base64_encoded_message"),
                         mentioned_pubkeys: mentioned_pubkeys_array,
+                        edited_at: None,
                         content_type: None,
                         replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                         quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -2150,6 +2223,7 @@ impl DatabaseInterface for PostgresDbManager {
                         post_id: post_id_hex,
                         base64_encoded_message: row.get("base64_encoded_message"),
                         mentioned_pubkeys: mentioned_pubkeys_array,
+                        edited_at: None,
                         content_type: None,
                         replies_count: Some(0), // Replies don't have replies
                         quotes_count: None,
@@ -2485,6 +2559,7 @@ impl DatabaseInterface for PostgresDbManager {
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys,
                     content_type: None,
+                    edited_at: None,
                     replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                     quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
                     up_votes_count: Some(row.get::<i64, _>("up_votes_count") as u64),
@@ -2529,6 +2604,7 @@ impl DatabaseInterface for PostgresDbManager {
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys,
                     content_type: None,
+                    edited_at: None,
                     replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                     quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
                     up_votes_count: Some(row.get::<i64, _>("up_votes_count") as u64),
@@ -2548,6 +2624,18 @@ impl DatabaseInterface for PostgresDbManager {
                 )));
             }
         };
+
+        // §5.7: fill editedAt on the single record (non-fatal). Powers get-post / get-thread.
+        let mut content_record = content_record;
+        match &mut content_record {
+            ContentRecord::Post(r) => {
+                let _ = self.enrich_edited_at(std::slice::from_mut(r)).await;
+            }
+            ContentRecord::Reply(r) => {
+                let _ = self.enrich_edited_at(std::slice::from_mut(r)).await;
+            }
+            ContentRecord::Vote(_) => {}
+        }
 
         Ok(Some((content_record, is_blocked)))
     }
@@ -2759,6 +2847,7 @@ impl DatabaseInterface for PostgresDbManager {
                 post_id: Self::encode_bytes_to_hex(&referenced_content_id),
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
+                edited_at: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -2773,6 +2862,8 @@ impl DatabaseInterface for PostgresDbManager {
             replies.push(reply_record);
         }
 
+        // §5.7: fill editedAt for this page (non-fatal).
+        let _ = self.enrich_edited_at(&mut replies).await;
         let pagination = self.create_compound_pagination_metadata(&replies, limit as u32, has_more);
 
         Ok(PaginatedResult {
@@ -2988,6 +3079,7 @@ impl DatabaseInterface for PostgresDbManager {
                 post_id: Self::encode_bytes_to_hex(&referenced_content_id),
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
+                edited_at: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -3002,6 +3094,8 @@ impl DatabaseInterface for PostgresDbManager {
             replies.push(reply_record);
         }
 
+        // §5.7: fill editedAt for this page (non-fatal).
+        let _ = self.enrich_edited_at(&mut replies).await;
         let pagination = self.create_compound_pagination_metadata(&replies, limit as u32, has_more);
 
         Ok(PaginatedResult {
@@ -3235,6 +3329,7 @@ impl DatabaseInterface for PostgresDbManager {
                 sender_signature: Self::encode_bytes_to_hex(&sender_signature),
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
+                edited_at: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -3254,6 +3349,8 @@ impl DatabaseInterface for PostgresDbManager {
             posts.push(post_record);
         }
 
+        // §5.7: fill editedAt for this page (non-fatal).
+        let _ = self.enrich_edited_at(&mut posts).await;
         let pagination = self.create_compound_pagination_metadata(&posts, limit as u32, has_more);
 
         Ok(PaginatedResult {
@@ -3526,6 +3623,7 @@ impl DatabaseInterface for PostgresDbManager {
                     sender_signature: String::new(),
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys: Vec::new(),
+                    edited_at: None,
                     content_type: None,
                     up_votes_count: None,
                     down_votes_count: None,
@@ -3561,6 +3659,7 @@ impl DatabaseInterface for PostgresDbManager {
                     sender_signature: String::new(),
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys: Vec::new(),
+                    edited_at: None,
                     content_type: None,
                     up_votes_count: None,
                     down_votes_count: None,
@@ -3593,6 +3692,7 @@ impl DatabaseInterface for PostgresDbManager {
                     post_id: String::new(),
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys: Vec::new(),
+                    edited_at: None,
                     content_type: None,
                     replies_count: None,
                     quotes_count: None,
@@ -3914,6 +4014,7 @@ impl DatabaseInterface for PostgresDbManager {
                 sender_signature: Self::encode_bytes_to_hex(&sender_signature),
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_raw,
+                edited_at: None,
                 content_type: row.try_get("content_type").ok(),
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 up_votes_count: Some(row.get::<i64, _>("up_votes_count") as u64),
@@ -3934,6 +4035,8 @@ impl DatabaseInterface for PostgresDbManager {
         }
 
         // Build pagination metadata
+        // §5.7: fill editedAt for this page (non-fatal).
+        let _ = self.enrich_edited_at(&mut items).await;
         let pagination = if items.is_empty() {
             PaginationMetadata {
                 has_more: false,
