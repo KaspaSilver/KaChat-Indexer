@@ -274,6 +274,9 @@ pub enum KActionType {
     /// Author edit of their own post/reply/quote within the 2h window (fork addition, §5.7).
     /// Payload: edit:pubkey:sig:post_id:b64_message:mentions_json
     Edit(KEdit),
+    /// Author delete of their own post/reply/quote, any time (fork addition, §5.8).
+    /// Payload: delete:pubkey:sig:post_id
+    Delete(KDelete),
     Unknown(String),
 }
 
@@ -290,6 +293,7 @@ fn action_sender_pubkey(action: &KActionType) -> Option<&str> {
         KActionType::Follow(k) => Some(&k.sender_pubkey),
         KActionType::Unquote(k) => Some(&k.sender_pubkey),
         KActionType::Edit(k) => Some(&k.sender_pubkey),
+        KActionType::Delete(k) => Some(&k.sender_pubkey),
         KActionType::Unknown(_) => None,
     }
 }
@@ -382,6 +386,16 @@ pub struct KEdit {
     /// Whether the payload arrived under the canonical `kchat:1:` prefix (vs legacy `k:1:`).
     #[serde(default)]
     pub is_kchat: bool,
+}
+
+/// Author delete of an existing post/reply/quote (fork addition, §5.8). The signature is over
+/// `delete:<post_id>` (literal `delete:` prefix, mirroring the edit action, so a bare-content-id
+/// signature from another action can't be replayed as a delete).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct KDelete {
+    pub sender_pubkey: String,
+    pub sender_signature: String,
+    pub post_id: String,
 }
 
 // Database record structures for PostgreSQL
@@ -837,6 +851,21 @@ impl KProtocolProcessor {
                     is_kchat,
                 }))
             }
+            "delete" => {
+                // Expected format: delete:sender_pubkey:sender_signature:post_id
+                if parts.len() < 4 {
+                    return Err(anyhow::anyhow!(
+                        "Invalid delete format: expected 4 parts, got {}",
+                        parts.len()
+                    ));
+                }
+
+                Ok(KActionType::Delete(KDelete {
+                    sender_pubkey: parts[1].to_string(),
+                    sender_signature: parts[2].to_string(),
+                    post_id: parts[3].to_string(),
+                }))
+            }
             _ => Ok(KActionType::Unknown(action.to_string())),
         }
     }
@@ -946,6 +975,10 @@ impl KProtocolProcessor {
                 }
                 KActionType::Edit(k_edit) => {
                     self.process_k_edit_in_database(transaction, k_edit)
+                        .await?;
+                }
+                KActionType::Delete(k_delete) => {
+                    self.process_k_delete_in_database(transaction, k_delete)
                         .await?;
                 }
                 KActionType::Unknown(action) => {
@@ -2194,6 +2227,109 @@ impl KProtocolProcessor {
         info!(
             "Applied K edit: {} edited {} (editedAt {})",
             transaction_id, k_edit.post_id, edit_block_time
+        );
+        Ok(())
+    }
+
+    /// Process a K delete action (§5.8). Hard-deletes the author's own post/reply/quote so it
+    /// disappears from every read path; parent replies/quotes counts recompute live, votes on it
+    /// are removed, and a quote whose target is gone renders without its embed. Accepted only when
+    /// the signature verifies and the target is indexed and authored by the same pubkey (an
+    /// unindexed target is skipped, since ownership can't be verified — rejecting forged deletes).
+    /// No time window. Hard-delete is idempotent (a re-seen delete tx removes nothing).
+    pub async fn process_k_delete_in_database(
+        &self,
+        transaction: &Transaction,
+        k_delete: KDelete,
+    ) -> Result<()> {
+        let transaction_id = &transaction.transaction_id;
+
+        // Signature is over "delete:<post_id>" (literal delete: prefix).
+        let message_to_verify = format!("delete:{}", k_delete.post_id);
+        if !self.verify_kaspa_signature(
+            &message_to_verify,
+            &k_delete.sender_signature,
+            &k_delete.sender_pubkey,
+        ) {
+            error!("Invalid signature for delete {}, skipping", transaction_id);
+            return Ok(());
+        }
+
+        let block_time = transaction.block_time.unwrap_or(0);
+        let transaction_id_bytes = hex::decode(transaction_id)?;
+        let sender_pubkey_bytes = hex::decode(&k_delete.sender_pubkey)?;
+        let post_id_bytes = hex::decode(&k_delete.post_id)?;
+
+        // The target must be indexed and authored by the deleter. Without the original row we can't
+        // verify ownership, so an unindexed target is skipped (rejects a forged delete of another's
+        // post).
+        let original = sqlx::query(
+            "SELECT sender_pubkey FROM k_contents WHERE transaction_id = $1 LIMIT 1",
+        )
+        .bind(&post_id_bytes)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        let original = match original {
+            Some(row) => row,
+            None => {
+                info!(
+                    "Delete {} targets content {} that is not indexed, skipping",
+                    transaction_id, k_delete.post_id
+                );
+                return Ok(());
+            }
+        };
+        let original_author: Vec<u8> = original.get("sender_pubkey");
+        if original_author != sender_pubkey_bytes {
+            info!(
+                "Delete {} is not by the author of {}, skipping",
+                transaction_id, k_delete.post_id
+            );
+            return Ok(());
+        }
+
+        // Audit tombstone (one row per deleted content id).
+        sqlx::query(
+            r#"
+            INSERT INTO k_deletes (transaction_id, block_time, sender_pubkey, post_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (post_id) DO NOTHING
+            "#,
+        )
+        .bind(&transaction_id_bytes)
+        .bind(block_time)
+        .bind(&sender_pubkey_bytes)
+        .bind(&post_id_bytes)
+        .execute(&self.db_pool)
+        .await?;
+
+        // Hard-delete the content row plus its votes and mentions in one statement. Replies TO the
+        // post and quotes OF it are left in place (their authors own them); their counts recompute
+        // live and a quote whose target is gone renders without the embed. k_hashtags cascade on
+        // the k_contents delete. Data-modifying CTEs all execute regardless of reference.
+        let deleted = sqlx::query(
+            r#"
+            WITH del_content AS (
+                DELETE FROM k_contents
+                WHERE transaction_id = $1 AND sender_pubkey = $2
+                RETURNING transaction_id
+            ),
+            del_votes AS (
+                DELETE FROM k_votes WHERE post_id = $1 RETURNING id
+            )
+            DELETE FROM k_mentions WHERE content_id = $1
+            "#,
+        )
+        .bind(&post_id_bytes)
+        .bind(&sender_pubkey_bytes)
+        .execute(&self.db_pool)
+        .await?;
+
+        info!(
+            "Applied K delete: {} deleted {} (removed content + votes + {} mention rows)",
+            transaction_id,
+            k_delete.post_id,
+            deleted.rows_affected()
         );
         Ok(())
     }

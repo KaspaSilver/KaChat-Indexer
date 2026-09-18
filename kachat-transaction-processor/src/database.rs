@@ -175,6 +175,9 @@ impl KDbClient {
         // `edited_at` column on k_contents and the k_edits audit table.
         self.create_edits_schema().await?;
 
+        // Step 1f: idempotently ensure the delete audit table (fork addition, §5.8) exists.
+        self.create_deletes_schema().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -276,6 +279,32 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Delete audit tombstone (fork addition, §5.8). An author can delete their own
+    /// post/reply/quote at any time; the processor hard-deletes the k_contents row (and its votes
+    /// and mentions — hashtags cascade), so it vanishes from every read path and live counts drop
+    /// on their own. This table records each accepted deletion (one row per deleted content id) for
+    /// audit; hard-delete is naturally idempotent (a re-seen delete tx removes 0 rows). Index name
+    /// is intentionally NOT `idx_k_%` so the schema verifier's K-index count is unaffected.
+    async fn create_deletes_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS k_deletes (
+                id BIGSERIAL PRIMARY KEY,
+                transaction_id BYTEA UNIQUE NOT NULL,
+                block_time BIGINT NOT NULL,
+                sender_pubkey BYTEA NOT NULL,
+                post_id BYTEA UNIQUE NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_deletes_post ON k_deletes(post_id)")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
