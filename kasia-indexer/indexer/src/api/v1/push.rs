@@ -127,6 +127,18 @@ pub struct PushRegistrationRequest {
     #[serde(default)]
     #[serde(rename = "kaposts_notify")]
     pub kaposts_notify: Option<KaPostsNotify>,
+    // The app (4.1+) actually sends these as FLAT top-level booleans, not a nested object. Accept
+    // both; the flat fields win when present. Absent = unchanged/default. See resolve_kaposts_notify.
+    #[serde(default)]
+    pub kaposts_notify_likes: Option<bool>,
+    #[serde(default)]
+    pub kaposts_notify_dislikes: Option<bool>,
+    #[serde(default)]
+    pub kaposts_notify_comments: Option<bool>,
+    #[serde(default)]
+    pub kaposts_notify_reposts: Option<bool>,
+    #[serde(default)]
+    pub kaposts_notify_follows: Option<bool>,
     // Address Activity: the device's own receive addresses to be notified about incoming KAS.
     // Absent = feature off for this device. Kept out of the auth preimage, like other optional
     // fields added after LegacyV1.
@@ -176,6 +188,17 @@ pub struct PushUpdateRequest {
     #[serde(default)]
     #[serde(rename = "kaposts_notify")]
     pub kaposts_notify: Option<KaPostsNotify>,
+    // FLAT per-kind booleans (what the app actually sends, 4.1+). Accept both shapes.
+    #[serde(default)]
+    pub kaposts_notify_likes: Option<bool>,
+    #[serde(default)]
+    pub kaposts_notify_dislikes: Option<bool>,
+    #[serde(default)]
+    pub kaposts_notify_comments: Option<bool>,
+    #[serde(default)]
+    pub kaposts_notify_reposts: Option<bool>,
+    #[serde(default)]
+    pub kaposts_notify_follows: Option<bool>,
     // Address Activity: the device's own receive addresses to be notified about incoming KAS.
     // Absent = feature off for this device. Kept out of the auth preimage, like other optional
     // fields added after LegacyV1.
@@ -405,6 +428,42 @@ async fn create_challenge(
     }))
 }
 
+/// Resolve the effective per-kind KaPosts toggles from the two shapes the clients use: a nested
+/// `kaposts_notify` object (rare) and the FLAT `kaposts_notify_*` booleans the app actually sends
+/// (4.1+). Flat fields win when present; a missing flat falls back to the nested value (or the
+/// default of enabled). All flat fields absent and no nested object → None (old client → notify all).
+fn resolve_kaposts_notify(
+    nested: Option<KaPostsNotify>,
+    likes: Option<bool>,
+    dislikes: Option<bool>,
+    comments: Option<bool>,
+    reposts: Option<bool>,
+    follows: Option<bool>,
+) -> Option<KaPostsNotify> {
+    let any_flat = likes.is_some()
+        || dislikes.is_some()
+        || comments.is_some()
+        || reposts.is_some()
+        || follows.is_some();
+    if !any_flat {
+        return nested;
+    }
+    let base = nested.unwrap_or(KaPostsNotify {
+        likes: true,
+        dislikes: true,
+        reposts: true,
+        comments: true,
+        follows: true,
+    });
+    Some(KaPostsNotify {
+        likes: likes.unwrap_or(base.likes),
+        dislikes: dislikes.unwrap_or(base.dislikes),
+        comments: comments.unwrap_or(base.comments),
+        reposts: reposts.unwrap_or(base.reposts),
+        follows: follows.unwrap_or(base.follows),
+    })
+}
+
 #[utoipa::path(
     post,
     path = "/v1/push/register",
@@ -454,6 +513,21 @@ async fn register_device(
         }
     };
 
+    let kaposts_notify = resolve_kaposts_notify(
+        payload.kaposts_notify,
+        payload.kaposts_notify_likes,
+        payload.kaposts_notify_dislikes,
+        payload.kaposts_notify_comments,
+        payload.kaposts_notify_reposts,
+        payload.kaposts_notify_follows,
+    );
+    if let Some(n) = kaposts_notify {
+        tracing::info!(
+            "[Push] register kaposts_notify likes={} dislikes={} comments={} reposts={} follows={}",
+            n.likes, n.dislikes, n.comments, n.reposts, n.follows
+        );
+    }
+
     let result = state
         .registry
         .register(
@@ -467,7 +541,7 @@ async fn register_device(
             payload.watched_broadcast_channels,
             payload.hidden_broadcast_senders,
             payload.kaposts_pubkey,
-            payload.kaposts_notify,
+            kaposts_notify,
             payload.watch_only_addresses,
             payload.apns_environment,
             payload.voip_token,
@@ -523,6 +597,15 @@ async fn update_registration(
         }
     };
 
+    let kaposts_notify = resolve_kaposts_notify(
+        payload.kaposts_notify,
+        payload.kaposts_notify_likes,
+        payload.kaposts_notify_dislikes,
+        payload.kaposts_notify_comments,
+        payload.kaposts_notify_reposts,
+        payload.kaposts_notify_follows,
+    );
+
     let result = state
         .registry
         .update(
@@ -535,7 +618,7 @@ async fn update_registration(
             payload.watched_broadcast_channels,
             payload.hidden_broadcast_senders,
             payload.kaposts_pubkey,
-            payload.kaposts_notify,
+            kaposts_notify,
             payload.watch_only_addresses,
             payload.apns_environment,
             payload.voip_token,
