@@ -207,6 +207,10 @@ pub trait DatabaseInterface: Send + Sync {
         before: Option<i64>,
     ) -> DatabaseResult<(Vec<BroadcastMessage>, bool)>;
 
+    // Chess Tournaments (5.1): every retained chess-arena row for the leaderboard replay, as
+    // (tx_id_hex, sender_address, block_time, content). The engine sorts internally.
+    async fn get_chess_arena_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>>;
+
     // NEW: k_contents table - Get content by ID using unified content table
     async fn get_content_by_id(
         &self,

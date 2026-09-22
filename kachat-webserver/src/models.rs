@@ -620,6 +620,45 @@ pub struct BroadcastsResponse {
     pub has_more: bool,
 }
 
+// Chess Tournaments (5.1) leaderboard — see CHESS_TOURNAMENTS.md §6.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChessPlayerRow {
+    pub address: String,
+    pub wins: i64,
+    pub losses: i64,
+    #[serde(rename = "tournamentsPlayed")]
+    pub tournaments_played: i64,
+    #[serde(rename = "tournamentsWon")]
+    pub tournaments_won: i64,
+    #[serde(rename = "lastPlayedAt")]
+    pub last_played_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChessLeaderboardResponse {
+    pub players: Vec<ChessPlayerRow>,
+    #[serde(rename = "generatedAt")]
+    pub generated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChessTournamentRow {
+    pub id: String,
+    pub status: String,
+    pub players: Vec<String>,
+    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub champion: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChessTournamentsResponse {
+    pub tournaments: Vec<ChessTournamentRow>,
+    #[serde(rename = "generatedAt")]
+    pub generated_at: i64,
+}
+
 impl ServerReply {
     // New method to construct from enriched KReplyRecord with blocking status
     pub fn from_enriched_k_reply_record_with_block_status(

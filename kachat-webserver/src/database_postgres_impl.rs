@@ -2428,6 +2428,28 @@ impl DatabaseInterface for PostgresDbManager {
         Ok((messages, has_more))
     }
 
+    async fn get_chess_arena_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>> {
+        let rows = sqlx::query(
+            "SELECT encode(transaction_id, 'hex') AS tx, sender_address, block_time, content \
+             FROM kachat_broadcasts WHERE channel = 'chess-arena'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch chess arena: {}", e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("tx"),
+                    row.get::<String, _>("sender_address"),
+                    row.get::<i64, _>("block_time"),
+                    row.get::<String, _>("content"),
+                )
+            })
+            .collect())
+    }
+
     async fn get_content_by_id(
         &self,
         content_id: &str,

@@ -26,7 +26,8 @@ use crate::api_handlers::ApiHandlers;
 use crate::config::ServerConfig;
 use crate::database_trait::DatabaseInterface;
 use crate::models::{
-    ApiError, BroadcastsResponse, GetThreadResponse, PaginatedEngagementResponse,
+    ApiError, BroadcastsResponse, ChessLeaderboardResponse, ChessPlayerRow, ChessTournamentRow,
+    ChessTournamentsResponse, GetThreadResponse, PaginatedEngagementResponse,
     PaginatedNotificationsResponse, PaginatedPostsResponse, PaginatedRepliesResponse,
     PaginatedUsersResponse, PostDetailsResponse, ServerUserPost, TrendingHashtagsResponse,
 };
@@ -48,6 +49,74 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Separate per-IP limiter for /translate (requests + posts).
     pub translate_rate_limit_map: crate::translate::TranslateRateLimitMap,
+    /// Chess leaderboard: replaying the whole arena is expensive, so cache the two derived views.
+    pub chess_cache: Arc<RwLock<ChessCache>>,
+}
+
+/// Cached result of one arena replay (see chess.rs). Recomputed when older than CHESS_CACHE_TTL.
+#[derive(Default)]
+pub struct ChessCache {
+    computed_at: Option<Instant>,
+    players: Vec<ChessPlayerRow>,
+    tournaments: Vec<ChessTournamentRow>,
+}
+
+const CHESS_CACHE_TTL: Duration = Duration::from_secs(30);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Serve the leaderboard + lobby from cache, recomputing from the DB when stale.
+async fn chess_snapshot(state: &AppState) -> (Vec<ChessPlayerRow>, Vec<ChessTournamentRow>) {
+    {
+        let cache = state.chess_cache.read().await;
+        if let Some(at) = cache.computed_at {
+            if at.elapsed() < CHESS_CACHE_TTL {
+                return (cache.players.clone(), cache.tournaments.clone());
+            }
+        }
+    }
+    let rows = state.db.get_chess_arena_rows().await.unwrap_or_default();
+    let arena: Vec<crate::chess::ArenaRow> = rows
+        .into_iter()
+        .map(|(tx_id, sender, block_time, content)| crate::chess::ArenaRow {
+            tx_id,
+            sender,
+            block_time,
+            content,
+        })
+        .collect();
+    let (board, lobby) = crate::chess::compute_all(arena);
+    let players: Vec<ChessPlayerRow> = board
+        .into_iter()
+        .map(|r| ChessPlayerRow {
+            address: r.address,
+            wins: r.wins,
+            losses: r.losses,
+            tournaments_played: r.tournaments_played,
+            tournaments_won: r.tournaments_won,
+            last_played_at: r.last_played_at,
+        })
+        .collect();
+    let tournaments: Vec<ChessTournamentRow> = lobby
+        .into_iter()
+        .map(|s| ChessTournamentRow {
+            id: s.id,
+            status: s.status,
+            players: s.players,
+            started_at: s.started_at,
+            champion: s.champion,
+        })
+        .collect();
+    let mut cache = state.chess_cache.write().await;
+    cache.computed_at = Some(Instant::now());
+    cache.players = players.clone();
+    cache.tournaments = tournaments.clone();
+    (players, tournaments)
 }
 
 pub struct WebServer {
@@ -198,6 +267,22 @@ struct GetTrendingHashtagsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ChessLeaderboardQuery {
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChessPlayerQuery {
+    address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChessTournamentsQuery {
+    status: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GetPostDetailsQuery {
     id: Option<String>,
     #[serde(rename = "requesterPubkey")]
@@ -278,6 +363,7 @@ impl WebServer {
             db,
             http,
             translate_rate_limit_map,
+            chess_cache: Arc::new(RwLock::new(ChessCache::default())),
         });
 
         Self { app_state }
@@ -329,6 +415,10 @@ impl WebServer {
             .route("/get-notifications", get(handle_get_notifications))
             .route("/get-hashtag-content", get(handle_get_hashtag_content))
             .route("/get-trending-hashtags", get(handle_get_trending_hashtags))
+            // Chess Tournaments (5.1) leaderboard (§6).
+            .route("/chess/leaderboard", get(handle_chess_leaderboard))
+            .route("/chess/player", get(handle_chess_player))
+            .route("/chess/tournaments", get(handle_chess_tournaments))
             .route("/translate", post(crate::translate::handle_translate))
             .route(
                 "/translate/languages",
@@ -1618,6 +1708,77 @@ async fn handle_get_contents_following(
 /// Fork addition: GET /get-broadcasts?channel=&limit=&before= — KaChat broadcast history for a
 /// tracked channel, served on the same host as KaPosts (same indexer URL). Newest-first.
 /// A missing or unknown channel returns 200 with empty messages (per BROADCAST_INDEXER.md).
+/// GET /chess/leaderboard?limit=100 — the replayed arena leaderboard (§6).
+async fn handle_chess_leaderboard(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<ChessLeaderboardQuery>,
+) -> Result<Json<ChessLeaderboardResponse>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+    let (players, _) = chess_snapshot(&app_state).await;
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000) as usize;
+    Ok(Json(ChessLeaderboardResponse {
+        players: players.into_iter().take(limit).collect(),
+        generated_at: now_ms(),
+    }))
+}
+
+/// GET /chess/player?address= — one player's leaderboard row (zeroed if they've never played).
+async fn handle_chess_player(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<ChessPlayerQuery>,
+) -> Result<Json<ChessPlayerRow>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+    let address = match params.address {
+        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "Missing required parameter: address".to_string(),
+                    code: "MISSING_PARAMETER".to_string(),
+                }),
+            ));
+        }
+    };
+    let (players, _) = chess_snapshot(&app_state).await;
+    let row = players
+        .into_iter()
+        .find(|r| r.address == address)
+        .unwrap_or(ChessPlayerRow {
+            address,
+            wins: 0,
+            losses: 0,
+            tournaments_played: 0,
+            tournaments_won: 0,
+            last_played_at: 0,
+        });
+    Ok(Json(row))
+}
+
+/// GET /chess/tournaments?status=open|live|done&limit= — the precomputed lobby list (§6, optional).
+async fn handle_chess_tournaments(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<ChessTournamentsQuery>,
+) -> Result<Json<ChessTournamentsResponse>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+    let (_, mut tournaments) = chess_snapshot(&app_state).await;
+    if let Some(status) = params.status.as_deref() {
+        let status = status.trim().to_lowercase();
+        if !status.is_empty() {
+            tournaments.retain(|t| t.status == status);
+        }
+    }
+    let limit = params.limit.unwrap_or(200).clamp(1, 1000) as usize;
+    tournaments.truncate(limit);
+    Ok(Json(ChessTournamentsResponse {
+        tournaments,
+        generated_at: now_ms(),
+    }))
+}
+
 async fn handle_get_broadcasts(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(app_state): State<Arc<AppState>>,
