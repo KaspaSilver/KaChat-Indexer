@@ -31,7 +31,7 @@ pub const KACHAT_MARKER: &str = "\u{2060}";
 /// accent-free spellings (espanol/francais/portugues) are deliberate so the names survive
 /// normalization. `kaspa-romania` was added later (server-tracked default).
 /// The *effective* tracked set is `channel_is_tracked` (runtime-configurable — see below).
-pub const DEFAULT_BROADCAST_CHANNELS: [&str; 14] = [
+pub const DEFAULT_BROADCAST_CHANNELS: [&str; 15] = [
     "kaspa",
     "kachat-bugs",
     "kaspa-indonesia",
@@ -46,6 +46,9 @@ pub const DEFAULT_BROADCAST_CHANNELS: [&str; 14] = [
     "kaspa-korean",
     "kaspa-hebrew",
     "kaspa-romania",
+    // 5.1: not a chat room but the transport for Chess Tournaments. Tracking it lets a phone
+    // opening Chess see the last 30 days of tournaments via /get-broadcasts.
+    "chess-arena",
 ];
 
 /// The channels the indexer currently tracks, refreshed from `k_vars['broadcast_channels']` by the
