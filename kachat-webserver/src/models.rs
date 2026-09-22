@@ -626,6 +626,14 @@ pub struct ChessPlayerRow {
     pub address: String,
     pub wins: i64,
     pub losses: i64,
+    #[serde(rename = "duelWins")]
+    pub duel_wins: i64,
+    #[serde(rename = "duelLosses")]
+    pub duel_losses: i64,
+    #[serde(rename = "tournamentGameWins")]
+    pub tournament_game_wins: i64,
+    #[serde(rename = "tournamentGameLosses")]
+    pub tournament_game_losses: i64,
     #[serde(rename = "tournamentsPlayed")]
     pub tournaments_played: i64,
     #[serde(rename = "tournamentsWon")]
@@ -645,6 +653,8 @@ pub struct ChessLeaderboardResponse {
 pub struct ChessTournamentRow {
     pub id: String,
     pub status: String,
+    /// 2 = 1v1 duel, 8 = tournament.
+    pub capacity: i32,
     pub players: Vec<String>,
     #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
     pub started_at: Option<i64>,

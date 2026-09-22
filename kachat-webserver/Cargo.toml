@@ -16,6 +16,7 @@ tower-http = { version = "0.5", features = ["cors", "trace", "timeout", "limit"]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 hex = "0.4"
+sha2 = "0.10"
 clap = { version = "4.5.48", features = ["derive"] }
 axum-prometheus = "0.9"
 base64ct = { version = "1.8.0", features = ["alloc"] }

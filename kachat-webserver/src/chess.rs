@@ -10,6 +10,7 @@
 //! CHESS_TOURNAMENTS.md §2-4, §6.
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -628,8 +629,53 @@ fn revoke_castling_right_if_corner_touched(sq: Square, board: &mut Board) {
 pub const ARENA_CHANNEL: &str = "chess-arena";
 const PLAYER_COUNT: usize = 8;
 const CLOCK_MS: i64 = 5 * 60 * 1000;
-const NAME_MAX_LENGTH: usize = 40;
-const CHAT_MAX_LENGTH: usize = 280;
+/// A seat in a waiting room lasts this long; if the room hasn't filled it's given back.
+const SEAT_TTL_MS: i64 = 5 * 60 * 1000;
+
+const PUBLIC_ID_PREFIX: &str = "public-";
+const DUEL_ID_PREFIX: &str = "duel-";
+/// Creator code for private tournaments (§2.1). `k` on the wire is the first 24 hex chars of
+/// SHA-256(code + ":" + id); the code itself never appears on chain. Keep in sync with the apps'
+/// ChessTournamentCodec.privateCreateCode.
+const PRIVATE_CREATE_CODE: &str = "KACHAT-CHESS";
+
+fn number_of(id: &str, prefix: &str) -> Option<i64> {
+    let rest = id.strip_prefix(prefix)?;
+    let n: i64 = rest.parse().ok()?;
+    if n >= 1 {
+        Some(n)
+    } else {
+        None
+    }
+}
+fn public_number(id: &str) -> Option<i64> {
+    number_of(id, PUBLIC_ID_PREFIX)
+}
+fn duel_number(id: &str) -> Option<i64> {
+    number_of(id, DUEL_ID_PREFIX)
+}
+fn public_id(n: i64) -> String {
+    format!("{}{}", PUBLIC_ID_PREFIX, n)
+}
+fn duel_id(n: i64) -> String {
+    format!("{}{}", DUEL_ID_PREFIX, n)
+}
+fn is_public_id(id: &str) -> bool {
+    public_number(id).is_some() || duel_number(id).is_some()
+}
+
+fn create_key(code: &str, id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}:{}", code.trim().to_uppercase(), id).as_bytes());
+    let hex: String = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+    hex[..24].to_string()
+}
+fn is_valid_create_key(key: Option<&str>, id: &str) -> bool {
+    match key {
+        Some(k) => k == create_key(PRIVATE_CREATE_CODE, id),
+        None => false,
+    }
+}
 
 #[derive(Deserialize)]
 struct TournamentMessage {
@@ -640,6 +686,7 @@ struct TournamentMessage {
     t: String,
     a: String,
     #[serde(default)]
+    #[allow(dead_code)]
     name: Option<String>,
     #[serde(default)]
     g: Option<String>,
@@ -652,7 +699,14 @@ struct TournamentMessage {
     #[serde(default)]
     promo: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     text: Option<String>,
+    /// Private tournaments only: proof the creator holds the creator code.
+    #[serde(default)]
+    k: Option<String>,
+    /// create only: 2 (a 1v1) or 8 (a tournament). Absent = 8.
+    #[serde(default)]
+    p: Option<i64>,
 }
 
 /// Cheap gate first (runs over every arena row), then decode. Mirrors ChessTournamentCodec.decode.
@@ -752,13 +806,33 @@ impl Game {
 
 struct Tournament {
     creator: String,
+    created_at: i64,
+    /// 2 for a 1v1, 8 for a tournament.
+    capacity: i32,
     started_at: Option<i64>,
     cancelled: bool,
     players: Vec<String>,
+    joined_at: HashMap<String, i64>,
     games: HashMap<String, Game>,
     white_count: HashMap<String, i32>,
 }
 impl Tournament {
+    fn is_duel(&self) -> bool {
+        self.capacity == 2
+    }
+    fn rounds(&self) -> i32 {
+        if self.is_duel() {
+            1
+        } else {
+            3
+        }
+    }
+    fn final_game_id(&self) -> String {
+        format!("{}-0", self.rounds())
+    }
+    fn is_full(&self) -> bool {
+        self.players.len() >= self.capacity as usize
+    }
     fn seed_of(&self, address: &str) -> Option<usize> {
         self.players.iter().position(|p| p == address).map(|i| i + 1)
     }
@@ -766,10 +840,13 @@ impl Tournament {
         self.games.get(&format!("{}-{}", round, index))
     }
     fn champion(&self) -> Option<String> {
-        self.games.get("3-0").and_then(|g| g.winner.clone())
+        self.games.get(&self.final_game_id()).and_then(|g| g.winner.clone())
     }
     fn is_finished(&self) -> bool {
-        self.games.get("3-0").map(|g| g.is_over()).unwrap_or(false)
+        self.games
+            .get(&self.final_game_id())
+            .map(|g| g.is_over())
+            .unwrap_or(false)
     }
     fn is_live(&self) -> bool {
         !self.cancelled && self.started_at.is_some() && !self.is_finished()
@@ -779,10 +856,18 @@ impl Tournament {
     }
 }
 
+/// A leaderboard row (§6): two boards' worth of stats per address. `wins`/`losses` are the
+/// combined totals; `duel*` are 1v1 games (duel-N + private 1v1), `tournamentGame*` are games
+/// inside 8-player tournaments, and `tournamentsWon`/`tournamentsPlayed` count 8-player
+/// tournaments only (a 1v1 never counts as a tournament).
 pub struct LeaderboardRow {
     pub address: String,
     pub wins: i64,
     pub losses: i64,
+    pub duel_wins: i64,
+    pub duel_losses: i64,
+    pub tournament_game_wins: i64,
+    pub tournament_game_losses: i64,
     pub tournaments_played: i64,
     pub tournaments_won: i64,
     pub last_played_at: i64,
@@ -812,32 +897,101 @@ fn apply_event(event: ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
     let m = &event.message;
     match m.a.as_str() {
         "create" => {
-            if tournaments.contains_key(&m.t) {
+            // Public rooms are never created by message. A private tournament (8) needs the
+            // creator key; a private 1v1 (2) is open to anyone.
+            let capacity: i32 = if m.p == Some(2) { 2 } else { PLAYER_COUNT as i32 };
+            if tournaments.contains_key(&m.t) || is_public_id(&m.t) {
                 return;
             }
+            if !(capacity == 2 || is_valid_create_key(m.k.as_deref(), &m.t)) {
+                return;
+            }
+            let mut joined = HashMap::new();
+            joined.insert(event.sender.clone(), event.block_time);
             let t = Tournament {
                 creator: event.sender.clone(),
+                created_at: event.block_time,
+                capacity,
                 started_at: None,
                 cancelled: false,
                 players: vec![event.sender.clone()],
+                joined_at: joined,
                 games: HashMap::new(),
                 white_count: HashMap::new(),
             };
             tournaments.insert(m.t.clone(), t);
         }
         "join" => {
+            if !tournaments.contains_key(&m.t) {
+                // The first join opens a public room — but only the NEXT one in the sequence,
+                // once the previous is full, so everyone queues into the same room.
+                let opened = if let Some(number) = public_number(&m.t) {
+                    let prev_full = number == 1
+                        || tournaments.get(&public_id(number - 1)).map(|t| t.is_full()).unwrap_or(false);
+                    if prev_full {
+                        Some(PLAYER_COUNT as i32)
+                    } else {
+                        None
+                    }
+                } else if let Some(number) = duel_number(&m.t) {
+                    let prev_full = number == 1
+                        || tournaments.get(&duel_id(number - 1)).map(|t| t.is_full()).unwrap_or(false);
+                    if prev_full {
+                        Some(2)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let capacity = match opened {
+                    Some(c) => c,
+                    None => return,
+                };
+                tournaments.insert(
+                    m.t.clone(),
+                    Tournament {
+                        creator: event.sender.clone(),
+                        created_at: event.block_time,
+                        capacity,
+                        started_at: None,
+                        cancelled: false,
+                        players: Vec::new(),
+                        joined_at: HashMap::new(),
+                        games: HashMap::new(),
+                        white_count: HashMap::new(),
+                    },
+                );
+            }
             let t = match tournaments.get_mut(&m.t) {
-                Some(t) if t.is_open() && !t.players.contains(&event.sender) => t,
+                Some(t) if t.is_open() => t,
                 _ => return,
             };
+            // Seats that ran out while the room waited are given back first (judged at this
+            // join's block time — the same on every phone), then the joiner is seated.
+            expire_seats(t, event.block_time);
+            if t.players.contains(&event.sender) {
+                return;
+            }
             t.players.push(event.sender.clone());
-            if t.players.len() == PLAYER_COUNT {
+            t.joined_at.insert(event.sender.clone(), event.block_time);
+            if t.players.len() == t.capacity as usize {
                 start(t, event.block_time);
+            }
+        }
+        "leave" => {
+            let t = match tournaments.get_mut(&m.t) {
+                Some(t) if t.is_open() => t,
+                _ => return,
+            };
+            if let Some(idx) = t.players.iter().position(|p| p == &event.sender) {
+                t.players.remove(idx);
+                t.joined_at.remove(&event.sender);
             }
         }
         "cancel" => {
             if let Some(t) = tournaments.get_mut(&m.t) {
-                if t.is_open() && t.creator == event.sender {
+                if t.is_open() && !is_public_id(&m.t) && t.creator == event.sender {
                     t.cancelled = true;
                 }
             }
@@ -852,7 +1006,7 @@ fn apply_event(event: ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
                 Some(g) => g.clone(),
                 None => return,
             };
-            let (winner, over) = {
+            let over = {
                 let game = match t.games.get_mut(&game_id) {
                     Some(g) if !g.is_over() => g,
                     _ => return,
@@ -862,10 +1016,9 @@ fn apply_event(event: ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
                     None => return,
                 };
                 let winner = game.address_of(color.opposite());
-                finish(game, winner.clone(), Outcome::Resignation, event.block_time);
-                (winner, true)
+                finish(game, winner, Outcome::Resignation, event.block_time);
+                true
             };
-            let _ = winner;
             if over {
                 advance_after(t, &game_id);
             }
@@ -884,11 +1037,10 @@ fn apply_event(event: ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
                     Some(g) if !g.is_over() => g,
                     _ => return,
                 };
-                let claimant = match game.color_of(&event.sender) {
-                    Some(c) if c != game.side_to_move() => c,
+                match game.color_of(&event.sender) {
+                    Some(c) if c != game.side_to_move() => {}
                     _ => return,
-                };
-                let _ = claimant;
+                }
                 let elapsed = (event.block_time - game.last_event_at).max(0);
                 let remaining = CLOCK_MS - game.used_ms(game.side_to_move());
                 if elapsed < remaining {
@@ -929,11 +1081,10 @@ fn apply_move(event: &ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
         if game.player_to_move() != event.sender {
             return;
         }
-        let ply = match m.n {
-            Some(n) if n == game.moves_count as i64 + 1 => n,
+        match m.n {
+            Some(n) if n == game.moves_count as i64 + 1 => {}
             _ => return,
-        };
-        let _ = ply;
+        }
         let (from, to) = match (
             m.from.as_deref().and_then(Square::from_algebraic),
             m.to.as_deref().and_then(Square::from_algebraic),
@@ -941,7 +1092,6 @@ fn apply_move(event: &ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
             (Some(f), Some(t)) => (f, t),
             _ => return,
         };
-        // A move after the mover's clock ran out is void: the opponent's claim decides.
         let elapsed = (event.block_time - game.last_event_at).max(0);
         let remaining = CLOCK_MS - game.used_ms(game.side_to_move());
         if elapsed >= remaining {
@@ -1005,12 +1155,34 @@ fn apply_move(event: &ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
     }
 }
 
+fn expire_seats(t: &mut Tournament, time: i64) {
+    let kept: Vec<String> = t
+        .players
+        .iter()
+        .filter(|p| t.joined_at.get(*p).copied().unwrap_or(t.created_at) + SEAT_TTL_MS > time)
+        .cloned()
+        .collect();
+    if kept.len() == t.players.len() {
+        return;
+    }
+    for gone in &t.players {
+        if !kept.contains(gone) {
+            t.joined_at.remove(gone);
+        }
+    }
+    t.players = kept;
+}
+
 // MARK: Bracket
 
 fn start(t: &mut Tournament, time: i64) {
     t.started_at = Some(time);
     let seeds = t.players.clone();
-    let pairs = [(0usize, 7usize), (1, 6), (2, 5), (3, 4)];
+    let pairs: Vec<(usize, usize)> = if t.is_duel() {
+        vec![(0, 1)]
+    } else {
+        vec![(0, 7), (1, 6), (2, 5), (3, 4)]
+    };
     for (index, pair) in pairs.iter().enumerate() {
         let white = seeds[pair.0].clone();
         let black = seeds[pair.1].clone();
@@ -1021,13 +1193,14 @@ fn start(t: &mut Tournament, time: i64) {
 }
 
 fn advance_after(t: &mut Tournament, game_id: &str) {
+    let rounds = t.rounds();
     let (round, index, ended_at) = {
         let game = match t.games.get(game_id) {
             Some(g) => g,
             None => return,
         };
         match game.ended_at {
-            Some(e) if game.round < 3 => (game.round, game.index, e),
+            Some(e) if game.round < rounds => (game.round, game.index, e),
             _ => return,
         }
     };
@@ -1042,7 +1215,6 @@ fn advance_after(t: &mut Tournament, game_id: &str) {
     if t.game(next_round, next_index).is_some() {
         return;
     }
-    // Colours: fewer whites so far gets white; tie -> lower seed.
     let whites_a = *t.white_count.get(&a).unwrap_or(&0);
     let whites_b = *t.white_count.get(&b).unwrap_or(&0);
     let a_is_white = if whites_a != whites_b {
@@ -1131,7 +1303,7 @@ fn position_key(board: &Board) -> String {
     key
 }
 
-// MARK: Leaderboard
+// MARK: Leaderboard (§6 two boards, realized from the reduced state)
 
 fn leaderboard(tournaments: &HashMap<String, Tournament>) -> Vec<LeaderboardRow> {
     let mut rows: HashMap<String, LeaderboardRow> = HashMap::new();
@@ -1140,6 +1312,10 @@ fn leaderboard(tournaments: &HashMap<String, Tournament>) -> Vec<LeaderboardRow>
             address: address.to_string(),
             wins: 0,
             losses: 0,
+            duel_wins: 0,
+            duel_losses: 0,
+            tournament_game_wins: 0,
+            tournament_game_losses: 0,
             tournaments_played: 0,
             tournaments_won: 0,
             last_played_at: 0,
@@ -1150,10 +1326,14 @@ fn leaderboard(tournaments: &HashMap<String, Tournament>) -> Vec<LeaderboardRow>
             Some(s) => s,
             None => continue,
         };
+        let is_duel = t.is_duel();
         for player in &t.players {
             let r = row(&mut rows, player);
-            r.tournaments_played += 1;
             r.last_played_at = r.last_played_at.max(started_at);
+            // A 1v1 is not a tournament — only 8-player brackets count as "played".
+            if !is_duel {
+                r.tournaments_played += 1;
+            }
         }
         for game in t.games.values() {
             if !game.is_over() {
@@ -1173,31 +1353,42 @@ fn leaderboard(tournaments: &HashMap<String, Tournament>) -> Vec<LeaderboardRow>
                 let w = row(&mut rows, &winner);
                 w.wins += 1;
                 w.last_played_at = w.last_played_at.max(ended);
+                if is_duel {
+                    w.duel_wins += 1;
+                } else {
+                    w.tournament_game_wins += 1;
+                }
             }
             {
                 let l = row(&mut rows, &loser);
                 l.losses += 1;
                 l.last_played_at = l.last_played_at.max(ended);
+                if is_duel {
+                    l.duel_losses += 1;
+                } else {
+                    l.tournament_game_losses += 1;
+                }
             }
         }
-        if let Some(champion) = t.champion() {
-            let c = row(&mut rows, &champion);
-            c.tournaments_won += 1;
+        // Tournaments won: champion of an 8-player bracket only.
+        if !is_duel {
+            if let Some(champion) = t.champion() {
+                row(&mut rows, &champion).tournaments_won += 1;
+            }
         }
     }
     let mut out: Vec<LeaderboardRow> = rows.into_values().collect();
+    // §6: most wins first, fewest losses breaking ties (the phone re-sorts each board itself).
     out.sort_by(|a, b| {
-        if a.tournaments_won != b.tournaments_won {
-            return b.tournaments_won.cmp(&a.tournaments_won);
-        }
         if a.wins != b.wins {
             return b.wins.cmp(&a.wins);
+        }
+        if a.losses != b.losses {
+            return a.losses.cmp(&b.losses);
         }
         if a.last_played_at != b.last_played_at {
             return b.last_played_at.cmp(&a.last_played_at);
         }
-        // Not in the Swift key (it leaves full ties arbitrary); added only so the server's output
-        // is stable run-to-run — tied rows have identical stats either way.
         a.address.cmp(&b.address)
     });
     out
@@ -1219,14 +1410,13 @@ pub struct ArenaRow {
 pub struct TournamentSummary {
     pub id: String,
     pub status: String, // "open" | "live" | "done" | "cancelled"
+    pub capacity: i32,  // 2 = 1v1, 8 = tournament
     pub players: Vec<String>,
     pub started_at: Option<i64>,
     pub champion: Option<String>,
 }
 
-/// Replay the arena once and return both the leaderboard and the lobby list. The replay is the
-/// expensive part (legal-move generation per move over the whole arena), so the two derived views
-/// are produced from a single pass and cached together by the caller.
+/// Replay the arena once and return both the leaderboard and the lobby list.
 pub fn compute_all(rows: Vec<ArenaRow>) -> (Vec<LeaderboardRow>, Vec<TournamentSummary>) {
     let events: Vec<ArenaEvent> = rows
         .into_iter()
@@ -1250,13 +1440,13 @@ pub fn compute_all(rows: Vec<ArenaRow>) -> (Vec<LeaderboardRow>, Vec<TournamentS
             TournamentSummary {
                 id,
                 status: status.to_string(),
+                capacity: t.capacity,
                 players: t.players.clone(),
                 started_at: t.started_at,
                 champion: t.champion(),
             }
         })
         .collect();
-    // Newest-started first; stable by id for the not-yet-started ones.
     lobby.sort_by(|a, b| {
         b.started_at
             .unwrap_or(0)
@@ -1278,6 +1468,13 @@ mod tests {
             content: json.to_string(),
         }
     }
+    fn events(rows: Vec<ArenaRow>) -> HashMap<String, Tournament> {
+        reduce(
+            rows.into_iter()
+                .filter_map(|r| arena_event(r.tx_id, r.sender, r.block_time, &r.content))
+                .collect(),
+        )
+    }
 
     #[test]
     fn initial_position_has_twenty_legal_moves() {
@@ -1286,7 +1483,6 @@ mod tests {
 
     #[test]
     fn fools_mate_is_checkmate() {
-        // 1. f3 e5 2. g4 Qh4#
         let mut b = initial_board();
         for (f, t, who) in [
             ("f2", "f3", Color::White),
@@ -1300,27 +1496,70 @@ mod tests {
                 promotion: None,
             };
             assert_eq!(b.side_to_move, who);
-            assert!(is_legal(mv, &b), "move {}-{} should be legal", f, t);
+            assert!(is_legal(mv, &b));
             b = apply(mv, &b);
         }
-        assert!(is_checkmate(&b), "fool's mate should be checkmate");
+        assert!(is_checkmate(&b));
     }
 
     #[test]
-    fn eighth_join_starts_and_seeds_round_one() {
-        let mut rows = vec![ev("t0", "p1", 1, r#"{"type":"chess_t","v":1,"t":"x","a":"create","name":"T"}"#)];
-        for i in 2..=8 {
-            // distinct senders join; txids ascending so order is stable
-            rows.push(ev(&format!("t{}", i), &format!("p{}", i), i as i64, r#"{"type":"chess_t","v":1,"t":"x","a":"join"}"#));
+    fn public_room_fills_and_seeds_round_one() {
+        // A public tournament room: no create; the first join opens it, the 8th starts it.
+        let mut rows = Vec::new();
+        for i in 1..=8 {
+            rows.push(ev(&format!("t{}", i), &format!("p{}", i), i as i64, r#"{"type":"chess_t","v":1,"t":"public-1","a":"join"}"#));
         }
-        let events: Vec<ArenaEvent> = rows.into_iter().filter_map(|r| arena_event(r.tx_id, r.sender, r.block_time, &r.content)).collect();
-        let ts = reduce(events);
-        let t = ts.get("x").expect("tournament exists");
+        let ts = events(rows);
+        let t = ts.get("public-1").expect("room opened");
+        assert_eq!(t.capacity, 8);
         assert_eq!(t.players.len(), 8);
         assert!(t.started_at.is_some());
-        // Round 1: 1v8, 2v7, 3v6, 4v5, lower seed white.
-        let g = t.game(1, 0).unwrap();
+        let g = t.game(1, 0).unwrap(); // seeds 1v8, lower seed white
         assert_eq!(g.white, "p1");
         assert_eq!(g.black, "p8");
+    }
+
+    #[test]
+    fn duel_starts_on_second_join() {
+        let rows = vec![
+            ev("d1", "alice", 1, r#"{"type":"chess_t","v":1,"t":"duel-1","a":"join"}"#),
+            ev("d2", "bob", 2, r#"{"type":"chess_t","v":1,"t":"duel-1","a":"join"}"#),
+        ];
+        let ts = events(rows);
+        let t = ts.get("duel-1").expect("duel opened");
+        assert_eq!(t.capacity, 2);
+        assert!(t.started_at.is_some());
+        let g = t.game(1, 0).unwrap();
+        assert_eq!(g.white, "alice");
+        assert_eq!(g.black, "bob");
+        assert_eq!(t.final_game_id(), "1-0");
+    }
+
+    #[test]
+    fn private_tournament_requires_valid_key() {
+        let id = "abcd2345";
+        let good = create_key(PRIVATE_CREATE_CODE, id);
+        // wrong key -> ignored
+        let bad = ev("c1", "host", 1, &format!(r#"{{"type":"chess_t","v":1,"t":"{}","a":"create","p":8,"k":"deadbeefdeadbeefdeadbeef"}}"#, id));
+        assert!(events(vec![bad]).get(id).is_none());
+        // right key -> opens
+        let ok = ev("c2", "host", 1, &format!(r#"{{"type":"chess_t","v":1,"t":"{}","a":"create","p":8,"k":"{}"}}"#, id, good));
+        let ts = events(vec![ok]);
+        assert!(ts.get(id).is_some());
+        assert_eq!(ts.get(id).unwrap().capacity, 8);
+    }
+
+    #[test]
+    fn stale_seat_expires_before_a_late_join() {
+        // p1 joins at t=0; p2 joins 6 minutes later (past the 5-min seat TTL) -> p1's seat is
+        // gone, so the duel does not start with a ghost.
+        let rows = vec![
+            ev("a", "p1", 0, r#"{"type":"chess_t","v":1,"t":"duel-1","a":"join"}"#),
+            ev("b", "p2", 6 * 60 * 1000, r#"{"type":"chess_t","v":1,"t":"duel-1","a":"join"}"#),
+        ];
+        let t = events(rows);
+        let room = t.get("duel-1").unwrap();
+        assert_eq!(room.players, vec!["p2".to_string()]);
+        assert!(room.started_at.is_none());
     }
 }
