@@ -1327,12 +1327,14 @@ fn leaderboard(tournaments: &HashMap<String, Tournament>) -> Vec<LeaderboardRow>
             None => continue,
         };
         let is_duel = t.is_duel();
-        for player in &t.players {
-            let r = row(&mut rows, player);
-            r.last_played_at = r.last_played_at.max(started_at);
-            // A 1v1 is not a tournament — only 8-player brackets count as "played".
-            if !is_duel {
+        // A 1v1 is not a tournament: it counts on the 1v1 board only. So the tournament-level
+        // player pass (tournamentsPlayed + lastPlayedAt from the start) runs for 8-player
+        // brackets only — a duel player's lastPlayedAt comes solely from their finished games.
+        if !is_duel {
+            for player in &t.players {
+                let r = row(&mut rows, player);
                 r.tournaments_played += 1;
+                r.last_played_at = r.last_played_at.max(started_at);
             }
         }
         for game in t.games.values() {
