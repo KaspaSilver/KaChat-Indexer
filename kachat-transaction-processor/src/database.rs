@@ -330,19 +330,18 @@ impl KDbClient {
     async fn create_notification_system(&self) -> Result<()> {
         info!("Creating notification function and trigger");
 
-        // Fire on:
+        // Fire on KaChat payloads only:
         //   - canonical KaChat payloads ('kchat:1:' = hex 6b636861743a313a) — covers both KaChat
         //     posts and KaChat broadcasts, since both start with `kchat:1:`;
-        //   - legacy K social payloads ('k:1:' = hex 6b3a313a);
-        //   - legacy KaChat broadcast payloads ('ciph_msg:1:bcast:' =
+        //   - pre-rebrand KaChat broadcast payloads ('ciph_msg:1:bcast:' =
         //     hex 636970685f6d73673a313a62636173743a).
-        // The two legacy prefixes are read-only history support after the KaChat rebrand.
+        // Legacy K-social 'k:1:' (hex 6b3a313a) is deliberately NOT matched — it is a separate
+        // network, not KaChat, and indexing it would pollute KaChat stats.
         sqlx::query(
             r#"
             CREATE OR REPLACE FUNCTION notify_transaction() RETURNS TRIGGER AS $$
             BEGIN
                 IF substr(encode(NEW.payload, 'hex'), 1, 16) = '6b636861743a313a'
-                   OR substr(encode(NEW.payload, 'hex'), 1, 8) = '6b3a313a'
                    OR substr(encode(NEW.payload, 'hex'), 1, 34) = '636970685f6d73673a313a62636173743a' THEN
                     PERFORM pg_notify('transaction_channel', encode(NEW.transaction_id, 'hex'));
                 END IF;

@@ -47,12 +47,13 @@ impl Worker {
 
         match self.fetch_and_process_transaction(&transaction_id).await {
             Ok(Some(transaction)) => {
-                // Process K protocol if payload starts with k:1:
+                // Process KaChat payloads only: canonical `kchat:1:` (posts + broadcasts) and the
+                // pre-rebrand KaChat broadcast prefix `ciph_msg:1:bcast:`. Legacy `k:1:` is the
+                // separate K-social network — not KaChat — so it is deliberately excluded.
                 if let Some(ref payload_hex) = transaction.payload {
                     if let Ok(payload_bytes) = hex::decode(payload_hex) {
                         if let Ok(payload_str) = std::str::from_utf8(&payload_bytes) {
                             if payload_str.starts_with("kchat:1:")
-                                || payload_str.starts_with("k:1:")
                                 || payload_str.starts_with("ciph_msg:1:bcast:")
                             {
                                 //info!("Worker {} - Processing K protocol / broadcast transaction: {}", self.id, transaction_id);
@@ -148,12 +149,13 @@ impl Worker {
                         "Worker {} - Retry successful for transaction {}",
                         self.id, transaction_id
                     );
-                    // Process K protocol if payload starts with k:1:
+                    // KaChat payloads only (see the same gate above): canonical `kchat:1:` and the
+                    // pre-rebrand KaChat broadcast prefix `ciph_msg:1:bcast:`. Legacy K-social
+                    // `k:1:` is not KaChat and is excluded.
                     if let Some(ref payload_hex) = transaction.payload {
                         if let Ok(payload_bytes) = hex::decode(payload_hex) {
                             if let Ok(payload_str) = std::str::from_utf8(&payload_bytes) {
                                 if payload_str.starts_with("kchat:1:")
-                                    || payload_str.starts_with("k:1:")
                                     || payload_str.starts_with("ciph_msg:1:bcast:")
                                 {
                                     //info!("Worker {} - Processing K protocol / broadcast transaction on retry: {}", self.id, transaction_id);

@@ -558,16 +558,17 @@ impl KProtocolProcessor {
 
     /// Parse K protocol payload and extract action type
     pub fn parse_k_protocol_payload(&self, payload: &str) -> Result<KActionType> {
-        // Strip the protocol prefix: canonical KaChat `kchat:1:`, or legacy K `k:1:` (read-only,
-        // for pre-rebrand history). Everything after the version is identical. The flag feeds
-        // kchat-only features (@mention notifications).
+        // Only the canonical KaChat prefix `kchat:1:` is indexed. The legacy `k:1:` prefix belongs
+        // to the separate K-social network — it is NOT KaChat, so parsing it would pollute KaChat
+        // stats (post/vote/follow counts). KaChat posts have always been `kchat:1:`; pre-rebrand
+        // KaChat chat/broadcasts use `ciph_msg:1:bcast:`, handled by the broadcast path.
         let is_kchat = payload.starts_with("kchat:1:");
         let k_payload = if let Some(rest) = payload.strip_prefix("kchat:1:") {
             rest
-        } else if let Some(rest) = payload.strip_prefix("k:1:") {
-            rest
         } else {
-            return Err(anyhow::anyhow!("Invalid KaChat/K protocol prefix"));
+            return Err(anyhow::anyhow!(
+                "Not a canonical KaChat (kchat:1:) payload — foreign/legacy prefix, not indexed"
+            ));
         };
 
         // Split by colons to get the components
