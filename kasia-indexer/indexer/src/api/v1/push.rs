@@ -11,7 +11,9 @@ use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use kaspa_addresses::{Address, Version};
-use kaspa_rpc_core::{RpcAddress, RpcNetworkType};
+use kaspa_rpc_core::api::rpc::RpcApi;
+use kaspa_rpc_core::{RpcAddress, RpcNetworkType, RpcTransaction};
+use kaspa_wrpc_client::KaspaRpcClient;
 use rand::RngCore;
 use ring::signature::{ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 use secp256k1::schnorr::Signature as SchnorrSignature;
@@ -51,6 +53,10 @@ pub struct PushApi {
     ext_push_tx: flume::Sender<ExtensionPushEvent>,
     /// Optional shared secret guarding the internal endpoints (env INTERNAL_PUSH_SECRET).
     internal_secret: Option<String>,
+    /// §5.10: the node client used to broadcast scheduled posts (the webserver's scheduler relays
+    /// due, phone-signed transactions here). This service is the only one on a node-compatible
+    /// wRPC version, so submission lives here — it never signs, only forwards given bytes.
+    rpc_client: KaspaRpcClient,
 }
 
 impl PushApi {
@@ -61,6 +67,7 @@ impl PushApi {
         _app_attest_team_id: Option<String>,
         _app_attest_bundle_id: Option<String>,
         ext_push_tx: flume::Sender<ExtensionPushEvent>,
+        rpc_client: KaspaRpcClient,
     ) -> Self {
         let internal_secret = std::env::var("INTERNAL_PUSH_SECRET")
             .ok()
@@ -73,6 +80,7 @@ impl PushApi {
             nonces: Arc::new(StdMutex::new(NonceStore::default())),
             ext_push_tx,
             internal_secret,
+            rpc_client,
         }
     }
 
@@ -91,6 +99,7 @@ impl PushApi {
         Router::new()
             .route("/broadcast", post(internal_broadcast_push))
             .route("/kaposts", post(internal_kaposts_push))
+            .route("/submit-tx", post(internal_submit_tx))
     }
 }
 
@@ -337,6 +346,40 @@ async fn internal_broadcast_push(
         tx_id: payload.tx_id,
     });
     (StatusCode::OK, "ok")
+}
+
+// §5.10: internal relay — the webserver's scheduler POSTs a due, phone-signed transaction here at
+// its `notBefore`, and this service (the only one on a node-compatible wRPC version) broadcasts it.
+// Body: `{ "transaction": <kaspa-rpc-core RpcTransaction JSON> }`. Never signs; forwards bytes only.
+#[derive(Debug, Deserialize)]
+pub struct InternalSubmitTx {
+    pub transaction: serde_json::Value,
+}
+
+async fn internal_submit_tx(
+    State(state): State<PushApi>,
+    headers: HeaderMap,
+    Json(payload): Json<InternalSubmitTx>,
+) -> impl IntoResponse {
+    if !state.internal_authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized".to_string());
+    }
+    let tx: RpcTransaction = match serde_json::from_value(payload.transaction) {
+        Ok(tx) => tx,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("bad transaction json: {e}"),
+            );
+        }
+    };
+    match state.rpc_client.submit_transaction(tx, false).await {
+        Ok(txid) => (StatusCode::OK, txid.to_string()),
+        Err(e) => {
+            // Surfaced back to the scheduler, which records it as the row's `error`.
+            (StatusCode::BAD_GATEWAY, format!("submit failed: {e}"))
+        }
+    }
 }
 
 async fn internal_kaposts_push(

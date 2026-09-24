@@ -181,6 +181,9 @@ impl KDbClient {
         // Step 1g: idempotently ensure the poll tables (fork addition, §5.9) exist.
         self.create_polls_schema().await?;
 
+        // Step 1h: idempotently ensure the scheduled-posts table (fork addition, §5.10) exists.
+        self.create_scheduled_posts_schema().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -347,6 +350,43 @@ impl KDbClient {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_pollvotes_poll_voter_time \
              ON k_poll_votes(poll_id, voter_pubkey, block_time DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// §5.10 Scheduled posts. The indexer holds a phone-signed transaction (bytes only — never a
+    /// key, never funds) and broadcasts it at `not_before`. `transaction_json` is the Kaspa REST
+    /// `/transactions` shape the phone submitted; the scheduler hands it to the node verbatim.
+    /// Status: scheduled → submitted | failed | cancelled. Index names are intentionally NOT
+    /// `idx_k_%` so the schema verifier's K-index count is unaffected.
+    async fn create_scheduled_posts_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS k_scheduled_posts (
+                tx_id BYTEA PRIMARY KEY,
+                pubkey BYTEA NOT NULL,
+                not_before BIGINT NOT NULL,
+                transaction_json TEXT NOT NULL,
+                post_content TEXT,
+                status VARCHAR(16) NOT NULL DEFAULT 'scheduled',
+                submitted_at BIGINT,
+                error TEXT,
+                created_at BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // The scheduler polls (status='scheduled' AND not_before <= now).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scheduled_due ON k_scheduled_posts(status, not_before)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scheduled_pubkey ON k_scheduled_posts(pubkey)",
         )
         .execute(&self.pool)
         .await?;
