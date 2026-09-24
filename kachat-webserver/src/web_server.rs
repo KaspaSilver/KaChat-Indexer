@@ -29,7 +29,7 @@ use crate::models::{
     ApiError, BroadcastsResponse, ChessLeaderboardResponse, ChessPlayerRow, ChessTournamentRow,
     ChessTournamentsResponse, GetThreadResponse, PaginatedEngagementResponse,
     PaginatedNotificationsResponse, PaginatedPostsResponse, PaginatedRepliesResponse,
-    PaginatedUsersResponse, PostDetailsResponse, ServerUserPost, TrendingHashtagsResponse,
+    PaginatedUsersResponse, PollData, PostDetailsResponse, ServerUserPost, TrendingHashtagsResponse,
 };
 
 #[derive(Debug, Clone)]
@@ -294,6 +294,16 @@ struct GetPostDetailsQuery {
     requester_pubkey: Option<String>,
 }
 
+/// §5.9: GET /get-poll accepts `postId` (canonical) or `id`, and an optional `requesterPubkey`.
+#[derive(Debug, Deserialize)]
+struct GetPollQuery {
+    #[serde(rename = "postId")]
+    post_id: Option<String>,
+    id: Option<String>,
+    #[serde(rename = "requesterPubkey")]
+    requester_pubkey: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GetUserDetailsQuery {
     user: Option<String>,
@@ -391,6 +401,8 @@ impl WebServer {
             // Fetch one post by id, any age or author, in the feed's KPost shape.
             // Same contract as get-post-details; named for what the apps call.
             .route("/get-post", get(handle_get_post_details))
+            // §5.9: single-poll refresh (options + live counts + myVote).
+            .route("/get-poll", get(handle_get_poll))
             // The post plus its parent chain, walked server-side.
             .route("/get-thread", get(handle_get_thread))
             .route("/get-posts-watching", get(handle_get_posts_watching))
@@ -755,6 +767,72 @@ async fn handle_get_post_details(
                 }
             }
         }
+    }
+}
+
+/// §5.9: GET /get-poll?postId=&requesterPubkey= → the poll object plus `id`, so a client can
+/// refresh one poll's live numbers without reloading the feed. 404 when the id is not an indexed
+/// poll. Reuses the get-post path (which already enriches the poll), then returns just the poll.
+#[derive(serde::Serialize)]
+struct GetPollResponse {
+    id: String,
+    #[serde(flatten)]
+    poll: PollData,
+}
+
+async fn handle_get_poll(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<GetPollQuery>,
+) -> Result<Json<GetPollResponse>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+
+    let post_id = match params.post_id.or(params.id) {
+        Some(id) => id,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "Missing required parameter: postId".to_string(),
+                    code: "MISSING_PARAMETER".to_string(),
+                }),
+            ));
+        }
+    };
+    // requesterPubkey is optional here (a poll's numbers are public); myVote is null without it.
+    let requester_pubkey = params.requester_pubkey.unwrap_or_default();
+
+    match app_state
+        .api_handlers
+        .get_post_details(&post_id, &requester_pubkey)
+        .await
+    {
+        Ok(response_json) => match serde_json::from_str::<PostDetailsResponse>(&response_json) {
+            Ok(details) => match details.post.poll {
+                Some(poll) => Ok(Json(GetPollResponse { id: post_id, poll })),
+                None => Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ApiError {
+                        error: "Not a poll".to_string(),
+                        code: "NOT_FOUND".to_string(),
+                    }),
+                )),
+            },
+            Err(_) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "Internal server error".to_string(),
+                    code: "INTERNAL_ERROR".to_string(),
+                }),
+            )),
+        },
+        Err(_) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "Poll not found".to_string(),
+                code: "NOT_FOUND".to_string(),
+            }),
+        )),
     }
 }
 

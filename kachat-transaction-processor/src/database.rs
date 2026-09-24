@@ -178,6 +178,9 @@ impl KDbClient {
         // Step 1f: idempotently ensure the delete audit table (fork addition, §5.8) exists.
         self.create_deletes_schema().await?;
 
+        // Step 1g: idempotently ensure the poll tables (fork addition, §5.9) exist.
+        self.create_polls_schema().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -305,6 +308,48 @@ impl KDbClient {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_deletes_post ON k_deletes(post_id)")
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// §5.9 Polls. A poll's question lives in `k_contents` (content_type `poll`); this stores its
+    /// options (raw base64 CSV, decoded client-side) and close time, and one row per cast vote.
+    /// The current vote per pubkey is the latest by chain time, resolved at read time — so replay
+    /// order never matters. Index names are intentionally NOT `idx_k_%` so the schema verifier's
+    /// K-index count is unaffected.
+    async fn create_polls_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS k_polls (
+                post_id BYTEA PRIMARY KEY,
+                options TEXT NOT NULL,
+                closes_at BIGINT NOT NULL,
+                block_time BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS k_poll_votes (
+                transaction_id BYTEA PRIMARY KEY,
+                poll_id BYTEA NOT NULL,
+                voter_pubkey BYTEA NOT NULL,
+                option_index INT NOT NULL,
+                block_time BIGINT NOT NULL,
+                sender_signature BYTEA UNIQUE NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // Read path resolves current-vote-per-voter with DISTINCT ON (voter) ORDER BY block_time.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pollvotes_poll_voter_time \
+             ON k_poll_votes(poll_id, voter_pubkey, block_time DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

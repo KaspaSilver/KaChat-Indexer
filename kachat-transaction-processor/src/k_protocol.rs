@@ -281,6 +281,11 @@ pub enum KActionType {
     /// Author delete of their own post/reply/quote, any time (fork addition, §5.8).
     /// Payload: delete:pubkey:sig:post_id
     Delete(KDelete),
+    /// A poll — a post carrying 2–4 options and a close time (fork addition, §5.9).
+    /// Payload: poll:pubkey:sig:b64_question:options_b64_csv:closes_at_ms:mentions_json
+    Poll(KPoll),
+    /// A vote in a poll (fork addition, §5.9). Payload: pollvote:pubkey:sig:poll_id:option_index
+    PollVote(KPollVote),
     Unknown(String),
 }
 
@@ -298,6 +303,8 @@ fn action_sender_pubkey(action: &KActionType) -> Option<&str> {
         KActionType::Unquote(k) => Some(&k.sender_pubkey),
         KActionType::Edit(k) => Some(&k.sender_pubkey),
         KActionType::Delete(k) => Some(&k.sender_pubkey),
+        KActionType::Poll(k) => Some(&k.sender_pubkey),
+        KActionType::PollVote(k) => Some(&k.sender_pubkey),
         KActionType::Unknown(_) => None,
     }
 }
@@ -400,6 +407,35 @@ pub struct KDelete {
     pub sender_pubkey: String,
     pub sender_signature: String,
     pub post_id: String,
+}
+
+/// A poll (fork addition, §5.9). The poll IS a post: `base64_encoded_question` is stored as the
+/// post's content (content_type `poll`), so an older client with no poll support shows it as a
+/// plain post. `options_b64_csv` is 2–4 options, each base64 of its UTF-8 text, joined with `,`
+/// (base64 has no `,`/`:`, so the payload still splits cleanly). Signature is over
+/// `poll:<b64_question>:<options_b64_csv>:<closes_at_ms>:<mentions_json>`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct KPoll {
+    pub sender_pubkey: String,
+    pub sender_signature: String,
+    pub base64_encoded_question: String,
+    pub options_b64_csv: String,
+    pub closes_at_ms: i64,
+    pub mentioned_pubkeys: Vec<String>,
+    /// Whether the payload arrived under the canonical `kchat:1:` prefix (vs legacy `k:1:`).
+    #[serde(default)]
+    pub is_kchat: bool,
+}
+
+/// A vote in a poll (fork addition, §5.9). Signature is over
+/// `pollvote:<poll_id>:<option_index>`. One current vote per pubkey — a later vote (by chain time)
+/// replaces the earlier one.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct KPollVote {
+    pub sender_pubkey: String,
+    pub sender_signature: String,
+    pub poll_id: String,
+    pub option_index: i32,
 }
 
 // Database record structures for PostgreSQL
@@ -871,6 +907,50 @@ impl KProtocolProcessor {
                     post_id: parts[3].to_string(),
                 }))
             }
+            "poll" => {
+                // Expected: poll:pubkey:sig:b64_question:options_b64_csv:closes_at_ms:mentions_json
+                if parts.len() < 6 {
+                    return Err(anyhow::anyhow!(
+                        "Invalid poll format: expected at least 6 parts, got {}",
+                        parts.len()
+                    ));
+                }
+                let closes_at_ms: i64 = parts[5].parse().map_err(|_| {
+                    anyhow::anyhow!("Invalid poll closes_at_ms '{}'", parts[5])
+                })?;
+                let mentioned_pubkeys: Vec<String> = if parts.len() > 6 {
+                    serde_json::from_str::<Vec<String>>(parts[6]).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                Ok(KActionType::Poll(KPoll {
+                    sender_pubkey: parts[1].to_string(),
+                    sender_signature: parts[2].to_string(),
+                    base64_encoded_question: parts[3].to_string(),
+                    options_b64_csv: parts[4].to_string(),
+                    closes_at_ms,
+                    mentioned_pubkeys,
+                    is_kchat,
+                }))
+            }
+            "pollvote" => {
+                // Expected: pollvote:pubkey:sig:poll_id:option_index
+                if parts.len() < 5 {
+                    return Err(anyhow::anyhow!(
+                        "Invalid pollvote format: expected 5 parts, got {}",
+                        parts.len()
+                    ));
+                }
+                let option_index: i32 = parts[4].parse().map_err(|_| {
+                    anyhow::anyhow!("Invalid pollvote option_index '{}'", parts[4])
+                })?;
+                Ok(KActionType::PollVote(KPollVote {
+                    sender_pubkey: parts[1].to_string(),
+                    sender_signature: parts[2].to_string(),
+                    poll_id: parts[3].to_string(),
+                    option_index,
+                }))
+            }
             _ => Ok(KActionType::Unknown(action.to_string())),
         }
     }
@@ -984,6 +1064,14 @@ impl KProtocolProcessor {
                 }
                 KActionType::Delete(k_delete) => {
                     self.process_k_delete_in_database(transaction, k_delete)
+                        .await?;
+                }
+                KActionType::Poll(k_poll) => {
+                    self.process_k_poll_in_database(transaction, k_poll)
+                        .await?;
+                }
+                KActionType::PollVote(k_pollvote) => {
+                    self.process_k_pollvote_in_database(transaction, k_pollvote)
                         .await?;
                 }
                 KActionType::Unknown(action) => {
@@ -2140,6 +2228,16 @@ impl KProtocolProcessor {
         let original_time: i64 = original.get("block_time");
         let content_type: String = original.get("content_type");
 
+        // §5.9: an edit is never accepted on a poll — the options are what people voted on, so
+        // the question text is frozen too.
+        if content_type == "poll" {
+            info!(
+                "Edit {} targets a poll ({}), which is not editable — skipping",
+                transaction_id, k_edit.post_id
+            );
+            return Ok(());
+        }
+
         // Author-only: an author edits only their own content.
         if original_author != sender_pubkey_bytes {
             info!(
@@ -2339,6 +2437,231 @@ impl KProtocolProcessor {
             k_delete.post_id,
             deleted.rows_affected()
         );
+        Ok(())
+    }
+
+    /// Process a poll (§5.9). A poll IS a post: the question is stored in `k_contents` with
+    /// content_type `poll` (so it flows through every feed/search path unchanged), and the options
+    /// + close time go in `k_polls`. Rejected silently on any validation failure.
+    pub async fn process_k_poll_in_database(
+        &self,
+        transaction: &Transaction,
+        k_poll: KPoll,
+    ) -> Result<()> {
+        let transaction_id = &transaction.transaction_id;
+
+        // Signature is over "poll:<b64_question>:<options_b64_csv>:<closes_at_ms>:<mentions_json>".
+        let mentions_json =
+            serde_json::to_string(&k_poll.mentioned_pubkeys).unwrap_or_else(|_| "[]".to_string());
+        let message_to_verify = format!(
+            "poll:{}:{}:{}:{}",
+            k_poll.base64_encoded_question,
+            k_poll.options_b64_csv,
+            k_poll.closes_at_ms,
+            mentions_json
+        );
+        if !self.verify_kaspa_signature(
+            &message_to_verify,
+            &k_poll.sender_signature,
+            &k_poll.sender_pubkey,
+        ) {
+            error!("Invalid signature for poll {}, skipping", transaction_id);
+            return Ok(());
+        }
+
+        // The question is a post's message: KaChat marker, non-empty, text-only.
+        if let Err(reason) = validate_kachat_message(&k_poll.base64_encoded_question) {
+            info!("Poll {} question rejected ({}), skipping", transaction_id, reason);
+            return Ok(());
+        }
+
+        // Options: 2–4, each base64 of 1–40 chars of UTF-8, no two identical (§5.9).
+        use base64::{Engine as _, engine::general_purpose};
+        let option_b64: Vec<&str> = k_poll.options_b64_csv.split(',').collect();
+        if option_b64.len() < 2 || option_b64.len() > 4 {
+            info!("Poll {} has {} options (need 2–4), skipping", transaction_id, option_b64.len());
+            return Ok(());
+        }
+        let mut decoded_options: Vec<String> = Vec::with_capacity(option_b64.len());
+        for opt in &option_b64 {
+            let bytes = match general_purpose::STANDARD.decode(opt.trim()) {
+                Ok(b) => b,
+                Err(_) => {
+                    info!("Poll {} has a non-base64 option, skipping", transaction_id);
+                    return Ok(());
+                }
+            };
+            let text = match String::from_utf8(bytes) {
+                Ok(t) => t,
+                Err(_) => {
+                    info!("Poll {} has a non-UTF8 option, skipping", transaction_id);
+                    return Ok(());
+                }
+            };
+            let len = text.chars().count();
+            if len < 1 || len > 40 {
+                info!("Poll {} option length {} out of 1–40, skipping", transaction_id, len);
+                return Ok(());
+            }
+            decoded_options.push(text);
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !decoded_options.iter().all(|o| seen.insert(o.as_str())) {
+            info!("Poll {} has duplicate options, skipping", transaction_id);
+            return Ok(());
+        }
+
+        // closes_at must be after the poll's chain time and within 7 days of it.
+        let block_time = transaction.block_time.unwrap_or(0);
+        const SEVEN_DAYS_MS: i64 = 604_800_000;
+        if k_poll.closes_at_ms <= block_time || k_poll.closes_at_ms > block_time + SEVEN_DAYS_MS {
+            info!(
+                "Poll {} closes_at {} not in (now, now+7d], skipping",
+                transaction_id, k_poll.closes_at_ms
+            );
+            return Ok(());
+        }
+
+        let transaction_id_bytes = hex::decode(transaction_id)?;
+        let sender_pubkey_bytes = hex::decode(&k_poll.sender_pubkey)?;
+        let sender_signature_bytes = hex::decode(&k_poll.sender_signature)?;
+
+        // Store the question as the post content (content_type = 'poll').
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO k_contents (
+                transaction_id, block_time, sender_pubkey, sender_signature,
+                base64_encoded_message, content_type, referenced_content_id
+            ) VALUES ($1, $2, $3, $4, $5, 'poll', NULL)
+            ON CONFLICT (sender_signature) DO NOTHING
+            "#,
+        )
+        .bind(&transaction_id_bytes)
+        .bind(block_time)
+        .bind(&sender_pubkey_bytes)
+        .bind(&sender_signature_bytes)
+        .bind(&k_poll.base64_encoded_question)
+        .execute(&self.db_pool)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            info!("Poll {} already indexed, skipping", transaction_id);
+            return Ok(());
+        }
+
+        // Options + close time. `options` is the raw base64 CSV, decoded client-side.
+        sqlx::query(
+            r#"
+            INSERT INTO k_polls (post_id, options, closes_at, block_time)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (post_id) DO NOTHING
+            "#,
+        )
+        .bind(&transaction_id_bytes)
+        .bind(&k_poll.options_b64_csv)
+        .bind(k_poll.closes_at_ms)
+        .bind(block_time)
+        .execute(&self.db_pool)
+        .await?;
+
+        // Mentions in the question notify like a post's (kchat only). Mirrors the post path.
+        if k_poll.is_kchat {
+            for pk_hex in &k_poll.mentioned_pubkeys {
+                let Ok(pk_bytes) = hex::decode(pk_hex) else { continue };
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey)
+                    VALUES ($1, 'post', $2, $3, $4)
+                    ON CONFLICT DO NOTHING
+                    "#,
+                )
+                .bind(&transaction_id_bytes)
+                .bind(&pk_bytes)
+                .bind(block_time)
+                .bind(&sender_pubkey_bytes)
+                .execute(&self.db_pool)
+                .await;
+            }
+        }
+
+        info!("Saved poll {} with {} options", transaction_id, decoded_options.len());
+        Ok(())
+    }
+
+    /// Process a poll vote (§5.9). Every valid vote is stored; the current vote per pubkey (the
+    /// latest by chain time) is resolved at read time, so replay order does not matter. Votes
+    /// produce no notification and do not count as votes/replies on the post.
+    pub async fn process_k_pollvote_in_database(
+        &self,
+        transaction: &Transaction,
+        k_vote: KPollVote,
+    ) -> Result<()> {
+        let transaction_id = &transaction.transaction_id;
+
+        // Signature is over "pollvote:<poll_id>:<option_index>".
+        let message_to_verify =
+            format!("pollvote:{}:{}", k_vote.poll_id, k_vote.option_index);
+        if !self.verify_kaspa_signature(
+            &message_to_verify,
+            &k_vote.sender_signature,
+            &k_vote.sender_pubkey,
+        ) {
+            error!("Invalid signature for pollvote {}, skipping", transaction_id);
+            return Ok(());
+        }
+
+        let poll_id_bytes = hex::decode(&k_vote.poll_id)?;
+        // The poll must be indexed; read its option count and close time.
+        let poll = sqlx::query("SELECT options, closes_at FROM k_polls WHERE post_id = $1")
+            .bind(&poll_id_bytes)
+            .fetch_optional(&self.db_pool)
+            .await?;
+        let poll = match poll {
+            Some(row) => row,
+            None => {
+                info!("Pollvote {} targets unknown poll {}, skipping", transaction_id, k_vote.poll_id);
+                return Ok(());
+            }
+        };
+        let options_csv: String = poll.get("options");
+        let closes_at: i64 = poll.get("closes_at");
+        let num_options = options_csv.split(',').count() as i32;
+
+        if k_vote.option_index < 0 || k_vote.option_index >= num_options {
+            info!(
+                "Pollvote {} index {} out of range 0..{}, skipping",
+                transaction_id, k_vote.option_index, num_options
+            );
+            return Ok(());
+        }
+
+        let block_time = transaction.block_time.unwrap_or(0);
+        if block_time >= closes_at {
+            info!("Pollvote {} arrived after the poll closed, skipping", transaction_id);
+            return Ok(());
+        }
+
+        let transaction_id_bytes = hex::decode(transaction_id)?;
+        let sender_pubkey_bytes = hex::decode(&k_vote.sender_pubkey)?;
+        let sender_signature_bytes = hex::decode(&k_vote.sender_signature)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO k_poll_votes (
+                transaction_id, poll_id, voter_pubkey, option_index, block_time, sender_signature
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (sender_signature) DO NOTHING
+            "#,
+        )
+        .bind(&transaction_id_bytes)
+        .bind(&poll_id_bytes)
+        .bind(&sender_pubkey_bytes)
+        .bind(k_vote.option_index)
+        .bind(block_time)
+        .bind(&sender_signature_bytes)
+        .execute(&self.db_pool)
+        .await?;
+
+        info!("Recorded pollvote {} on poll {}", transaction_id, k_vote.poll_id);
         Ok(())
     }
 

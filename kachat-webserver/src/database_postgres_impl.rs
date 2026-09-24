@@ -8,7 +8,7 @@ use crate::database_trait::{
 };
 use crate::models::{
     BroadcastMessage, ContentRecord, EngagementActor, KBroadcastRecord, KPostRecord, KReplyRecord,
-    KVoteRecord, NotificationContentRecord, PaginationMetadata,
+    KVoteRecord, NotificationContentRecord, PaginationMetadata, PollData,
 };
 
 pub struct PostgresDbManager {
@@ -210,7 +210,7 @@ impl PostgresDbManager {
                        c.referenced_content_id
                 FROM k_contents c
                 LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = c.sender_pubkey
-                WHERE c.content_type IN ('post', 'quote')
+                WHERE c.content_type IN ('post', 'quote', 'poll')
                   AND kb.blocked_user_pubkey IS NULL{cursor_conditions}{content_conditions}
                 {order_clause}
                 LIMIT ${limit_param}
@@ -344,6 +344,7 @@ impl PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
                 edited_at: None,
+                poll: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -365,6 +366,8 @@ impl PostgresDbManager {
 
         // §5.7: fill editedAt for this page (non-fatal).
         let _ = self.enrich_edited_at(&mut posts).await;
+        // §5.9: attach poll data + content_type="poll" for any poll rows on this page.
+        let _ = self.enrich_polls(&mut posts, &requester_pubkey_bytes).await;
         let pagination = self.create_compound_pagination_metadata(&posts, limit as u32, has_more);
 
         Ok(PaginatedResult {
@@ -507,6 +510,119 @@ impl PostgresDbManager {
         for it in items.iter_mut() {
             if let Some(v) = map.get(it.edit_tx_id()) {
                 it.set_edited_at(Some(*v));
+            }
+        }
+        Ok(())
+    }
+
+    /// §5.9: for any record on the page that is a poll (present in `k_polls`), set content_type
+    /// to "poll" and attach the live `poll` object (options, per-option counts of the CURRENT
+    /// vote per pubkey, total, closesAt, and the requester's myVote). One membership lookup plus
+    /// two aggregate queries per page. Non-poll records are untouched. Failures are swallowed by
+    /// callers (a cold-start race before the tables exist simply leaves polls un-enriched).
+    async fn enrich_polls(
+        &self,
+        items: &mut [KPostRecord],
+        requester_pubkey: &[u8],
+    ) -> DatabaseResult<()> {
+        use std::collections::HashMap;
+        if items.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = items
+            .iter()
+            .filter_map(|it| hex::decode(&it.transaction_id).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // Which page rows are polls? Read their options CSV + close time.
+        let poll_rows = sqlx::query(
+            "SELECT encode(post_id, 'hex') as pid, options, closes_at \
+             FROM k_polls WHERE post_id = ANY($1::bytea[])",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        if poll_rows.is_empty() {
+            return Ok(());
+        }
+        let mut meta: HashMap<String, (String, i64)> = HashMap::new();
+        for r in poll_rows {
+            let pid: String = r.get("pid");
+            let options: String = r.get("options");
+            let closes_at: i64 = r.get("closes_at");
+            meta.insert(pid, (options, closes_at));
+        }
+        let poll_ids: Vec<Vec<u8>> = meta.keys().filter_map(|k| hex::decode(k).ok()).collect();
+
+        // Per-option counts of the CURRENT vote per voter (latest by chain time).
+        let count_rows = sqlx::query(
+            r#"
+            WITH current AS (
+                SELECT DISTINCT ON (poll_id, voter_pubkey) poll_id, option_index
+                FROM k_poll_votes
+                WHERE poll_id = ANY($1::bytea[])
+                ORDER BY poll_id, voter_pubkey, block_time DESC, transaction_id DESC
+            )
+            SELECT encode(poll_id, 'hex') as pid, option_index, COUNT(*) as cnt
+            FROM current GROUP BY poll_id, option_index
+            "#,
+        )
+        .bind(&poll_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        let mut counts: HashMap<String, HashMap<i32, u64>> = HashMap::new();
+        for r in count_rows {
+            let pid: String = r.get("pid");
+            let oi: i32 = r.get("option_index");
+            let cnt: i64 = r.get("cnt");
+            counts.entry(pid).or_default().insert(oi, cnt as u64);
+        }
+
+        // The requester's current vote per poll (option index), if any.
+        let mut myvotes: HashMap<String, i32> = HashMap::new();
+        if !requester_pubkey.is_empty() {
+            let mv = sqlx::query(
+                r#"
+                SELECT DISTINCT ON (poll_id) encode(poll_id, 'hex') as pid, option_index
+                FROM k_poll_votes
+                WHERE poll_id = ANY($1::bytea[]) AND voter_pubkey = $2
+                ORDER BY poll_id, block_time DESC, transaction_id DESC
+                "#,
+            )
+            .bind(&poll_ids)
+            .bind(requester_pubkey)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+            for r in mv {
+                let pid: String = r.get("pid");
+                let oi: i32 = r.get("option_index");
+                myvotes.insert(pid, oi);
+            }
+        }
+
+        for it in items.iter_mut() {
+            if let Some((options_csv, closes_at)) = meta.get(&it.transaction_id) {
+                let options: Vec<String> =
+                    options_csv.split(',').map(|s| s.to_string()).collect();
+                let n = options.len() as i32;
+                let cmap = counts.get(&it.transaction_id);
+                let counts_vec: Vec<u64> = (0..n)
+                    .map(|i| cmap.and_then(|m| m.get(&i)).copied().unwrap_or(0))
+                    .collect();
+                let total: u64 = counts_vec.iter().sum();
+                it.content_type = Some("poll".to_string());
+                it.poll = Some(PollData {
+                    options,
+                    counts: counts_vec,
+                    total,
+                    closes_at: *closes_at as u64,
+                    my_vote: myvotes.get(&it.transaction_id).copied(),
+                });
             }
         }
         Ok(())
@@ -985,7 +1101,7 @@ impl DatabaseInterface for PostgresDbManager {
             INNER JOIN (
                 SELECT sender_pubkey, COUNT(*) as post_count
                 FROM k_contents
-                WHERE content_type IN ('post', 'reply', 'quote')
+                WHERE content_type IN ('post', 'reply', 'quote', 'poll')
                 GROUP BY sender_pubkey
             ) pc ON pc.sender_pubkey = b.sender_pubkey
             WHERE (convert_from(decode(b.base64_encoded_nickname, 'base64'), 'UTF8') ILIKE $2 ESCAPE '\'
@@ -1763,7 +1879,7 @@ impl DatabaseInterface for PostgresDbManager {
                 INNER JOIN k_follows kf ON kf.followed_user_pubkey = c.sender_pubkey
                 LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = c.sender_pubkey
                 WHERE kf.sender_pubkey = $1
-                  AND c.content_type IN ('post', 'reply', 'quote')
+                  AND c.content_type IN ('post', 'reply', 'quote', 'poll')
                   AND kb.blocked_user_pubkey IS NULL{cursor_conditions}
                 {order_clause}
                 LIMIT ${limit_param}
@@ -1896,6 +2012,7 @@ impl DatabaseInterface for PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_raw,
                 edited_at: None,
+                poll: None,
                 content_type: row.try_get("content_type").ok(),
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 up_votes_count: Some(row.get::<i64, _>("up_votes_count") as u64),
@@ -1918,6 +2035,8 @@ impl DatabaseInterface for PostgresDbManager {
         // Build pagination metadata
         // §5.7: fill editedAt for this page (non-fatal).
         let _ = self.enrich_edited_at(&mut items).await;
+        // §5.9: attach poll data for any poll rows from followed users.
+        let _ = self.enrich_polls(&mut items, &requester_pubkey_bytes).await;
         let pagination = if items.is_empty() {
             PaginationMetadata {
                 has_more: false,
@@ -2186,6 +2305,7 @@ impl DatabaseInterface for PostgresDbManager {
                         base64_encoded_message: row.get("base64_encoded_message"),
                         mentioned_pubkeys: mentioned_pubkeys_array,
                         edited_at: None,
+                        poll: None,
                         content_type: None,
                         replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                         quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -2565,7 +2685,7 @@ impl DatabaseInterface for PostgresDbManager {
         let is_blocked: bool = row.get("is_blocked");
 
         let content_record = match content_type {
-            "post" | "quote" => {
+            "post" | "quote" | "poll" => {
                 let mentioned_pubkeys_bytes: Vec<Vec<u8>> = row.get("mentioned_pubkeys");
                 let mentioned_pubkeys: Vec<String> = mentioned_pubkeys_bytes
                     .into_iter()
@@ -2582,6 +2702,7 @@ impl DatabaseInterface for PostgresDbManager {
                     mentioned_pubkeys,
                     content_type: None,
                     edited_at: None,
+                    poll: None,
                     replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                     quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
                     up_votes_count: Some(row.get::<i64, _>("up_votes_count") as u64),
@@ -2652,6 +2773,10 @@ impl DatabaseInterface for PostgresDbManager {
         match &mut content_record {
             ContentRecord::Post(r) => {
                 let _ = self.enrich_edited_at(std::slice::from_mut(r)).await;
+                // §5.9: a poll fetched by id (get-post / get-thread) carries its poll object.
+                let _ = self
+                    .enrich_polls(std::slice::from_mut(r), &requester_pubkey_bytes)
+                    .await;
             }
             ContentRecord::Reply(r) => {
                 let _ = self.enrich_edited_at(std::slice::from_mut(r)).await;
@@ -3185,7 +3310,7 @@ impl DatabaseInterface for PostgresDbManager {
                        c.sender_signature, c.base64_encoded_message, c.content_type,
                        c.referenced_content_id
                 FROM k_contents c
-                WHERE c.content_type IN ('post', 'quote') AND c.sender_pubkey = $1{cursor_conditions}
+                WHERE c.content_type IN ('post', 'quote', 'poll') AND c.sender_pubkey = $1{cursor_conditions}
                 {order_clause}
                 LIMIT ${limit_param}
             ),
@@ -3352,6 +3477,7 @@ impl DatabaseInterface for PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
                 edited_at: None,
+                poll: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -3373,6 +3499,8 @@ impl DatabaseInterface for PostgresDbManager {
 
         // §5.7: fill editedAt for this page (non-fatal).
         let _ = self.enrich_edited_at(&mut posts).await;
+        // §5.9: attach poll data + content_type="poll" for any poll rows on this page.
+        let _ = self.enrich_polls(&mut posts, &requester_pubkey_bytes).await;
         let pagination = self.create_compound_pagination_metadata(&posts, limit as u32, has_more);
 
         Ok(PaginatedResult {
@@ -3646,6 +3774,7 @@ impl DatabaseInterface for PostgresDbManager {
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys: Vec::new(),
                     edited_at: None,
+                    poll: None,
                     content_type: None,
                     up_votes_count: None,
                     down_votes_count: None,
@@ -3682,6 +3811,7 @@ impl DatabaseInterface for PostgresDbManager {
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys: Vec::new(),
                     edited_at: None,
+                    poll: None,
                     content_type: None,
                     up_votes_count: None,
                     down_votes_count: None,
@@ -4037,6 +4167,7 @@ impl DatabaseInterface for PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_raw,
                 edited_at: None,
+                poll: None,
                 content_type: row.try_get("content_type").ok(),
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 up_votes_count: Some(row.get::<i64, _>("up_votes_count") as u64),

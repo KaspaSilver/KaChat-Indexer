@@ -1007,6 +1007,7 @@ impl ApiHandlers {
                         is_quote: false,
                         quote: None,
                         edited_at: None,
+                        poll: None,
                     }
                 }
             })
@@ -1207,6 +1208,7 @@ impl ApiHandlers {
                 is_quote: false,
                 quote: None,
                 edited_at: None,
+                poll: None,
             },
         }
     }
@@ -1375,6 +1377,7 @@ impl ApiHandlers {
                             is_quote: false,
                             quote: None,
                             edited_at: None,
+                            poll: None,
                         };
                         PostDetailsResponse { post: server_vote }
                     }

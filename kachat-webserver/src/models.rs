@@ -51,6 +51,20 @@ pub struct KPost {
     pub mentioned_pubkeys: Vec<String>,
 }
 
+/// §5.9: the poll object embedded in a `KPost` whose content_type is "poll". `options` are the
+/// base64 option texts (decoded client-side); `counts[i]` is the number of pubkeys whose CURRENT
+/// vote is option `i`; `total` is their sum; `my_vote` is the requester's option index or null.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PollData {
+    pub options: Vec<String>,
+    pub counts: Vec<u64>,
+    pub total: u64,
+    #[serde(rename = "closesAt")]
+    pub closes_at: u64,
+    #[serde(rename = "myVote")]
+    pub my_vote: Option<i32>,
+}
+
 // Database model for K protocol posts with additional metadata
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct KPostRecord {
@@ -64,6 +78,9 @@ pub struct KPostRecord {
     pub content_type: Option<String>,
     // §5.7: chain time (ms) of the latest accepted edit, or None if never edited.
     pub edited_at: Option<i64>,
+    // §5.9: poll data, filled by enrich_polls when this content is a poll; None otherwise.
+    #[serde(default)]
+    pub poll: Option<PollData>,
     // Optional enriched metadata fields for optimized queries
     pub replies_count: Option<u64>,
     pub up_votes_count: Option<u64>,
@@ -221,6 +238,9 @@ pub struct ServerPost {
     /// The apps show an "edited" label when this is present.
     #[serde(rename = "editedAt", skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<u64>,
+    /// §5.9: present only when content_type is "poll"; carries options, live counts and myVote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll: Option<PollData>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -460,6 +480,7 @@ impl ServerPost {
             is_quote,
             quote,
             edited_at: record.edited_at.map(|v| v as u64),
+            poll: record.poll.clone(),
         }
     }
 }
@@ -705,6 +726,7 @@ impl ServerReply {
             is_quote: false,
             quote: None,
             edited_at: record.edited_at.map(|v| v as u64),
+            poll: None,
         }
     }
 }
