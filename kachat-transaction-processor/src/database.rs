@@ -320,6 +320,17 @@ impl KDbClient {
     /// order never matters. Index names are intentionally NOT `idx_k_%` so the schema verifier's
     /// K-index count is unaffected.
     async fn create_polls_schema(&self) -> Result<()> {
+        // A poll is stored in k_contents with content_type 'poll', but the table's CHECK constraint
+        // predates polls and rejects it. Widen it (drop + re-add so it is idempotent on restart).
+        sqlx::query("ALTER TABLE k_contents DROP CONSTRAINT IF EXISTS k_contents_content_type_check")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "ALTER TABLE k_contents ADD CONSTRAINT k_contents_content_type_check \
+             CHECK (content_type IN ('post', 'reply', 'repost', 'quote', 'poll'))",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS k_polls (
