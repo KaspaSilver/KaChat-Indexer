@@ -51,6 +51,8 @@ pub struct AppState {
     pub translate_rate_limit_map: crate::translate::TranslateRateLimitMap,
     /// Chess leaderboard: replaying the whole arena is expensive, so cache the two derived views.
     pub chess_cache: Arc<RwLock<ChessCache>>,
+    /// §5.10: direct pool handle for the scheduled-posts store (raw SQL).
+    pub scheduled_pool: sqlx::PgPool,
 }
 
 /// Cached result of one arena replay (see chess.rs). Recomputed when older than CHESS_CACHE_TTL.
@@ -362,7 +364,11 @@ struct GetNotificationsCountQuery {
 struct GetUsersCountQuery {}
 
 impl WebServer {
-    pub async fn new(db: Arc<dyn DatabaseInterface>, server_config: ServerConfig) -> Self {
+    pub async fn new(
+        db: Arc<dyn DatabaseInterface>,
+        scheduled_pool: sqlx::PgPool,
+        server_config: ServerConfig,
+    ) -> Self {
         let api_handlers = ApiHandlers::new(db.clone());
         let rate_limit_map = Arc::new(RwLock::new(HashMap::new()));
         let http = reqwest::Client::builder()
@@ -379,7 +385,11 @@ impl WebServer {
             http,
             translate_rate_limit_map,
             chess_cache: Arc::new(RwLock::new(ChessCache::default())),
+            scheduled_pool,
         });
+
+        // §5.10: start the per-minute scheduler that broadcasts due scheduled posts.
+        crate::scheduled::spawn_scheduler(app_state.clone());
 
         Self { app_state }
     }
@@ -403,6 +413,13 @@ impl WebServer {
             .route("/get-post", get(handle_get_post_details))
             // §5.9: single-poll refresh (options + live counts + myVote).
             .route("/get-poll", get(handle_get_poll))
+            // §5.10 scheduled posts: build+sign on the phone, submit at notBefore server-side.
+            .route("/schedule-post", post(crate::scheduled::handle_schedule_post))
+            .route("/scheduled-posts", get(crate::scheduled::handle_scheduled_posts))
+            .route(
+                "/cancel-scheduled-post",
+                post(crate::scheduled::handle_cancel_scheduled_post),
+            )
             // The post plus its parent chain, walked server-side.
             .route("/get-thread", get(handle_get_thread))
             .route("/get-posts-watching", get(handle_get_posts_watching))

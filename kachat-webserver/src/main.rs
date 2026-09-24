@@ -4,6 +4,7 @@ mod config;
 mod database_postgres_impl;
 mod database_trait;
 mod models;
+mod scheduled;
 mod translate;
 mod web_server;
 
@@ -151,9 +152,11 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<(), Box<dyn std
             }
         };
 
-    // Create web server
+    // Create web server. Keep a direct handle to the pool for the §5.10 scheduled-posts store
+    // (raw SQL, not routed through the DatabaseInterface trait).
+    let scheduled_pool = db_manager.pool.clone();
     let db_interface: Arc<dyn database_trait::DatabaseInterface> = Arc::new(db_manager);
-    let web_server = WebServer::new(db_interface, config.server.clone()).await;
+    let web_server = WebServer::new(db_interface, scheduled_pool, config.server.clone()).await;
 
     info!("Starting web server on {}", config.server.bind_address);
 

@@ -21,3 +21,8 @@ clap = { version = "4.5.48", features = ["derive"] }
 axum-prometheus = "0.9"
 base64ct = { version = "1.8.0", features = ["alloc"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# §5.10 scheduled posts: verify the schedule/cancel request signatures (schnorr over Kaspa's
+# PersonalMessageSigningHash) using the exact same path the processor uses — no reimplemented crypto.
+kaspa-wallet-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", features = ["wasm32-sdk"] }
+secp256k1 = "0.29"
+base64 = "0.21"
