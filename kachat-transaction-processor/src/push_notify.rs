@@ -98,7 +98,15 @@ pub fn broadcast_preview(content: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
         match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "reply" => {
-                if let Some(inner) = v.get("content").and_then(|c| c.as_str()) {
+                // A reply envelope (MessageReplyContent) carries the reply's own text in `text`;
+                // unwrap it BEFORE truncating, or a 150-char cut of the raw JSON drops the text
+                // entirely and the phone shows only "Replied to a message". `content` is a legacy
+                // fallback for any older envelope shape.
+                if let Some(inner) = v
+                    .get("text")
+                    .or_else(|| v.get("content"))
+                    .and_then(|c| c.as_str())
+                {
                     if inner.contains("data:audio") {
                         return "Voice message".to_string();
                     }
@@ -123,6 +131,16 @@ pub fn is_reaction_content(content: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(content.trim())
         .ok()
         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "reaction"))
+        .unwrap_or(false)
+}
+
+/// True if `content` is an edit envelope (`{"type":"edit","targetTxId":…,"text":…}`). An edit
+/// rewrites an earlier message in place (MESSAGING.md "Message Edits") — there is nothing new to
+/// announce, so it must never generate a push. Broadcasts are plaintext, so we suppress here.
+pub fn is_edit_content(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content.trim())
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "edit"))
         .unwrap_or(false)
 }
 
@@ -178,4 +196,42 @@ pub fn notify_kaposts(
             "tx_id": tx_id,
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reply_preview_reads_inner_text_not_raw_json() {
+        // A reply envelope's txId + sender alone are ~130 chars, so truncating the raw JSON at 150
+        // would drop the text. Must unwrap `text` first (BROADCAST_INDEXER.md §5).
+        let env = r#"{"type":"reply","replyToId":"a3f9c1e28b7d4655aa10cc9021fe4477deadbeef00112233","replyToSender":"kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq","replyToPreview":"hi there","text":"actually the answer is 42"}"#;
+        assert_eq!(broadcast_preview(env), "actually the answer is 42");
+    }
+
+    #[test]
+    fn file_and_audio_previews_are_voice_message() {
+        assert_eq!(broadcast_preview(r#"{"type":"file","content":"data:audio/m4a;base64,AAA"}"#), "Voice message");
+        assert_eq!(broadcast_preview(r#"{"type":"audio","content":"x"}"#), "Voice message");
+    }
+
+    #[test]
+    fn plain_text_is_verbatim_and_truncated() {
+        assert_eq!(broadcast_preview("gm kaspa"), "gm kaspa");
+        let long: String = "x".repeat(300);
+        assert_eq!(broadcast_preview(&long).chars().count(), 150);
+    }
+
+    #[test]
+    fn reactions_and_edits_are_suppressed() {
+        let reaction = r#"{"type":"reaction","targetTxId":"abc","emoji":"❤️","action":"add"}"#;
+        let edit = r#"{"type":"edit","targetTxId":"abc","text":"fixed typo"}"#;
+        assert!(is_reaction_content(reaction));
+        assert!(is_edit_content(edit));
+        // Cross-checks: a reaction is not an edit and vice versa; plain text is neither.
+        assert!(!is_edit_content(reaction));
+        assert!(!is_reaction_content(edit));
+        assert!(!is_reaction_content("gm") && !is_edit_content("gm"));
+    }
 }

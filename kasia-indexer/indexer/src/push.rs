@@ -2150,7 +2150,10 @@ impl PushDispatcher {
                         },
                         sound: "default",
                         thread_id: format!("broadcast:{channel}"),
-                        mutable_content: None,
+                        // Required: the app's notification-service extension only runs with
+                        // mutable-content:1, and it's what tidies the body (reply text, base64,
+                        // truncated envelopes). Without it the extension never fires.
+                        mutable_content: Some(1),
                     },
                     post_id: None,
                     kaposts_kind: None,
@@ -2791,8 +2794,9 @@ impl PushAlert {
     }
 }
 
-// KaChat fork: plain-alert payloads for broadcast/KaPosts (public content — no mutable-content,
-// no encrypted body). thread-id routes taps in the app; `postId` is a top-level custom key.
+// KaChat fork: plain-alert payloads for broadcast/KaPosts (public content — no encrypted body).
+// Both set mutable-content:1 so the client's notification-service extension can tidy the body.
+// thread-id routes taps in the app; `postId` is a top-level custom key.
 #[derive(Debug, Serialize)]
 struct ExtensionPayload {
     aps: ExtensionAps,

@@ -1125,8 +1125,11 @@ impl KProtocolProcessor {
                 transaction_id, channel, sender_address
             );
             // Fire-and-forget push notify (push service filters to bell-on / non-hidden devices).
-            // Reaction envelopes are invisible protocol traffic — never push them.
-            if !crate::push_notify::is_reaction_content(content) {
+            // Reaction and edit envelopes are invisible protocol traffic (a reaction renders as a
+            // pill; an edit rewrites an earlier bubble in place) — never push either.
+            if !crate::push_notify::is_reaction_content(content)
+                && !crate::push_notify::is_edit_content(content)
+            {
                 let body = crate::push_notify::broadcast_preview(content);
                 crate::push_notify::notify_broadcast(&channel, &sender_address, body, transaction_id);
             }
