@@ -659,6 +659,8 @@ pub struct ChessPlayerRow {
     pub tournaments_played: i64,
     #[serde(rename = "tournamentsWon")]
     pub tournaments_won: i64,
+    #[serde(rename = "tournamentsLost")]
+    pub tournaments_lost: i64,
     #[serde(rename = "lastPlayedAt")]
     pub last_played_at: i64,
 }

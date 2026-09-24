@@ -105,6 +105,7 @@ async fn chess_snapshot(state: &AppState) -> (Vec<ChessPlayerRow>, Vec<ChessTour
             tournament_game_losses: r.tournament_game_losses,
             tournaments_played: r.tournaments_played,
             tournaments_won: r.tournaments_won,
+            tournaments_lost: r.tournaments_lost,
             last_played_at: r.last_played_at,
         })
         .collect();
@@ -1856,6 +1857,7 @@ async fn handle_chess_player(
             tournament_game_losses: 0,
             tournaments_played: 0,
             tournaments_won: 0,
+            tournaments_lost: 0,
             last_played_at: 0,
         });
     Ok(Json(row))

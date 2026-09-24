@@ -870,6 +870,9 @@ pub struct LeaderboardRow {
     pub tournament_game_losses: i64,
     pub tournaments_played: i64,
     pub tournaments_won: i64,
+    /// Whole 8-player tournaments the player was knocked out of (§6, KaChat@main 7049e70). The
+    /// tournament board is now "whole tournaments only" — champions (won) vs knocked-out (lost).
+    pub tournaments_lost: i64,
     pub last_played_at: i64,
 }
 
@@ -923,30 +926,18 @@ fn apply_event(event: ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
         }
         "join" => {
             if !tournaments.contains_key(&m.t) {
-                // The first join opens a public room — but only the NEXT one in the sequence,
-                // once the previous is full, so everyone queues into the same room.
-                let opened = if let Some(number) = public_number(&m.t) {
-                    let prev_full = number == 1
-                        || tournaments.get(&public_id(number - 1)).map(|t| t.is_full()).unwrap_or(false);
-                    if prev_full {
-                        Some(PLAYER_COUNT as i32)
-                    } else {
-                        None
-                    }
-                } else if let Some(number) = duel_number(&m.t) {
-                    let prev_full = number == 1
-                        || tournaments.get(&duel_id(number - 1)).map(|t| t.is_full()).unwrap_or(false);
-                    if prev_full {
-                        Some(2)
-                    } else {
-                        None
-                    }
+                // The first join opens a public room — whichever number it names. There used to be
+                // a rule that room N opened only once room N-1 was full, but that made every
+                // viewer's result depend on holding the complete history back to room 1: a viewer
+                // missing the early rooms (indexer window / retention / a late backfill) rejected
+                // every later room outright. The app dropped that gate (KaChat@main 7049e70); an
+                // indexer that keeps it undercounts exactly the 1v1s/tournaments the phones show.
+                let capacity = if public_number(&m.t).is_some() {
+                    PLAYER_COUNT as i32
+                } else if duel_number(&m.t).is_some() {
+                    2
                 } else {
-                    None
-                };
-                let capacity = match opened {
-                    Some(c) => c,
-                    None => return,
+                    return;
                 };
                 tournaments.insert(
                     m.t.clone(),
@@ -1318,6 +1309,7 @@ fn leaderboard(tournaments: &HashMap<String, Tournament>) -> Vec<LeaderboardRow>
             tournament_game_losses: 0,
             tournaments_played: 0,
             tournaments_won: 0,
+            tournaments_lost: 0,
             last_played_at: 0,
         })
     }
@@ -1368,7 +1360,9 @@ fn leaderboard(tournaments: &HashMap<String, Tournament>) -> Vec<LeaderboardRow>
                 if is_duel {
                     l.duel_losses += 1;
                 } else {
+                    // A tournament game loss in single-elim IS elimination from the tournament.
                     l.tournament_game_losses += 1;
+                    l.tournaments_lost += 1;
                 }
             }
         }
