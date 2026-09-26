@@ -4,7 +4,7 @@ use anyhow::bail;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use indexer_actors::metrics::SharedMetrics;
 use indexer_db::AddressPayload;
@@ -56,6 +56,8 @@ impl GroupControlApi {
         Router::new()
             .route("/by-sender", get(get_group_control_by_sender))
             .route("/by-recipient", get(get_group_control_by_recipient))
+            // Live polling: the union of controls from any sender OR to a recipient, since a time.
+            .route("/since", post(post_group_control_since))
     }
 }
 
@@ -414,6 +416,211 @@ async fn get_group_control_by_recipient(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: format!("Task error: {join_error}"),
+            }),
+        )),
+    }
+}
+
+/// Up to this many senders per `since` request.
+const MAX_SINCE_SENDERS: usize = 256;
+
+fn parse_address(s: &str) -> Result<AddressPayload, String> {
+    let rpc = kaspa_rpc_core::RpcAddress::try_from(s.to_string())
+        .map_err(|e| format!("Invalid address: {e}"))?;
+    AddressPayload::try_from(&rpc).map_err(|e| format!("Invalid address payload: {e}"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlSinceRequest {
+    #[serde(default)]
+    pub senders: Vec<String>,
+    #[serde(default)]
+    pub recipient: Option<String>,
+    pub since_block_time: u64,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlSinceResponse {
+    pub controls: Vec<GroupControlResponse>,
+    pub latest_block_time: u64,
+}
+
+/// POST /group-control/since — the union of controls from any of `senders` OR addressed to
+/// `recipient`, with blockTime > sinceBlockTime, oldest first, capped at limit. Deduped by txId.
+async fn post_group_control_since(
+    State(state): State<GroupControlApi>,
+    Json(request): Json<ControlSinceRequest>,
+) -> impl IntoResponse {
+    if request.senders.len() > MAX_SINCE_SENDERS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("at most {MAX_SINCE_SENDERS} senders per request"),
+            }),
+        ));
+    }
+    let limit = request.limit.unwrap_or(200).min(500);
+    let since = request.since_block_time;
+
+    let mut sender_payloads: Vec<AddressPayload> = Vec::with_capacity(request.senders.len());
+    for s in &request.senders {
+        let payload = parse_address(s)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?;
+        sender_payloads.push(payload);
+    }
+    let recipient_payload = match request.recipient.as_deref() {
+        Some(r) => Some(
+            parse_address(r)
+                .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?,
+        ),
+        None => None,
+    };
+
+    let metrics = state.metrics.clone();
+    let db_read_started = std::time::Instant::now();
+    let result = spawn_blocking(move || {
+        let rtx = state.tx_keyspace.read_tx();
+        let mut all: Vec<GroupControlResponse> = Vec::new();
+        let mut seen_tx_ids = std::collections::HashSet::new();
+
+        // Controls authored by any of the given senders.
+        for sender in &sender_payloads {
+            let rows = state
+                .group_control_by_sender_partition
+                .get_by_sender_from_block_time(&rtx, sender, since)
+                .process_results(|iter| {
+                    iter.filter(|message| {
+                        message.block_time.get() > since && seen_tx_ids.insert(message.tx_id)
+                    })
+                    .take(limit)
+                    .map(|message_key| {
+                        let sender_str =
+                            match to_rpc_address(&message_key.sender, state.context.network_type) {
+                                Ok(Some(addr)) => addr.to_string(),
+                                Ok(None) => String::new(),
+                                Err(e) => bail!("Address conversion error: {}", e),
+                            };
+                        let recipient =
+                            to_rpc_address(&message_key.recipient, state.context.network_type)?
+                                .map(|address| address.to_string());
+                        let acceptance = state
+                            .tx_id_to_acceptance_partition
+                            .acceptance_by_tx_id_rtx(&rtx, &message_key.tx_id)?;
+                        let (accepting_block, accepting_daa_score) = acceptance
+                            .map(|a| {
+                                (
+                                    Some(faster_hex::hex_string(&a.header.accepting_block_hash)),
+                                    Some(a.header.accepting_daa.into()),
+                                )
+                            })
+                            .unwrap_or((None, None));
+                        let sealed_hex = state
+                            .tx_id_to_group_control_partition
+                            .get_rtx(&rtx, &message_key.tx_id)?
+                            .ok_or_else(|| anyhow::anyhow!("Group control payload not found"))?;
+                        Ok(GroupControlResponse {
+                            tx_id: faster_hex::hex_string(&message_key.tx_id),
+                            sender: sender_str,
+                            recipient,
+                            block_time: message_key.block_time.into(),
+                            cursor: faster_hex::hex_string(message_key.as_bytes()),
+                            accepting_block,
+                            accepting_daa_score,
+                            message_payload: faster_hex::hex_string(sealed_hex.as_ref()),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, anyhow::Error>>()
+                })
+                .flatten()?;
+            all.extend(rows);
+        }
+
+        // Controls addressed to the recipient (first-invite discovery, self-stash).
+        if let Some(recipient) = &recipient_payload {
+            let rows = state
+                .group_control_by_recipient_partition
+                .get_by_recipient_from_block_time(&rtx, recipient, since)
+                .process_results(|iter| {
+                    iter.filter(|(message, _sender)| {
+                        message.block_time.get() > since && seen_tx_ids.insert(message.tx_id)
+                    })
+                    .take(limit)
+                    .map(|(message_key, sender_payload)| {
+                        let sender = to_rpc_address(&sender_payload, state.context.network_type)?
+                            .map(|address| address.to_string())
+                            .unwrap_or_default();
+                        let recipient =
+                            to_rpc_address(&message_key.recipient, state.context.network_type)?
+                                .map(|address| address.to_string());
+                        let acceptance = state
+                            .tx_id_to_acceptance_partition
+                            .acceptance_by_tx_id_rtx(&rtx, &message_key.tx_id)?;
+                        let (accepting_block, accepting_daa_score) = acceptance
+                            .map(|a| {
+                                (
+                                    Some(faster_hex::hex_string(&a.header.accepting_block_hash)),
+                                    Some(a.header.accepting_daa.into()),
+                                )
+                            })
+                            .unwrap_or((None, None));
+                        let payload = state
+                            .tx_id_to_group_control_partition
+                            .get_rtx(&rtx, &message_key.tx_id)?
+                            .ok_or_else(|| anyhow::anyhow!("Group control payload not found"))?;
+                        Ok(GroupControlResponse {
+                            tx_id: faster_hex::hex_string(&message_key.tx_id),
+                            sender,
+                            recipient,
+                            block_time: message_key.block_time.get(),
+                            cursor: faster_hex::hex_string(message_key.as_bytes()),
+                            accepting_block,
+                            accepting_daa_score,
+                            message_payload: faster_hex::hex_string(payload.as_ref()),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, anyhow::Error>>()
+                })
+                .flatten()?;
+            all.extend(rows);
+        }
+
+        all.sort_by(|a, b| {
+            a.block_time
+                .cmp(&b.block_time)
+                .then_with(|| a.tx_id.cmp(&b.tx_id))
+        });
+        all.truncate(limit);
+        let latest_block_time = all.iter().map(|c| c.block_time).max().unwrap_or(since);
+        Ok::<_, anyhow::Error>(ControlSinceResponse {
+            controls: all,
+            latest_block_time,
+        })
+    })
+    .await;
+    metrics.increment_db_read_ops_total(1);
+    metrics.increment_db_read_time_ms_total(
+        db_read_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    );
+    if result.as_ref().is_err() || matches!(&result, Ok(Err(_))) {
+        metrics.increment_db_errors_total();
+    }
+
+    match result {
+        Ok(Ok(response)) => Ok(Json(response)),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+        Err(join_err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Task error: {join_err}"),
             }),
         )),
     }
