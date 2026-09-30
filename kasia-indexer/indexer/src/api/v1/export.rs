@@ -12,6 +12,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
+use axum::Json;
 use fjall::{PartitionCreateOptions, TxKeyspace};
 
 /// Message-content partitions that carry chat history (verbatim names from indexer-db).
@@ -52,6 +53,30 @@ impl ExportApi {
     pub fn new(tx_keyspace: TxKeyspace) -> Self {
         Self { tx_keyspace }
     }
+}
+
+/// GET /stats — this indexer's slice of the Kaspa Hub → KaChat Stats screen: the chat-family
+/// transaction counts it holds (comm/handshake/pay/gcomm/gctl/self_stash). Counts come from the
+/// one-entry-per-tx `tx-id-to-*` partitions via approximate_len (O(1)-ish; exact enough for a
+/// dashboard). The KaPosts/chess/public-chat categories are served by the content indexer, which
+/// aggregates this endpoint. All-time totals only; the app shows a dash for the rolling windows.
+pub async fn get_stats(State(state): State<ExportApi>) -> impl IntoResponse {
+    let count = |name: &str| -> u64 {
+        state
+            .tx_keyspace
+            .open_partition(name, PartitionCreateOptions::default())
+            .map(|p| p.approximate_len() as u64)
+            .unwrap_or(0)
+    };
+    let categories = serde_json::json!({
+        "messages":      { "total": count("tx-id-to-contextual-message") },
+        "handshakes":    { "total": count("tx-id-to-handshake") },
+        "payments":      { "total": count("tx_id_to_payment") },
+        "groupMessages": { "total": count("tx-id-to-group-message") },
+        "groupUpdates":  { "total": count("tx-id-to-group-control") },
+        "selfStash":     { "total": count("tx-id-to-self-stash") },
+    });
+    (StatusCode::OK, Json(serde_json::json!({ "categories": categories }))).into_response()
 }
 
 /// GET /export — dump every message-content partition as `<partition> <key_hex> <value_hex>`.

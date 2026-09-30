@@ -242,6 +242,11 @@ impl Api {
                 "/metrics/prometheus",
                 get(get_prometheus_metrics).with_state(self.metrics.clone()),
             )
+            // KaChat fork: chat-family transaction counts for Kaspa Hub → KaChat Stats.
+            .route(
+                "/stats",
+                get(export::get_stats).with_state(self.export_api.clone()),
+            )
             // KaChat fork: full-store export + import-file (large-body).
             .route(
                 "/export",

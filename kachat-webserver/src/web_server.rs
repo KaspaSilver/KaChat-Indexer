@@ -592,15 +592,26 @@ async fn handle_stats(
     check_rate_limit(&app_state, addr).await?;
 
     match app_state.db.get_stats().await {
-        Ok(stats) => Ok(Json(serde_json::json!({
-            "broadcasts": stats.broadcasts_count,
-            "posts": stats.posts_count,
-            "replies": stats.replies_count,
-            "quotes": stats.quotes_count,
-            "votes": stats.votes_count,
-            "follows": stats.follows_count,
-            "blocks": stats.blocks_count
-        }))),
+        Ok(stats) => {
+            let mut out = serde_json::json!({
+                "broadcasts": stats.broadcasts_count,
+                "posts": stats.posts_count,
+                "replies": stats.replies_count,
+                "quotes": stats.quotes_count,
+                "votes": stats.votes_count,
+                "follows": stats.follows_count,
+                "blocks": stats.blocks_count
+            });
+            // Merge in the Kaspa Hub → KaChat Stats shape (updatedAt/indexedSince/categories),
+            // including the chat indexer's slice. Superset response: old + new consumers both work.
+            let extra = build_kachat_stats(&app_state).await;
+            if let (Some(o), Some(e)) = (out.as_object_mut(), extra.as_object()) {
+                for (k, v) in e {
+                    o.insert(k.clone(), v.clone());
+                }
+            }
+            Ok(Json(out))
+        }
         Err(e) => {
             log_error!("Failed to get database stats: {}", e);
             let error = ApiError {
@@ -852,6 +863,122 @@ async fn handle_get_poll(
             }),
         )),
     }
+}
+
+// -------------------------------------------------------------- KaChat Stats ---
+// GET /stats — transaction counts by category for Kaspa Hub → KaChat Stats. This content indexer
+// reports the KaPosts/chess/public-chat categories from Postgres, and aggregates the chat indexer's
+// slice (comm/handshakes/payments/groups/self-stash) from 127.0.0.1:8600/stats (same container).
+// kchat:1: root only. Cached ~60s to absorb pull-to-refresh. Public, no auth (200 always).
+
+static STATS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>> =
+    std::sync::OnceLock::new();
+const STATS_TTL: Duration = Duration::from_secs(60);
+
+fn stats_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// Run a `count(*) / FILTER(>d1) / FILTER(>d7)` query, returning (total, last24h, last7d).
+async fn stats_count3(pool: &sqlx::PgPool, sql: &str, d1: i64, d7: i64) -> (i64, i64, i64) {
+    use sqlx::Row;
+    match sqlx::query(sql).bind(d1).bind(d7).fetch_one(pool).await {
+        Ok(r) => (
+            r.get::<i64, _>("t"),
+            r.get::<i64, _>("d1"),
+            r.get::<i64, _>("d7"),
+        ),
+        Err(e) => {
+            log_error!("stats query failed: {}", e);
+            (0, 0, 0)
+        }
+    }
+}
+
+/// Build the Kaspa Hub → KaChat Stats fields ({updatedAt, indexedSince, categories}) — merged into
+/// GET /stats alongside the legacy flat counts. Cached ~60s.
+async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
+    // Serve from cache if fresh (absorbs pull-to-refresh bursts).
+    let cache = STATS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((at, value)) = guard.as_ref() {
+            if at.elapsed() < STATS_TTL {
+                return value.clone();
+            }
+        }
+    }
+
+    let now = stats_now_ms();
+    let d1 = now - 86_400_000;
+    let d7 = now - 7 * 86_400_000;
+    let pool = &app_state.scheduled_pool;
+
+    let cat = |name: &str, c: (i64, i64, i64)| {
+        (name.to_string(), serde_json::json!({ "total": c.0, "last24h": c.1, "last7d": c.2 }))
+    };
+    let mut categories = serde_json::Map::new();
+
+    let kaposts = stats_count3(pool,
+        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7 \
+         FROM k_contents WHERE content_type IN ('post','reply','quote','poll')", d1, d7).await;
+    let (k, v) = cat("kaposts", kaposts); categories.insert(k, v);
+
+    let actions = stats_count3(pool,
+        "SELECT count(*) t, count(*) FILTER (WHERE bt > $1) d1, count(*) FILTER (WHERE bt > $2) d7 FROM ( \
+           SELECT block_time bt FROM k_votes UNION ALL SELECT block_time FROM k_follows \
+           UNION ALL SELECT block_time FROM k_edits UNION ALL SELECT block_time FROM k_deletes \
+           UNION ALL SELECT block_time FROM k_poll_votes) a", d1, d7).await;
+    let (k, v) = cat("kapostActions", actions); categories.insert(k, v);
+
+    let public_chats = stats_count3(pool,
+        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7 \
+         FROM kachat_broadcasts WHERE channel <> 'chess-arena'", d1, d7).await;
+    let (k, v) = cat("publicChats", public_chats); categories.insert(k, v);
+
+    let chess_moves = stats_count3(pool,
+        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7 \
+         FROM kachat_broadcasts WHERE channel = 'chess-arena' AND content LIKE '%\"a\":\"move\"%'", d1, d7).await;
+    let (k, v) = cat("chessMoves", chess_moves); categories.insert(k, v);
+
+    // indexedSince = earliest kchat:1: content we hold (honest "counting since").
+    let indexed_since: Option<i64> = {
+        use sqlx::Row;
+        sqlx::query("SELECT min(block_time) m FROM k_contents")
+            .fetch_one(pool)
+            .await
+            .ok()
+            .and_then(|r| r.try_get::<i64, _>("m").ok())
+    };
+
+    // Aggregate the chat indexer's slice (same container, 127.0.0.1:8600). Best-effort: on any
+    // failure we just return our own categories, so a split deployment still works.
+    let chat_url = std::env::var("CHAT_STATS_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8600/stats".to_string());
+    if let Ok(resp) = app_state.http.get(&chat_url).timeout(Duration::from_secs(5)).send().await {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if let Some(obj) = body.get("categories").and_then(|c| c.as_object()) {
+                    for (k, v) in obj {
+                        categories.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert("updatedAt".to_string(), serde_json::json!(now));
+    if let Some(since) = indexed_since {
+        out.insert("indexedSince".to_string(), serde_json::json!(since));
+    }
+    out.insert("categories".to_string(), serde_json::Value::Object(categories));
+    let value = serde_json::Value::Object(out);
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((std::time::Instant::now(), value.clone()));
+    }
+    value
 }
 
 async fn handle_get_thread(
