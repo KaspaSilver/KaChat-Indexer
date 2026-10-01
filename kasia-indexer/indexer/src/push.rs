@@ -4067,4 +4067,91 @@ mod tests {
         drop(handle);
         actor_thread.join().expect("actor exits cleanly");
     }
+
+    #[tokio::test]
+    async fn tokens_for_inbox_matches_recipient_primary_address() {
+        // No-handshake messaging (§5.4): a dm is routed to the recipient's devices by the inbox tag
+        // of their primary address. Register two devices with different primaries and confirm the
+        // tag lookup returns only the matching one, and nothing for a tag no device owns.
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let registry = PushRegistry::new(
+            tx_keyspace.clone(),
+            DeviceRegistrationPartition::new(&tx_keyspace).expect("device partition"),
+            WatchedAddressPartition::new(&tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(&tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(&tx_keyspace).expect("primary partition"),
+            create_shared_metrics(),
+        );
+        let (actor, handle) = PushRegistryActor::new(registry, 8);
+        let actor_thread = std::thread::spawn(move || actor.process());
+
+        let primary_a = Address::new(Prefix::Mainnet, Version::PubKey, &[1; 32]).to_string();
+        let primary_b = Address::new(Prefix::Mainnet, Version::PubKey, &[2; 32]).to_string();
+        let token_a = "aa".repeat(32);
+        let token_b = "bb".repeat(32);
+
+        for (token, primary) in [
+            (token_a.clone(), primary_a.clone()),
+            (token_b.clone(), primary_b.clone()),
+        ] {
+            handle
+                .register(
+                    token,
+                    "ios".to_string(),
+                    vec![primary.clone()], // watch own address (a device registers with one)
+                    vec![],
+                    vec![],
+                    Some(primary),
+                    vec![],
+                    vec![],
+                    Default::default(),
+                    None,
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("registration succeeds");
+        }
+
+        // Hash the primary exactly as stored, so the test is immune to any normalization in register.
+        let stored = handle
+            .primary_addresses_for_tokens(vec![token_a.clone()])
+            .await
+            .expect("primary lookup succeeds");
+        let stored_primary_a = stored
+            .get(&token_a)
+            .expect("device A has a stored primary")
+            .clone();
+        let tag_a = crate::compute_inbox_tag(&stored_primary_a);
+
+        // Only the device whose primary hashes to the tag is returned — not device B.
+        assert_eq!(
+            handle
+                .matching_tokens_for_inbox(tag_a)
+                .await
+                .expect("inbox match"),
+            vec![token_a.clone()],
+        );
+
+        // A tag no device owns returns nothing (mirrors the endpoint's unknown-tag -> 200 []).
+        let mut unknown = tag_a;
+        unknown[0] ^= 0xFF;
+        assert!(
+            handle
+                .matching_tokens_for_inbox(unknown)
+                .await
+                .expect("inbox match")
+                .is_empty(),
+        );
+
+        drop(handle);
+        actor_thread.join().expect("actor exits cleanly");
+    }
 }
