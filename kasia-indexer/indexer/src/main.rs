@@ -60,6 +60,7 @@ mod context;
 mod fcm;
 mod push;
 mod signals;
+mod stats_windows;
 
 /// Load the personal-mode address allowlist (KaChat fork). The admin dashboard writes one
 /// address per line to `KASIA_PERSONAL_FILE` (default `/app/data/personal_addresses.txt`) and
@@ -452,6 +453,9 @@ async fn main() -> anyhow::Result<()> {
             .into_boxed_str(),
     );
     let api_handle = tokio::spawn(api_service.serve(api_bind, api_shutdown_rx));
+
+    // KaChat Stats: keep the chat-category 24h/7d windows warm for GET /stats (every ~5 min).
+    stats_windows::spawn_window_scanner(tx_keyspace.clone());
 
     let options = ConnectOptions {
         block_async_connect: false,

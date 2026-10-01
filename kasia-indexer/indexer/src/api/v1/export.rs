@@ -68,13 +68,28 @@ pub async fn get_stats(State(state): State<ExportApi>) -> impl IntoResponse {
             .map(|p| p.approximate_len() as u64)
             .unwrap_or(0)
     };
+    // total from approximate_len (unchanged); 24h/7d from the cached window scan (omitted while
+    // the cache is still warming). Clamp the windows to total so last24h <= last7d <= total holds
+    // even though total is an approximate count and the windows are exact.
+    let category = |cat: &'static str, tx_id_partition: &str| -> serde_json::Value {
+        let total = count(tx_id_partition);
+        let mut obj = serde_json::Map::new();
+        obj.insert("total".to_string(), serde_json::json!(total));
+        if let Some((d1, d7)) = crate::stats_windows::windows_for(cat) {
+            let d7 = d7.min(total);
+            let d1 = d1.min(d7);
+            obj.insert("last24h".to_string(), serde_json::json!(d1));
+            obj.insert("last7d".to_string(), serde_json::json!(d7));
+        }
+        serde_json::Value::Object(obj)
+    };
     let categories = serde_json::json!({
-        "messages":      { "total": count("tx-id-to-contextual-message") },
-        "handshakes":    { "total": count("tx-id-to-handshake") },
-        "payments":      { "total": count("tx_id_to_payment") },
-        "groupMessages": { "total": count("tx-id-to-group-message") },
-        "groupUpdates":  { "total": count("tx-id-to-group-control") },
-        "selfStash":     { "total": count("tx-id-to-self-stash") },
+        "messages":      category("messages", "tx-id-to-contextual-message"),
+        "handshakes":    category("handshakes", "tx-id-to-handshake"),
+        "payments":      category("payments", "tx_id_to_payment"),
+        "groupMessages": category("groupMessages", "tx-id-to-group-message"),
+        "groupUpdates":  category("groupUpdates", "tx-id-to-group-control"),
+        "selfStash":     category("selfStash", "tx-id-to-self-stash"),
     });
     (StatusCode::OK, Json(serde_json::json!({ "categories": categories }))).into_response()
 }
