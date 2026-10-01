@@ -462,21 +462,25 @@ async fn get_broadcasts(
 #[derive(Deserialize)]
 struct RecentQuery {
     limit: Option<i64>,
-    /// Keyset cursor for paging through everything ever indexed: pass the previous page's last
-    /// item `timestamp` + `id` to get the rows strictly older than it (same DESC ordering).
-    before_time: Option<i64>,
-    before_id: Option<i64>,
+    /// Zero-based offset for numbered-page navigation (page N = offset (N-1)*limit).
+    offset: Option<i64>,
 }
 
 #[derive(Serialize)]
 struct RecentItem {
-    /// Row id — the stable tiebreaker for the keyset cursor (pass back as `before_id`).
     id: i64,
     transaction_id: String,
     sender_pubkey: String,
     content_type: String,
     timestamp: i64,
     preview: String,
+}
+
+/// A page of recent content plus the grand total, so the panel can render numbered page buttons.
+#[derive(Serialize)]
+struct RecentPage {
+    total: i64,
+    items: Vec<RecentItem>,
 }
 
 /// The KaChat exclusivity marker (U+2060), stripped from previews for readability.
@@ -495,42 +499,29 @@ fn decode_preview(base64_message: &str) -> String {
 async fn get_recent(
     State(state): State<AppState>,
     Query(params): Query<RecentQuery>,
-) -> Result<Json<Vec<RecentItem>>, ApiError> {
+) -> Result<Json<RecentPage>, ApiError> {
     let limit = params.limit.unwrap_or(25).clamp(1, 200);
-    // Keyset pagination: with a cursor, return rows strictly older than (before_time, before_id) in
-    // the same DESC ordering, so the panel can walk back through everything ever indexed. Without
-    // one, start from the newest. The `(block_time, id) < ($, $)` row comparison matches the ORDER BY.
-    let rows = match (params.before_time, params.before_id) {
-        (Some(before_time), Some(before_id)) => {
-            sqlx::query(
-                r#"
-                SELECT id, transaction_id, sender_pubkey, content_type, block_time, base64_encoded_message
-                FROM k_contents
-                WHERE (block_time, id) < ($2, $3)
-                ORDER BY block_time DESC, id DESC
-                LIMIT $1
-                "#,
-            )
-            .bind(limit)
-            .bind(before_time)
-            .bind(before_id)
-            .fetch_all(&state.pool)
-            .await
-        }
-        _ => {
-            sqlx::query(
-                r#"
-                SELECT id, transaction_id, sender_pubkey, content_type, block_time, base64_encoded_message
-                FROM k_contents
-                ORDER BY block_time DESC, id DESC
-                LIMIT $1
-                "#,
-            )
-            .bind(limit)
-            .fetch_all(&state.pool)
-            .await
-        }
-    }
+    let offset = params.offset.unwrap_or(0).max(0);
+
+    // Offset pagination so the panel can jump to any numbered page. `total` drives how many page
+    // buttons it shows. COUNT(*) is fine for a dashboard-sized table.
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM k_contents")
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::db)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, transaction_id, sender_pubkey, content_type, block_time, base64_encoded_message
+        FROM k_contents
+        ORDER BY block_time DESC, id DESC
+        LIMIT $1 OFFSET $2
+        "#,
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
     .map_err(ApiError::db)?;
 
     let items = rows
@@ -550,7 +541,7 @@ async fn get_recent(
         })
         .collect();
 
-    Ok(Json(items))
+    Ok(Json(RecentPage { total, items }))
 }
 
 // ---------------------------------------------------------------------------
