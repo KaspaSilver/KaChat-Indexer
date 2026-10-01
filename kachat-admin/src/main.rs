@@ -462,10 +462,16 @@ async fn get_broadcasts(
 #[derive(Deserialize)]
 struct RecentQuery {
     limit: Option<i64>,
+    /// Keyset cursor for paging through everything ever indexed: pass the previous page's last
+    /// item `timestamp` + `id` to get the rows strictly older than it (same DESC ordering).
+    before_time: Option<i64>,
+    before_id: Option<i64>,
 }
 
 #[derive(Serialize)]
 struct RecentItem {
+    /// Row id — the stable tiebreaker for the keyset cursor (pass back as `before_id`).
+    id: i64,
     transaction_id: String,
     sender_pubkey: String,
     content_type: String,
@@ -491,17 +497,40 @@ async fn get_recent(
     Query(params): Query<RecentQuery>,
 ) -> Result<Json<Vec<RecentItem>>, ApiError> {
     let limit = params.limit.unwrap_or(25).clamp(1, 200);
-    let rows = sqlx::query(
-        r#"
-        SELECT transaction_id, sender_pubkey, content_type, block_time, base64_encoded_message
-        FROM k_contents
-        ORDER BY block_time DESC, id DESC
-        LIMIT $1
-        "#,
-    )
-    .bind(limit)
-    .fetch_all(&state.pool)
-    .await
+    // Keyset pagination: with a cursor, return rows strictly older than (before_time, before_id) in
+    // the same DESC ordering, so the panel can walk back through everything ever indexed. Without
+    // one, start from the newest. The `(block_time, id) < ($, $)` row comparison matches the ORDER BY.
+    let rows = match (params.before_time, params.before_id) {
+        (Some(before_time), Some(before_id)) => {
+            sqlx::query(
+                r#"
+                SELECT id, transaction_id, sender_pubkey, content_type, block_time, base64_encoded_message
+                FROM k_contents
+                WHERE (block_time, id) < ($2, $3)
+                ORDER BY block_time DESC, id DESC
+                LIMIT $1
+                "#,
+            )
+            .bind(limit)
+            .bind(before_time)
+            .bind(before_id)
+            .fetch_all(&state.pool)
+            .await
+        }
+        _ => {
+            sqlx::query(
+                r#"
+                SELECT id, transaction_id, sender_pubkey, content_type, block_time, base64_encoded_message
+                FROM k_contents
+                ORDER BY block_time DESC, id DESC
+                LIMIT $1
+                "#,
+            )
+            .bind(limit)
+            .fetch_all(&state.pool)
+            .await
+        }
+    }
     .map_err(ApiError::db)?;
 
     let items = rows
@@ -511,6 +540,7 @@ async fn get_recent(
             let sender: Vec<u8> = row.get("sender_pubkey");
             let msg: String = row.get("base64_encoded_message");
             RecentItem {
+                id: row.get("id"),
                 transaction_id: hex::encode(&tx),
                 sender_pubkey: hex::encode(&sender),
                 content_type: row.get("content_type"),
