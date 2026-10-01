@@ -1413,13 +1413,16 @@ pub struct TournamentSummary {
 }
 
 /// Replay the arena once and return both the leaderboard and the lobby list.
-pub fn compute_all(rows: Vec<ArenaRow>) -> (Vec<LeaderboardRow>, Vec<TournamentSummary>) {
+pub fn compute_all(rows: Vec<ArenaRow>) -> (Vec<LeaderboardRow>, Vec<TournamentSummary>, u64) {
     let events: Vec<ArenaEvent> = rows
         .into_iter()
         .filter_map(|r| arena_event(r.tx_id, r.sender, r.block_time, &r.content))
         .collect();
     let tournaments = reduce(events);
     let board = leaderboard(&tournaments);
+    // Chess Games (§ stats): games started = every game the reducer created across all rooms (a
+    // duel's single game; a tournament's round games as each round begins).
+    let games_started: u64 = tournaments.values().map(|t| t.games.len() as u64).sum();
 
     let mut lobby: Vec<TournamentSummary> = tournaments
         .into_iter()
@@ -1449,7 +1452,7 @@ pub fn compute_all(rows: Vec<ArenaRow>) -> (Vec<LeaderboardRow>, Vec<TournamentS
             .cmp(&a.started_at.unwrap_or(0))
             .then(a.id.cmp(&b.id))
     });
-    (board, lobby)
+    (board, lobby, games_started)
 }
 
 #[cfg(test)]
