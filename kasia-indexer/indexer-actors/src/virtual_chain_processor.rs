@@ -902,6 +902,7 @@ impl VirtualProcessor {
                             daa_score: daa,
                             blinded_group_id: None,
                             group_control_recipient: None,
+                            inbox_tag: None,
                         });
                         Ok(())
                     }
@@ -949,14 +950,14 @@ impl VirtualProcessor {
                             daa_score: daa,
                             blinded_group_id: None,
                             group_control_recipient: None,
+                            inbox_tag: None,
                         });
                         Ok(())
                     }
                     PartitionId::ContextualMessageByInbox => {
                         // No-handshake messaging: fill in the resolved sender for the inbox-tag
-                        // index, same deferred-resolution shape as HandshakeByReceiver. The by-sender
-                        // arm above already emitted the push and payload; this only completes the tag
-                        // lookup's value.
+                        // index (same deferred shape as HandshakeByReceiver) and now that the sender
+                        // is known, emit the recipient's discovery push routed by inbox tag.
                         if !matches!(entry.action, Action::UpdateValueSender) {
                             panic!("Unexpected action")
                         }
@@ -964,6 +965,29 @@ impl VirtualProcessor {
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
                         self.contextual_message_by_inbox_partition
                             .insert_wtx(wtx, key, Some(sender))?;
+                        let payload = self
+                            .tx_id_to_contextual_message_partition
+                            .get_rtx(&rtx, &key.tx_id)
+                            .ok()
+                            .flatten()
+                            .map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string());
+                        push_events.borrow_mut().push(PushEvent {
+                            kind: PushEventKind::Contextual,
+                            // Unused for inbox-tag routing (only logged); use the resolved sender so
+                            // address stringification never sees a zero address.
+                            watched_address: sender,
+                            sender,
+                            receiver: sender,
+                            alias: None,
+                            tx_id: key.tx_id,
+                            amount: None,
+                            payload,
+                            timestamp: key.block_time.into(),
+                            daa_score: daa,
+                            blinded_group_id: None,
+                            group_control_recipient: None,
+                            inbox_tag: Some(key.inbox_tag),
+                        });
                         Ok(())
                     }
                     PartitionId::PaymentByReceiver => {
@@ -1000,6 +1024,7 @@ impl VirtualProcessor {
                                 daa_score: daa,
                                 blinded_group_id: None,
                                 group_control_recipient: None,
+                                inbox_tag: None,
                             });
                         } else {
                             trace!(sender = ?sender, "Skipping payment push: receiver matches sender");
@@ -1044,6 +1069,7 @@ impl VirtualProcessor {
                             daa_score: daa,
                             blinded_group_id: None,
                             group_control_recipient: None,
+                            inbox_tag: None,
                         });
                         Ok(())
                     }
@@ -1100,6 +1126,7 @@ impl VirtualProcessor {
                             daa_score: daa,
                             blinded_group_id: Some(key.blinded_group_id),
                             group_control_recipient: None,
+                            inbox_tag: None,
                         });
                         Ok(())
                     }
@@ -1141,6 +1168,7 @@ impl VirtualProcessor {
                             daa_score: daa,
                             blinded_group_id: None,
                             group_control_recipient: recipient,
+                            inbox_tag: None,
                         });
                         Ok(())
                     }

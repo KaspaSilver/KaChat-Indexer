@@ -1,4 +1,5 @@
 use indexer_db::AddressPayload;
+use indexer_db::messages::contextual_message::INBOX_TAG_LEN;
 
 #[derive(Debug, Clone, Copy)]
 pub enum PushEventKind {
@@ -94,6 +95,10 @@ pub struct PushEvent {
     pub blinded_group_id: Option<[u8; 32]>,
     /// Exact destination for recipient-addressed `gctl`; `None` denotes legacy control.
     pub group_control_recipient: Option<AddressPayload>,
+    /// No-handshake messaging (KaChat 5.2): when `Some`, this event is a `dm` discovery push routed
+    /// to the recipient by inbox tag (not by `watched_address`), and the delivered payload carries
+    /// `"inbox": true`. `None` for every classic push. See NO_HANDSHAKE_MESSAGING.md §5.4.
+    pub inbox_tag: Option<[u8; INBOX_TAG_LEN]>,
 }
 
 pub fn parse_self_stash_alias(raw: &[u8]) -> Option<String> {

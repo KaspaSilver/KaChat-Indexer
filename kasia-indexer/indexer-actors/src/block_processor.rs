@@ -661,6 +661,7 @@ impl BlockProcessor {
                 daa_score: block.daa_score,
                 blinded_group_id: None,
                 group_control_recipient: None,
+                inbox_tag: None,
             });
         } else {
             trace!("No sender resolved for handshake");
@@ -725,6 +726,7 @@ impl BlockProcessor {
                 daa_score: block.daa_score,
                 blinded_group_id: None,
                 group_control_recipient: None,
+                inbox_tag: None,
             });
         } else {
             trace!("No sender resolved for handshake v2");
@@ -785,6 +787,7 @@ impl BlockProcessor {
                     daa_score: header.daa_score,
                     blinded_group_id: None,
                     group_control_recipient: None,
+                    inbox_tag: None,
                 });
             }
         } else {
@@ -812,12 +815,30 @@ impl BlockProcessor {
                     {
                         warn!(%tx_id, error = %e, "Failed to index dm by inbox tag");
                     }
-                    if sender.is_none() {
-                        entries.push(InsertionEntry {
+                    match sender {
+                        // Sender known now: notify the recipient's devices (routed by inbox tag).
+                        // When the sender is still unresolved the push is emitted at resolution, in
+                        // the ContextualMessageByInbox arm of the virtual chain processor.
+                        Some(sender) => self.emit_push(PushEvent {
+                            kind: PushEventKind::Contextual,
+                            watched_address: receiver,
+                            sender,
+                            receiver,
+                            alias: None,
+                            tx_id: tx_id.as_bytes(),
+                            amount: None,
+                            payload: Some(String::from_utf8_lossy(cm.sealed_hex).to_string()),
+                            timestamp: header.timestamp,
+                            daa_score: header.daa_score,
+                            blinded_group_id: None,
+                            group_control_recipient: None,
+                            inbox_tag: Some(inbox_tag),
+                        }),
+                        None => entries.push(InsertionEntry {
                             partition_id: PartitionId::ContextualMessageByInbox,
                             action: Action::UpdateValueSender,
                             partition_key: SmallVec::from_slice(ik.as_bytes()),
-                        });
+                        }),
                     }
                 }
                 Err(e) => warn!(%tx_id, error = %e, "dm inbox tag failed to decode; skipping inbox index"),
@@ -874,6 +895,7 @@ impl BlockProcessor {
                     daa_score: header.daa_score,
                     blinded_group_id: None,
                     group_control_recipient: None,
+                    inbox_tag: None,
                 });
             } else {
                 trace!(sender = ?sender, "Skipping payment push: receiver matches sender");
@@ -931,6 +953,7 @@ impl BlockProcessor {
                     daa_score: block_header.daa_score,
                     blinded_group_id: None,
                     group_control_recipient: None,
+                    inbox_tag: None,
                 });
             }
         } else {
@@ -995,6 +1018,7 @@ impl BlockProcessor {
                 daa_score: block.daa_score,
                 blinded_group_id: Some(blinded_group_id),
                 group_control_recipient: None,
+                inbox_tag: None,
             });
         } else {
             trace!("No sender resolved for group message");
@@ -1066,6 +1090,7 @@ impl BlockProcessor {
                 daa_score: block_header.daa_score,
                 blinded_group_id: None,
                 group_control_recipient: recipient,
+                inbox_tag: None,
             });
         } else {
             trace!("No sender resolved for group control");

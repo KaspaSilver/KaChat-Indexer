@@ -7,6 +7,7 @@ use indexer_actors::metrics::SharedMetrics;
 use indexer_actors::push::{ExtensionPushEvent, FundsPushEvent, PushEvent, PushEventKind};
 use indexer_actors::util::ToHex;
 use indexer_db::AddressPayload;
+use indexer_db::messages::contextual_message::INBOX_TAG_LEN;
 use indexer_db::push::{
     DeviceRegistrationPartition, PrimaryAddressPartition, WatchedAddressPartition,
     WatchedGroupIdPartition,
@@ -1188,6 +1189,27 @@ impl PushRegistry {
         Ok(out)
     }
 
+    /// No-handshake messaging (KaChat 5.2): every device whose primary (own) address hashes to
+    /// `inbox_tag` — the recipient of a `dm` carrying that tag. Iterates all registrations (no
+    /// reverse index; dm-discovery pushes are rare relative to chat, mirroring the VoIP lookup).
+    fn tokens_for_inbox(&self, inbox_tag: &[u8; INBOX_TAG_LEN]) -> anyhow::Result<Vec<String>> {
+        let rtx = self.tx_keyspace.read_tx();
+        let mut out = Vec::new();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let value = entry?;
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            let Some(primary) = reg.primary_address.as_deref() else {
+                continue;
+            };
+            if &crate::compute_inbox_tag(primary) == inbox_tag {
+                out.push(reg.device_token);
+            }
+        }
+        Ok(out)
+    }
+
     fn token_allows_alias(&mut self, token: &str, alias: &str) -> bool {
         if let Some(aliases) = self.alias_cache.get(token) {
             return aliases.is_empty() || aliases.contains(alias);
@@ -1389,6 +1411,12 @@ enum PushRegistryCommand {
         group_id: [u8; 32],
         response: RegistryResponse<Vec<String>>,
     },
+    /// No-handshake messaging: devices whose primary address hashes to this inbox tag (the dm's
+    /// recipient).
+    MatchInboxTokens {
+        inbox_tag: [u8; INBOX_TAG_LEN],
+        response: RegistryResponse<Vec<String>>,
+    },
     MatchGroupControlTokens {
         sender: AddressPayload,
         recipient: Option<AddressPayload>,
@@ -1570,6 +1598,13 @@ impl PushRegistryActor {
                 }
                 PushRegistryCommand::MatchGroupTokens { group_id, response } => {
                     let result = self.registry.matching_tokens_for_group(&group_id);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::MatchInboxTokens {
+                    inbox_tag,
+                    response,
+                } => {
+                    let result = self.registry.tokens_for_inbox(&inbox_tag);
                     let _ = response.send(result);
                 }
                 PushRegistryCommand::MatchGroupControlTokens {
@@ -1787,6 +1822,16 @@ impl PushRegistryHandle {
         group_id: [u8; 32],
     ) -> anyhow::Result<Vec<String>> {
         self.request(|response| PushRegistryCommand::MatchGroupTokens { group_id, response })
+            .await
+    }
+
+    /// No-handshake messaging (KaChat 5.2): the device tokens whose primary address hashes to
+    /// `inbox_tag` — the recipient of a `dm` carrying that tag.
+    pub async fn matching_tokens_for_inbox(
+        &self,
+        inbox_tag: [u8; INBOX_TAG_LEN],
+    ) -> anyhow::Result<Vec<String>> {
+        self.request(|response| PushRegistryCommand::MatchInboxTokens { inbox_tag, response })
             .await
     }
 
@@ -2562,6 +2607,13 @@ impl PushDispatcher {
                     )
                     .await?
             }
+            // No-handshake messaging: a `dm` discovery push is routed to the recipient by inbox tag,
+            // not by watched_address.
+            _ if event.inbox_tag.is_some() => {
+                self.registry
+                    .matching_tokens_for_inbox(event.inbox_tag.unwrap())
+                    .await?
+            }
             _ => {
                 let receiver_filter = matches!(
                     event.kind,
@@ -2635,9 +2687,17 @@ impl PushDispatcher {
         }
 
         let tx_id = event.tx_id.to_hex();
-        if !self.sent_cache.mark_seen(&tx_id) {
+        // A `dm` yields two pushes for one tx — the sender-side contextual (watched_address = sender,
+        // for the writer's own devices) and this recipient-side inbox push — so they dedup under
+        // separate keys instead of the inbox one being swallowed as a "duplicate tx".
+        let dedup_key = if event.inbox_tag.is_some() {
+            format!("{tx_id}:inbox")
+        } else {
+            tx_id.clone()
+        };
+        if !self.sent_cache.mark_seen(&dedup_key) {
             self.metrics.increment_push_dedup_dropped_total();
-            tracing::debug!("[Push] Duplicate tx {} ignored", tx_id);
+            tracing::debug!("[Push] Duplicate tx {} ignored", dedup_key);
             return Ok(());
         }
         let payload_type = match event.kind {
@@ -2682,6 +2742,7 @@ impl PushDispatcher {
             timestamp: event.timestamp,
             daa_score: event.daa_score,
             blinded_group_id: event.blinded_group_id.map(|id| id.to_hex()),
+            inbox: event.inbox_tag.is_some(),
         };
 
         // FCM data-only payload (no notification block — see deliver()): the Android FCM handler
@@ -2703,6 +2764,9 @@ impl PushDispatcher {
         }
         if let Some(group_id) = payload.blinded_group_id.as_ref() {
             data.insert("blinded_group_id".to_string(), group_id.clone());
+        }
+        if payload.inbox {
+            data.insert("inbox".to_string(), "true".to_string());
         }
         // The sealed/encrypted message body for the app to decrypt locally.
         if let Some(enc) = payload.payload.as_ref() {
@@ -2763,6 +2827,10 @@ struct PushPayload {
     daa_score: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     blinded_group_id: Option<String>,
+    /// No-handshake messaging (KaChat 5.2): present and `true` only on a `dm` discovery push, so the
+    /// recipient's client can treat it as a message request. Omitted otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    inbox: bool,
 }
 
 #[derive(Debug, Serialize)]
