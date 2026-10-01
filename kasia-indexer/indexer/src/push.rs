@@ -3861,6 +3861,8 @@ mod tests {
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
+            apns_environment: None,
+            voip_token: None,
             created_at: 0,
             last_seen: 0,
         };

@@ -60,6 +60,12 @@ pub struct SealedMessage {
 pub struct SealedContextualMessageV1<'a> {
     pub alias: &'a [u8],
     pub sealed_hex: &'a [u8],
+    /// No-handshake messaging (KaChat 5.2): the recipient-derived inbox tag carried only by a
+    /// `dm` message's **first** envelope, as 32 lowercase hex bytes. `None` for a classic `comm`
+    /// message. A `dm` is stored exactly like a `comm` (by sender + alias, by tx id) and, when this
+    /// is `Some`, additionally indexed by the tag so the recipient can discover it without a
+    /// handshake. See NO_HANDSHAKE_MESSAGING.md §1-2.
+    pub inbox_tag: Option<&'a [u8]>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -186,6 +192,7 @@ mod tests {
                 SealedContextualMessageV1 {
                     alias: b"alias123",
                     sealed_hex: b"abc123",
+                    inbox_tag: None,
                 }
             ))
         );
@@ -202,6 +209,7 @@ mod tests {
                 SealedContextualMessageV1 {
                     alias: b"alias123",
                     sealed_hex: b"abc123",
+                    inbox_tag: None,
                 }
             ))
         );
@@ -217,6 +225,47 @@ mod tests {
         );
         // Unknown prefixes still reject.
         assert_eq!(parse_sealed_operation(b"other:1:comm:a:b"), None);
+    }
+
+    #[test]
+    fn test_deserialize_dm_message() {
+        // dm:<tag>:<alias>:<sealed> parses to the same ContextualMessageV1 as comm, plus the tag.
+        let tag = "a".repeat(32);
+        let payload = format!("kchat:1:dm:{tag}:alias123:abc123");
+        assert_eq!(
+            parse_sealed_operation(payload.as_bytes()),
+            Some(SealedOperation::ContextualMessageV1(
+                SealedContextualMessageV1 {
+                    alias: b"alias123",
+                    sealed_hex: b"abc123",
+                    inbox_tag: Some(tag.as_bytes()),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn test_deserialize_dm_rejects_bad_tag() {
+        // Wrong length, uppercase, or non-hex tags reject the whole operation.
+        for tag in [
+            "a".repeat(31),
+            "a".repeat(33),
+            "A".repeat(32),
+            format!("{}z", "a".repeat(31)),
+        ] {
+            let payload = format!("kchat:1:dm:{tag}:alias123:abc123");
+            assert_eq!(
+                parse_sealed_operation(payload.as_bytes()),
+                None,
+                "tag {tag} must reject"
+            );
+        }
+        // Missing the alias delimiter also rejects.
+        let tag = "a".repeat(32);
+        assert_eq!(
+            parse_sealed_operation(format!("kchat:1:dm:{tag}:onlyonefield").as_bytes()),
+            None
+        );
     }
 
     #[test]

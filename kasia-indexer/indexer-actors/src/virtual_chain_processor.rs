@@ -6,8 +6,8 @@ use crate::util::ToHex64;
 use crate::virtual_chain_syncer::{NotificationAck, VirtualChainSyncer};
 use fjall::{TxKeyspace, WriteTransaction};
 use indexer_db::messages::contextual_message::{
-    ContextualMessageBySenderKey, ContextualMessageBySenderPartition,
-    TxIdToContextualMessagePartition,
+    ContextualMessageByInboxKey, ContextualMessageByInboxPartition, ContextualMessageBySenderKey,
+    ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
 };
 use indexer_db::messages::group_control::{
     GroupControlByRecipientPartition, GroupControlBySenderPartition, GroupControlKeyByRecipient,
@@ -69,6 +69,7 @@ pub struct VirtualProcessor {
     handshake_by_sender_partition: HandshakeBySenderPartition,
 
     contextual_message_by_sender_partition: ContextualMessageBySenderPartition,
+    contextual_message_by_inbox_partition: ContextualMessageByInboxPartition,
     self_stash_by_owner_partition: SelfStashByOwnerPartition,
 
     payment_by_receiver_partition: PaymentByReceiverPartition,
@@ -840,6 +841,9 @@ impl VirtualProcessor {
                     PartitionId::ContextualMessageBySender => {
                         size_of::<ContextualMessageBySenderKey>()
                     }
+                    PartitionId::ContextualMessageByInbox => {
+                        size_of::<ContextualMessageByInboxKey>()
+                    }
                     PartitionId::PaymentByReceiver => size_of::<PaymentKeyByReceiver>(),
                     PartitionId::PaymentBySender => size_of::<PaymentKeyBySender>(),
                     PartitionId::SelfStashByOwner => size_of::<SelfStashKeyByOwner>(),
@@ -946,6 +950,20 @@ impl VirtualProcessor {
                             blinded_group_id: None,
                             group_control_recipient: None,
                         });
+                        Ok(())
+                    }
+                    PartitionId::ContextualMessageByInbox => {
+                        // No-handshake messaging: fill in the resolved sender for the inbox-tag
+                        // index, same deferred-resolution shape as HandshakeByReceiver. The by-sender
+                        // arm above already emitted the push and payload; this only completes the tag
+                        // lookup's value.
+                        if !matches!(entry.action, Action::UpdateValueSender) {
+                            panic!("Unexpected action")
+                        }
+                        let key = ContextualMessageByInboxKey::try_ref_from_bytes(entry.key)
+                            .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
+                        self.contextual_message_by_inbox_partition
+                            .insert_wtx(wtx, key, Some(sender))?;
                         Ok(())
                     }
                     PartitionId::PaymentByReceiver => {

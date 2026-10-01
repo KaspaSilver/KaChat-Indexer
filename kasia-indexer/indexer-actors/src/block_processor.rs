@@ -12,8 +12,8 @@ use indexer_db::headers::block_compact_headers::BlockCompactHeaderPartition;
 use indexer_db::headers::block_gaps::BlockGapsPartition;
 use indexer_db::headers::daa_index::DaaIndexPartition;
 use indexer_db::messages::contextual_message::{
-    ContextualMessageBySenderKey, ContextualMessageBySenderPartition,
-    TxIdToContextualMessagePartition,
+    ContextualMessageByInboxKey, ContextualMessageByInboxPartition, ContextualMessageBySenderKey,
+    ContextualMessageBySenderPartition, INBOX_TAG_LEN, TxIdToContextualMessagePartition,
 };
 use indexer_db::messages::group_control::{
     GroupControlByRecipientPartition, GroupControlBySenderPartition, GroupControlKeyByRecipient,
@@ -69,6 +69,7 @@ pub struct BlockProcessor {
     handshake_by_sender_partition: HandshakeBySenderPartition,
     tx_id_to_handshake_partition: TxIdToHandshakePartition,
     contextual_message_by_sender_partition: ContextualMessageBySenderPartition,
+    contextual_message_by_inbox_partition: ContextualMessageByInboxPartition,
     tx_id_to_contextual_message_partition: TxIdToContextualMessagePartition,
     tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
     self_stash_by_owner_partition: SelfStashByOwnerPartition,
@@ -473,6 +474,18 @@ impl BlockProcessor {
                     }
                 }
             }
+            // No-handshake messaging: a `dm` goes back to the SENDER's own address, so in personal
+            // mode `personal_allows` (which matches sender/receiver) would drop an incoming dm
+            // addressed to me — its only link to me is the inbox tag. Also keep it when the tag is
+            // one of my personal addresses', so a recipient's personal indexer still discovers
+            // requests. (A plain `comm` has `inbox_tag = None`, so this reduces to the default.)
+            SealedOperation::ContextualMessageV1(cm) => {
+                crate::personal_allows(sender.as_ref(), &receiver)
+                    || cm
+                        .inbox_tag
+                        .and_then(|hex| decode_fixed_hex::<INBOX_TAG_LEN>(hex).ok())
+                        .is_some_and(|tag| crate::is_personal_inbox_tag(&tag))
+            }
             _ => crate::personal_allows(sender.as_ref(), &receiver),
         };
         if store_content {
@@ -780,6 +793,35 @@ impl BlockProcessor {
                 action: Action::InsertByKeySender,
                 partition_key: SmallVec::from_slice(cmk.as_bytes()),
             })
+        }
+
+        // No-handshake messaging (KaChat 5.2): a `dm` additionally files itself by the recipient's
+        // inbox tag so the recipient can discover it without a handshake. The key is written now;
+        // the sender value is filled now if resolved, otherwise deferred like HandshakeByReceiver.
+        if let Some(tag_hex) = cm.inbox_tag {
+            match decode_fixed_hex::<INBOX_TAG_LEN>(tag_hex) {
+                Ok(inbox_tag) => {
+                    let ik = ContextualMessageByInboxKey {
+                        inbox_tag,
+                        block_time: header.timestamp.into(),
+                        tx_id: tx_id.as_bytes(),
+                    };
+                    if let Err(e) =
+                        self.contextual_message_by_inbox_partition
+                            .insert_wtx(wtx, &ik, sender)
+                    {
+                        warn!(%tx_id, error = %e, "Failed to index dm by inbox tag");
+                    }
+                    if sender.is_none() {
+                        entries.push(InsertionEntry {
+                            partition_id: PartitionId::ContextualMessageByInbox,
+                            action: Action::UpdateValueSender,
+                            partition_key: SmallVec::from_slice(ik.as_bytes()),
+                        });
+                    }
+                }
+                Err(e) => warn!(%tx_id, error = %e, "dm inbox tag failed to decode; skipping inbox index"),
+            }
         }
     }
 

@@ -21,6 +21,10 @@ pub const EXPORT_PARTITIONS: &[&str] = &[
     "handshake_by_receiver",
     "tx-id-to-handshake",
     "contextual_message_by_sender",
+    // No-handshake messaging (KaChat 5.2): the inbox-tag index for dm discovery. Included so
+    // export/import round-trips a full store (the sender value is re-derivable, but exporting it
+    // keeps imports self-contained without re-running sender resolution).
+    "contextual_message_by_inbox",
     "tx-id-to-contextual-message",
     "payment_by_sender",
     "payment_by_receiver",

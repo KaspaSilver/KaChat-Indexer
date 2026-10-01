@@ -13,7 +13,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use indexer_actors::metrics::{IndexerMetricsSnapshot, SharedMetrics};
 use indexer_db::messages::contextual_message::{
-    ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
+    ContextualMessageByInboxPartition, ContextualMessageBySenderPartition,
+    TxIdToContextualMessagePartition,
 };
 use indexer_db::messages::group_control::{
     GroupControlByRecipientPartition, GroupControlBySenderPartition, TxIdToGroupControlPartition,
@@ -93,6 +94,7 @@ impl Api {
         handshake_by_sender_partition: HandshakeBySenderPartition,
         handshake_by_receiver_partition: HandshakeByReceiverPartition,
         contextual_message_by_sender_partition: ContextualMessageBySenderPartition,
+        contextual_message_by_inbox_partition: ContextualMessageByInboxPartition,
         tx_id_to_contextual_message_partition: TxIdToContextualMessagePartition,
         payment_by_sender_partition: PaymentBySenderPartition,
         payment_by_receiver_partition: PaymentByReceiverPartition,
@@ -125,6 +127,7 @@ impl Api {
         let contextual_message_api = ContextualMessageApi::new(
             tx_keyspace.clone(),
             contextual_message_by_sender_partition,
+            contextual_message_by_inbox_partition,
             tx_id_to_acceptance_partition.clone(),
             tx_id_to_contextual_message_partition,
             metrics.clone(),

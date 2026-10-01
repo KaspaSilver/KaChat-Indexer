@@ -9,8 +9,8 @@ use axum::{Json, Router};
 use indexer_actors::metrics::SharedMetrics;
 use indexer_db::AddressPayload;
 use indexer_db::messages::contextual_message::{
-    ContextualMessageBySenderKey, ContextualMessageBySenderPartition,
-    TxIdToContextualMessagePartition,
+    ContextualMessageByInboxPartition, ContextualMessageBySenderKey,
+    ContextualMessageBySenderPartition, INBOX_TAG_LEN, TxIdToContextualMessagePartition,
 };
 use kaspa_rpc_core::RpcAddress;
 use protocol::operation::SealedOperation;
@@ -25,6 +25,7 @@ use utoipa::{IntoParams, ToSchema};
 pub struct ContextualMessageApi {
     tx_keyspace: fjall::TxKeyspace,
     contextual_message_by_sender_partition: ContextualMessageBySenderPartition,
+    contextual_message_by_inbox_partition: ContextualMessageByInboxPartition,
     tx_id_to_contextual_message_partition: TxIdToContextualMessagePartition,
     tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
     metrics: SharedMetrics,
@@ -35,6 +36,7 @@ impl ContextualMessageApi {
     pub fn new(
         tx_keyspace: fjall::TxKeyspace,
         contextual_message_by_sender_partition: ContextualMessageBySenderPartition,
+        contextual_message_by_inbox_partition: ContextualMessageByInboxPartition,
         tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
         tx_id_to_contextual_message_partition: TxIdToContextualMessagePartition,
         metrics: SharedMetrics,
@@ -43,6 +45,7 @@ impl ContextualMessageApi {
         Self {
             tx_keyspace,
             contextual_message_by_sender_partition,
+            contextual_message_by_inbox_partition,
             tx_id_to_contextual_message_partition,
             tx_id_to_acceptance_partition,
             metrics,
@@ -53,6 +56,7 @@ impl ContextualMessageApi {
     pub fn router() -> Router<Self> {
         Router::new()
             .route("/by-sender", get(get_contextual_messages_by_sender))
+            .route("/by-inbox", get(get_contextual_messages_by_inbox))
             .route("/import", post(import_contextual_messages))
     }
 }
@@ -300,6 +304,135 @@ async fn get_contextual_messages_by_sender(
                             tx_id: faster_hex::hex_string(&message_key.tx_id),
                             sender: sender_str,
                             alias: alias.clone(), // todo use byteview
+                            block_time,
+                            accepting_block,
+                            accepting_daa_score,
+                            message_payload,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .flatten()
+    })
+    .await;
+    metrics.increment_db_read_ops_total(1);
+    metrics.increment_db_read_time_ms_total(
+        db_read_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    );
+    if result.as_ref().is_err() || matches!(&result, Ok(Err(_))) {
+        metrics.increment_db_errors_total();
+    }
+
+    match result {
+        Ok(Ok(messages)) => Ok(Json(messages)),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+        Err(join_err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Task error: {join_err}"),
+            }),
+        )),
+    }
+}
+
+// --- No-handshake messaging (KaChat 5.2): discovery by inbox tag ---
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct InboxPaginationParams {
+    /// Recipient inbox tag: 32 lowercase hex characters (NO_HANDSHAKE_MESSAGING.md §1).
+    pub tag: String,
+    pub limit: Option<usize>,
+    pub block_time: Option<u64>,
+}
+
+/// GET /contextual-messages/by-inbox — the recipient asks for its own tag and learns who wrote,
+/// without a handshake (NO_HANDSHAKE_MESSAGING.md §5.3). Same objects as `/by-sender`, with the
+/// resolved sender filled from the index value; `alias` is empty here (the client derives it from
+/// the sender). Ascending by block time, newer than `block_time`. A malformed tag is 400; an
+/// unknown tag is `200 []`. The route merely existing is the client's "supported" probe.
+#[utoipa::path(
+    get,
+    path = "/contextual-messages/by-inbox",
+    params(InboxPaginationParams),
+    responses(
+        (status = 200, description = "Get contextual messages by inbox tag", body = [ContextualMessageResponse]),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+async fn get_contextual_messages_by_inbox(
+    State(state): State<ContextualMessageApi>,
+    Query(params): Query<InboxPaginationParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(100).min(500);
+    let cursor = params.block_time.unwrap_or(0);
+
+    let mut tag = [0u8; INBOX_TAG_LEN];
+    if params.tag.len() != INBOX_TAG_LEN * 2
+        || params.tag.bytes().any(|b| b.is_ascii_uppercase())
+        || faster_hex::hex_decode(params.tag.as_bytes(), &mut tag).is_err()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "tag must be 32 lowercase hex characters".to_string(),
+            }),
+        ));
+    }
+
+    let metrics = state.metrics.clone();
+    let db_read_started = std::time::Instant::now();
+    let result = spawn_blocking(move || {
+        let rtx = state.tx_keyspace.read_tx();
+        let mut seen_tx_ids = std::collections::HashSet::with_capacity(limit);
+
+        state
+            .contextual_message_by_inbox_partition
+            .iter_by_tag_from_block_time(&rtx, &tag, cursor)
+            .process_results(|iter| {
+                iter.filter(|(key, _sender)| seen_tx_ids.insert(key.tx_id))
+                    .take(limit)
+                    .map(|(key, sender_payload)| {
+                        let block_time = key.block_time.into();
+
+                        let sender_str =
+                            match to_rpc_address(&sender_payload, state.context.network_type) {
+                                Ok(Some(addr)) => addr.to_string(),
+                                Ok(None) => String::new(),
+                                Err(e) => bail!("Address conversion error: {}", e),
+                            };
+
+                        let acceptance = state
+                            .tx_id_to_acceptance_partition
+                            .acceptance_by_tx_id_rtx(&rtx, &key.tx_id)?;
+                        let (accepting_block, accepting_daa_score) =
+                            if let Some(acceptance) = acceptance {
+                                (
+                                    Some(faster_hex::hex_string(
+                                        &acceptance.header.accepting_block_hash,
+                                    )),
+                                    Some(acceptance.header.accepting_daa.into()),
+                                )
+                            } else {
+                                (None, None)
+                            };
+
+                        let message_payload = state
+                            .tx_id_to_contextual_message_partition
+                            .get_rtx(&rtx, &key.tx_id)?
+                            .map(|sealed| faster_hex::hex_string(sealed.as_ref()))
+                            .unwrap_or_default();
+
+                        Ok(ContextualMessageResponse {
+                            tx_id: faster_hex::hex_string(&key.tx_id),
+                            sender: sender_str,
+                            // Not stored in the inbox index; the client derives it from the sender.
+                            alias: String::new(),
                             block_time,
                             accepting_block,
                             accepting_daa_score,

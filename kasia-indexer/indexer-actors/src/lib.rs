@@ -25,11 +25,21 @@ pub mod util;
 // ---------------------------------------------------------------------------
 
 use indexer_db::AddressPayload;
+use indexer_db::messages::contextual_message::INBOX_TAG_LEN;
 use indexer_db::messages::group_message::BLINDED_GROUP_ID_LEN;
 use std::collections::HashSet;
 use std::sync::{LazyLock, RwLock};
 
 static PERSONAL_ADDRESSES: RwLock<Vec<AddressPayload>> = RwLock::new(Vec::new());
+
+/// No-handshake messaging (KaChat 5.2): the inbox tags of my personal addresses. A `dm` addressed
+/// to me goes back to the sender's own address on chain, so personal-address matching alone would
+/// drop it — the only link to me is its inbox tag. These are computed from the personal address
+/// STRINGS at load time (the tag is a hash of the address string, which `AddressPayload` doesn't
+/// retain) and consulted by the block processor so a recipient's personal indexer keeps incoming
+/// requests. Empty unless personal mode is on. See NO_HANDSHAKE_MESSAGING.md §1.
+static PERSONAL_INBOX_TAGS: LazyLock<RwLock<HashSet<[u8; INBOX_TAG_LEN]>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// Personal-mode GROUP allowlist: blinded group ids (per-(group,member), 32 bytes) whose group
 /// messages should be stored. Parallel to `PERSONAL_ADDRESSES` — an operator who can't be matched
@@ -77,6 +87,23 @@ pub fn set_personal_addresses(addrs: Vec<AddressPayload>) {
 /// Number of configured personal addresses (0 = personal mode off / index everything).
 pub fn personal_address_count() -> usize {
     PERSONAL_ADDRESSES.read().map(|g| g.len()).unwrap_or(0)
+}
+
+/// Replace the personal-mode inbox-tag set (computed by the loader from the personal address
+/// strings). An empty set means no dm is kept purely on a tag match.
+pub fn set_personal_inbox_tags(tags: HashSet<[u8; INBOX_TAG_LEN]>) {
+    if let Ok(mut guard) = PERSONAL_INBOX_TAGS.write() {
+        *guard = tags;
+    }
+}
+
+/// Whether `tag` is the inbox tag of one of my personal addresses — i.e. a `dm` carrying it is
+/// addressed to me and must be kept even though it never touches my address on chain.
+pub fn is_personal_inbox_tag(tag: &[u8; INBOX_TAG_LEN]) -> bool {
+    PERSONAL_INBOX_TAGS
+        .read()
+        .map(|g| g.contains(tag))
+        .unwrap_or(false)
 }
 
 /// Whether a transaction touching `sender`/`receiver` should have its chat content stored.

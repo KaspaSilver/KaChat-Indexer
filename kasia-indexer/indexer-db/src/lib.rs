@@ -183,4 +183,10 @@ pub enum PartitionId {
     GroupControlBySender = 21,
     TxIdToGroupControl = 22,
     GroupControlByRecipient = 23,
+
+    // No-handshake messaging (KaChat 5.2): a `dm` message, in addition to the by-sender index,
+    // is filed by its recipient-derived inbox tag so the recipient can discover it without a
+    // handshake. Sender is the value (resolved like HandshakeByReceiver), so deferred resolution
+    // uses Action::UpdateValueSender. See NO_HANDSHAKE_MESSAGING.md §5.2.
+    ContextualMessageByInbox = 24,
 }

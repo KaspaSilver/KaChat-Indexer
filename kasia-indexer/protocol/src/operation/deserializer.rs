@@ -70,6 +70,29 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
                 SealedContextualMessageV1 {
                     alias,
                     sealed_hex: contextual_message_hex,
+                    inbox_tag: None,
+                },
+            ))
+        }
+        // No-handshake messaging (KaChat 5.2): `dm:<tag>:<alias>:<sealed>` is a `comm` message plus
+        // a recipient-derived inbox tag. The tag must be exactly 32 lowercase hex characters;
+        // anything else rejects the whole operation (NO_HANDSHAKE_MESSAGING.md §5.1). Downstream it
+        // is the same ContextualMessageV1 as `comm`, just with `inbox_tag: Some(tag)`.
+        Some([b'd', b'm', b':', remaining @ ..]) => {
+            let tag_end = remaining.iter().position(|b| b == &b':')?;
+            let inbox_tag = &remaining[..tag_end];
+            if !is_lowercase_hex(inbox_tag, 16) {
+                return None;
+            }
+            let rest = &remaining[tag_end + 1..];
+            let alias_end = rest.iter().position(|b| b == &b':')?;
+            let alias = &rest[..alias_end];
+            let contextual_message_hex = &rest[alias_end + 1..];
+            Some(SealedOperation::ContextualMessageV1(
+                SealedContextualMessageV1 {
+                    alias,
+                    sealed_hex: contextual_message_hex,
+                    inbox_tag: Some(inbox_tag),
                 },
             ))
         }
@@ -173,6 +196,15 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
 
 fn is_fixed_hex(value: &[u8], byte_len: usize) -> bool {
     value.len() == byte_len * 2 && value.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Like `is_fixed_hex` but rejects uppercase — the inbox tag is specified as *lowercase* hex
+/// (NO_HANDSHAKE_MESSAGING.md §1), and the recipient matches it byte-for-byte, so `AB` ≠ `ab`.
+fn is_lowercase_hex(value: &[u8], byte_len: usize) -> bool {
+    value.len() == byte_len * 2
+        && value
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
 fn is_nonempty_hex(value: &[u8]) -> bool {

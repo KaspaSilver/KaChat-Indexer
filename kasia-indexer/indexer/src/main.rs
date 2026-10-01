@@ -17,7 +17,8 @@ use indexer_db::headers::block_compact_headers::BlockCompactHeaderPartition;
 use indexer_db::headers::block_gaps::{BlockGap, BlockGapsPartition};
 use indexer_db::headers::daa_index::DaaIndexPartition;
 use indexer_db::messages::contextual_message::{
-    ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
+    ContextualMessageByInboxPartition, ContextualMessageBySenderPartition,
+    TxIdToContextualMessagePartition,
 };
 use indexer_db::messages::group_control::{
     GroupControlByRecipientPartition, GroupControlBySenderPartition, TxIdToGroupControlPartition,
@@ -76,17 +77,25 @@ fn load_personal_addresses() {
         }
     };
     let mut addrs = Vec::new();
+    // No-handshake messaging (KaChat 5.2): also keep each personal address's inbox tag, so an
+    // incoming `dm` addressed to me is kept even though on chain it only touches the sender's own
+    // address. The tag is a hash of the address STRING, which AddressPayload doesn't retain, so it
+    // must be computed here from the canonical address text.
+    let mut inbox_tags = std::collections::HashSet::new();
     for token in content.split(['\n', '\r', ',', ' ', '\t']) {
         let t = token.trim();
         if t.is_empty() {
             continue;
         }
-        match kaspa_rpc_core::RpcAddress::try_from(t.to_string())
-            .ok()
-            .and_then(|rpc| indexer_db::AddressPayload::try_from(&rpc).ok())
-        {
-            Some(ap) => addrs.push(ap),
-            None => tracing::warn!("Personal mode: skipping unparseable address '{t}'"),
+        match kaspa_rpc_core::RpcAddress::try_from(t.to_string()) {
+            Ok(rpc) => match indexer_db::AddressPayload::try_from(&rpc) {
+                Ok(ap) => {
+                    addrs.push(ap);
+                    inbox_tags.insert(compute_inbox_tag(&rpc.to_string()));
+                }
+                Err(_) => tracing::warn!("Personal mode: skipping unparseable address '{t}'"),
+            },
+            Err(_) => tracing::warn!("Personal mode: skipping unparseable address '{t}'"),
         }
     }
     if addrs.is_empty() {
@@ -98,6 +107,21 @@ fn load_personal_addresses() {
         );
     }
     indexer_actors::set_personal_addresses(addrs);
+    indexer_actors::set_personal_inbox_tags(inbox_tags);
+}
+
+/// NO_HANDSHAKE_MESSAGING.md §1: `inboxTag(recipient) = first 16 bytes of
+/// SHA-256("kachat-inbox:v1:" + recipient)`, where `recipient` is the full address string,
+/// lowercased, with its prefix. Returns the raw 16 bytes (the on-chain form is their lowercase hex).
+fn compute_inbox_tag(address: &str) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"kachat-inbox:v1:");
+    hasher.update(address.to_lowercase().as_bytes());
+    let digest = hasher.finalize();
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&digest[..16]);
+    tag
 }
 
 /// Load the personal-mode GROUP allowlist (KaChat fork). The admin dashboard writes one 64-char
@@ -169,6 +193,8 @@ async fn main() -> anyhow::Result<()> {
     let handshake_by_receiver_partition = HandshakeByReceiverPartition::new(&tx_keyspace)?;
     let tx_id_to_handshake_partition = TxIdToHandshakePartition::new(&tx_keyspace)?;
     let contextual_message_partition = ContextualMessageBySenderPartition::new(&tx_keyspace)?;
+    let contextual_message_by_inbox_partition =
+        ContextualMessageByInboxPartition::new(&tx_keyspace)?;
     let tx_id_to_contextual_message_partition =
         TxIdToContextualMessagePartition::new(&tx_keyspace)?;
     let payment_by_receiver_partition = PaymentByReceiverPartition::new(&tx_keyspace)?;
@@ -307,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
         .handshake_by_sender_partition(handshake_by_sender_partition.clone())
         .tx_id_to_handshake_partition(tx_id_to_handshake_partition.clone())
         .contextual_message_by_sender_partition(contextual_message_partition.clone())
+        .contextual_message_by_inbox_partition(contextual_message_by_inbox_partition.clone())
         .tx_id_to_contextual_message_partition(tx_id_to_contextual_message_partition.clone())
         .payment_by_receiver_partition(payment_by_receiver_partition.clone())
         .payment_by_sender_partition(payment_by_sender_partition.clone())
@@ -341,6 +368,7 @@ async fn main() -> anyhow::Result<()> {
         .handshake_by_receiver_partition(handshake_by_receiver_partition.clone())
         .handshake_by_sender_partition(handshake_by_sender_partition.clone())
         .contextual_message_by_sender_partition(contextual_message_partition.clone())
+        .contextual_message_by_inbox_partition(contextual_message_by_inbox_partition.clone())
         .payment_by_receiver_partition(payment_by_receiver_partition.clone())
         .payment_by_sender_partition(payment_by_sender_partition.clone())
         .self_stash_by_owner_partition(self_stash_by_owner_partition.clone())
@@ -419,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
         handshake_by_sender_partition,
         handshake_by_receiver_partition,
         contextual_message_partition,
+        contextual_message_by_inbox_partition,
         tx_id_to_contextual_message_partition,
         payment_by_sender_partition,
         payment_by_receiver_partition,
@@ -635,5 +664,30 @@ impl Shutdown {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod inbox_tag_tests {
+    use super::compute_inbox_tag;
+
+    #[test]
+    fn inbox_tag_matches_independent_sha256() {
+        // Cross-check against an independently computed value (shell `sha256sum`), NOT the Rust impl
+        // itself, so this catches a drift in the construction: tag = first 16 bytes of
+        // SHA-256("kachat-inbox:v1:" + address). The iOS reference (InboxTag.compute) must produce
+        // the same 32-hex string for this input — re-verify there before shipping (§1 test vector).
+        //   printf 'kachat-inbox:v1:kaspatest:qrabc' | sha256sum  => da18094059d445097fec17e83e5961aa...
+        let tag = compute_inbox_tag("kaspatest:qrabc");
+        assert_eq!(faster_hex::hex_string(&tag), "da18094059d445097fec17e83e5961aa");
+    }
+
+    #[test]
+    fn inbox_tag_is_case_insensitive_on_input() {
+        // The address is lowercased before hashing, so mixed-case input yields the same tag.
+        assert_eq!(
+            compute_inbox_tag("kaspatest:qrABC"),
+            compute_inbox_tag("kaspatest:qrabc")
+        );
     }
 }
