@@ -340,5 +340,7 @@ pub fn is_valid_name(name: &[u8]) -> bool {
 pub mod transition;
 pub use transition::{Contract, Entry, NameStatus, entry_for_tag, name_status, YEAR_MS};
 
+pub mod ingest;
+
 #[cfg(test)]
 mod tests;
