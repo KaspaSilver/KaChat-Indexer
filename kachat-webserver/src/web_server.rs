@@ -53,6 +53,8 @@ pub struct AppState {
     pub chess_cache: Arc<RwLock<ChessCache>>,
     /// §5.10: direct pool handle for the scheduled-posts store (raw SQL).
     pub scheduled_pool: sqlx::PgPool,
+    /// .kachat names registry module (testnet). Off unless KACHAT_NAMES_MANIFEST is set.
+    pub names: crate::names::NamesState,
 }
 
 /// Cached result of one arena replay (see chess.rs). Recomputed when older than CHESS_CACHE_TTL.
@@ -389,6 +391,7 @@ impl WebServer {
             translate_rate_limit_map,
             chess_cache: Arc::new(RwLock::new(ChessCache::default())),
             scheduled_pool,
+            names: crate::names::NamesState::from_env(),
         });
 
         // §5.10: start the per-minute scheduler that broadcasts due scheduled posts.
@@ -405,6 +408,10 @@ impl WebServer {
             .route("/", get(handle_root))
             .route("/health", get(handle_health))
             .route("/stats", get(handle_stats))
+            // .kachat names registry (testnet). Follower + lookups land next.
+            .route("/names/status", get(crate::names::handle_names_status))
+            .route("/names/manifest", get(crate::names::handle_names_manifest))
+            .route("/names/:name", get(crate::names::handle_name_lookup))
             .route(
                 "/metrics",
                 get(move || async move { metric_handle.render() }),
