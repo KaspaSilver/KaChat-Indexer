@@ -408,10 +408,22 @@ impl WebServer {
             .route("/", get(handle_root))
             .route("/health", get(handle_health))
             .route("/stats", get(handle_stats))
-            // .kachat names registry (testnet). Follower + lookups land next.
+            // .kachat names registry (testnet): status/manifest here, the read API over the
+            // kachat-names-follower tables in names_api (docs/KACHAT_NAMES_APP_CONTRACT.md).
             .route("/names/status", get(crate::names::handle_names_status))
             .route("/names/manifest", get(crate::names::handle_names_manifest))
-            .route("/names/:name", get(crate::names::handle_name_lookup))
+            .route("/names/expiring", get(crate::names_api::expiring))
+            .route("/names/by-owner/:address", get(crate::names_api::by_owner))
+            .route("/names/gap/:key", get(crate::names_api::gap_lookup))
+            .route("/names/:name", get(crate::names_api::name_lookup))
+            .route("/names/:name/offers", get(crate::names_api::name_offers))
+            .route("/names/:name/history", get(crate::names_api::name_history))
+            .route("/offers/by-buyer/:address", get(crate::names_api::offers_by_buyer))
+            .route("/market/listings", get(crate::names_api::listings))
+            .route("/market/activity", get(crate::names_api::market_activity))
+            .route("/profiles/:address", get(crate::names_api::profile))
+            .route("/identity/batch", post(crate::names_api::identity_batch))
+            .route("/identity/:address", get(crate::names_api::identity))
             .route(
                 "/metrics",
                 get(move || async move { metric_handle.render() }),

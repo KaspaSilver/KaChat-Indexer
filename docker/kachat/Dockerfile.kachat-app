@@ -3,16 +3,19 @@
 # vendored chat indexer, run under supervisord. Postgres stays in its own container.
 # Build context is the repo root (../..).
 
-# --- Stage 1: build our workspace binaries (processor, webserver, admin) ---
+# --- Stage 1: build our workspace binaries (processor, webserver, admin, names follower) ---
 FROM rust:1.91-alpine AS ourbuild
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
 WORKDIR /src
 COPY Cargo.toml ./
-RUN sed -i '/members = \[/,/\]/c\members = ["kachat-transaction-processor","kachat-webserver","kachat-admin"]' Cargo.toml
+RUN sed -i '/members = \[/,/\]/c\members = ["kachat-transaction-processor","kachat-webserver","kachat-admin","kachat-names","kachat-names-follower"]' Cargo.toml
 COPY kachat-transaction-processor ./kachat-transaction-processor
 COPY kachat-webserver ./kachat-webserver
 COPY kachat-admin ./kachat-admin
-RUN cargo build --release --bin kachat-transaction-processor --bin kachat-webserver --bin kachat-admin
+# .kachat names: the pure engine (the webserver's read API uses it too) + the follower.
+COPY kachat-names ./kachat-names
+COPY kachat-names-follower ./kachat-names-follower
+RUN cargo build --release --bin kachat-transaction-processor --bin kachat-webserver --bin kachat-admin --bin kachat-names-follower
 
 # --- Stage 2: build the vendored chat (kasia) indexer ---
 FROM rust:1.89.0-alpine3.20 AS chatbuild
@@ -32,6 +35,7 @@ COPY --from=supertypo/simply-kaspa-indexer:v2.3.0 /usr/local/bin/simply-kaspa-in
 COPY --from=ourbuild /src/target/release/kachat-transaction-processor /app/
 COPY --from=ourbuild /src/target/release/kachat-webserver /app/
 COPY --from=ourbuild /src/target/release/kachat-admin /app/
+COPY --from=ourbuild /src/target/release/kachat-names-follower /app/
 COPY --from=chatbuild /src/target/release/indexer /app/kachat-chat-indexer
 # Launch scripts + supervisor config.
 COPY docker/kachat/app/ /app/

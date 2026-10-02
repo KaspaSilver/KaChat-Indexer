@@ -1,0 +1,24 @@
+[package]
+name = "kachat-names-follower"
+version.workspace = true
+edition.workspace = true
+
+# The .kachat registry follower (KACHAT_NAMES_INDEXER.md §B/§3/§4): reads the node's virtual
+# chain over wRPC (getVirtualChainFromBlockV2), drives kachat-names' engine, and keeps the
+# registry in Postgres for kachat-webserver's /names/* read API. Off unless a manifest is set.
+[dependencies]
+kachat-names = { path = "../kachat-names" }
+# Same rusty-kaspa git source as the rest of the workspace (Cargo unifies the revision);
+# it carries Toccata (covenant bindings) and getVirtualChainFromBlockV2.
+kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git" }
+kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git" }
+kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa.git" }
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git" }
+tokio = { version = "1.0", features = ["full"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres"] }
+serde_json = "1.0.145"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+clap = { version = "4.5.48", features = ["derive", "env"] }
+hex = "0.4"

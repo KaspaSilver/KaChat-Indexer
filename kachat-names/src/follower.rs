@@ -7,7 +7,7 @@
 //! accepted tx into [`crate::ingest::Tx`]. The loop applies accepted txs, undoes removed
 //! chain blocks (reorgs), advances the checkpoint, and prunes the undo journal past finality.
 
-use crate::ingest::{Registry, Templates, Tx};
+use crate::ingest::{Event, Registry, Templates, Tx};
 
 /// One virtual-chain batch: blocks removed by a reorg (undo these first), the transactions
 /// newly accepted since the last call (in chain order), and the new tip to checkpoint at.
@@ -45,21 +45,22 @@ impl Follower {
     }
 
     /// Pull one batch and apply it. Reorg-safe order: undo removed blocks first, then apply
-    /// the newly-accepted txs, then advance the checkpoint and prune. Returns how many txs
-    /// were applied.
-    pub fn step<S: ChainSource>(&mut self, templates: &Templates, src: &mut S) -> Result<usize, S::Error> {
+    /// the newly-accepted txs, then advance the checkpoint and prune. Returns the batch (so
+    /// the caller can persist what it touched) and the registry events it produced.
+    pub fn step<S: ChainSource>(&mut self, templates: &Templates, src: &mut S) -> Result<(VccBatch, Vec<Event>), S::Error> {
         let batch = src.next_batch(self.checkpoint)?;
         for block in &batch.removed_blocks {
             self.registry.undo_block(block);
         }
+        let mut events = Vec::new();
         for tx in &batch.accepted {
-            self.registry.apply(templates, tx);
+            events.extend(self.registry.apply(templates, tx));
         }
         if let Some(tip) = batch.tip {
             self.checkpoint = Some(tip);
         }
         self.registry.prune_journal(self.finality_keep);
-        Ok(batch.accepted.len())
+        Ok((batch, events))
     }
 }
 
@@ -173,8 +174,9 @@ mod tests {
         };
 
         let key = name_key(b"alice");
-        let n = f.step(&t, &mut src).unwrap();
-        assert_eq!(n, 1);
+        let (batch, events) = f.step(&t, &mut src).unwrap();
+        assert_eq!(batch.accepted.len(), 1);
+        assert_eq!(events.iter().map(|e| e.op).collect::<Vec<_>>(), vec!["register"]);
         assert!(f.registry.name_by_key(&key).is_some(), "name indexed after block A");
         assert_eq!(f.checkpoint, Some(block_a));
         assert_eq!(src.seen_from[0], Some(scan_from), "first pull starts at scanFrom");

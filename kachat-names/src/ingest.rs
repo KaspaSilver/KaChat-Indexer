@@ -127,8 +127,18 @@ pub struct Event {
     pub op: &'static str,
     pub key: [u8; 32],
     pub tx_id: [u8; 32],
+    /// The chain block that accepted the tx (history rows are dropped when it is reorged out).
+    pub block: [u8; 32],
     pub daa: u64,
     pub at: i64,
+    /// Owner before (transfer/sale/release/reclaim/offer_accepted) — x-only key.
+    pub from: Option<[u8; 32]>,
+    /// Owner after (register/transfer/sale/offer_accepted) — x-only key; the buyer for `offer`.
+    pub to: Option<[u8; 32]>,
+    /// Sompi: the listing price (`list`), the price paid (`sale`).
+    pub price: Option<i64>,
+    /// Years bought (`register`, `renew`).
+    pub years: Option<i64>,
 }
 
 /// The tracked registry: gaps/names/offers by outpoint, profiles by address.
@@ -225,7 +235,9 @@ impl Registry {
             }
             for s in &spends {
                 if let Tracked::Name(n) = &s.2 {
-                    events.push(self.event(if s.3 == Entry::NameReclaim { "reclaim" } else { "release" }, n.key, tx));
+                    let mut e = self.event(if s.3 == Entry::NameReclaim { "reclaim" } else { "release" }, n.key, tx);
+                    e.from = Some(n.owner);
+                    events.push(e);
                 }
             }
         } else if has(Entry::GapRegister) {
@@ -238,28 +250,36 @@ impl Registry {
                         let new_owner = sig.args.first().and_then(|a| a.data()).and_then(|d| d.try_into().ok());
                         if let Some(owner) = new_owner {
                             let ns = transition::name_transfer(old, owner);
-                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events,
-                                if *entry == Entry::NameBuy { "sale" } else { "transfer" });
+                            // A transfer co-spent with an offer accept is the offer being taken.
+                            let op = if *entry == Entry::NameBuy {
+                                "sale"
+                            } else if has(Entry::OfferAccept) {
+                                "offer_accepted"
+                            } else {
+                                "transfer"
+                            };
+                            let price = (*entry == Entry::NameBuy).then_some(old.price);
+                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, op, Some(old), price, None);
                         }
                     }
                     (Tracked::Name(old), Entry::NameList) => {
                         if let Some(price) = sig.args.first().and_then(|a| a.as_i64()) {
                             let ns = transition::name_list(old, price);
                             self.record_name(templates, tx, &ns, &mut used_outputs, &mut events,
-                                if price == 0 { "delist" } else { "list" });
+                                if price == 0 { "delist" } else { "list" }, Some(old), Some(price), None);
                         }
                     }
                     (Tracked::Name(old), Entry::NameRenew) => {
                         if let Some(years) = sig.args.first().and_then(|a| a.as_i64()) {
                             let ns = transition::name_renew(old, years);
-                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, "renew");
+                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, "renew", Some(old), None, Some(years));
                         }
                     }
                     (Tracked::Offer(offer), Entry::OfferAccept) => {
                         // The accepted name goes to the buyer; verify a name output matches.
                         if let Some((_, name)) = self.name_by_key(&offer.key) {
                             let ns = transition::offer_accept(&name, offer);
-                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, "offer_accepted");
+                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, "offer_accepted", Some(&name), None, None);
                         }
                     }
                     _ => {}
@@ -368,10 +388,14 @@ impl Registry {
         }
         if let Some(i) = Self::find_output(tx, &templates.name_spk(&nm), used) {
             self.utxos.insert((tx.id, i as u32), Tracked::Name(nm));
-            events.push(self.event("register", nm.key, tx));
+            let mut e = self.event("register", nm.key, tx);
+            e.to = Some(nm.owner);
+            e.years = Some(years);
+            events.push(e);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_name(
         &mut self,
         templates: &Templates,
@@ -380,10 +404,22 @@ impl Registry {
         used: &mut Vec<usize>,
         events: &mut Vec<Event>,
         op: &'static str,
+        old: Option<&NameState>,
+        price: Option<i64>,
+        years: Option<i64>,
     ) {
         if let Some(i) = Self::find_output(tx, &templates.name_spk(ns), used) {
             self.utxos.insert((tx.id, i as u32), Tracked::Name(*ns));
-            events.push(self.event(op, ns.key, tx));
+            let mut e = self.event(op, ns.key, tx);
+            if let Some(old) = old
+                && old.owner != ns.owner
+            {
+                e.from = Some(old.owner);
+                e.to = Some(ns.owner);
+            }
+            e.price = price;
+            e.years = years;
+            events.push(e);
         }
     }
 
@@ -401,7 +437,9 @@ impl Registry {
         for (i, o) in tx.outputs.iter().enumerate() {
             if o.script_public_key == spk {
                 self.utxos.insert((tx.id, i as u32), Tracked::Offer(offer));
-                events.push(self.event("offer", key, tx));
+                let mut e = self.event("offer", key, tx);
+                e.to = Some(buyer);
+                events.push(e);
                 return;
             }
         }
@@ -430,7 +468,7 @@ impl Registry {
     }
 
     fn event(&self, op: &'static str, key: [u8; 32], tx: &Tx) -> Event {
-        Event { op, key, tx_id: tx.id, daa: tx.accepting_daa, at: tx.block_time }
+        Event { op, key, tx_id: tx.id, block: tx.accepting_block, daa: tx.accepting_daa, at: tx.block_time, from: None, to: None, price: None, years: None }
     }
 }
 

@@ -3,7 +3,8 @@ members = [
     "kachat-transaction-processor",
     "kachat-webserver",
     "kachat-admin",
-    "kachat-names"
+    "kachat-names",
+    "kachat-names-follower"
 ]
 resolver = "2"
 

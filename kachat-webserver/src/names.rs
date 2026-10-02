@@ -13,7 +13,7 @@
 
 use crate::web_server::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -138,8 +138,15 @@ pub fn name_key_hex(name: &str) -> String {
 /// id is reported separately as `manifestRegistryCovenantId` for the panel.
 pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let n = &state.names;
-    let synced = false;
     let manifest_registry = n.manifest.as_ref().and_then(|m| m.registry_covenant_id.clone());
+    // Synced = kachat-names-follower caught up, self-tested clean, heartbeat fresh, and
+    // following this same registry (see names_api::follower_status).
+    let follower = match &manifest_registry {
+        Some(r) => crate::names_api::follower_status(&state.scheduled_pool, r).await,
+        None => None,
+    };
+    let synced = follower.as_ref().is_some_and(|f| f.synced);
+    let indexed_daa = follower.as_ref().map(|f| f.indexed_daa).unwrap_or(0);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -148,7 +155,7 @@ pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl Int
             "manifestRegistryCovenantId": manifest_registry,
             "genesisTxId": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.txid.clone()),
             "scanFrom": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.scan_from.clone()),
-            "indexedDaa": 0,
+            "indexedDaa": indexed_daa,
             "synced": synced,
             "on": n.is_on(),
             "manifestPath": n.path,
@@ -166,39 +173,6 @@ pub async fn handle_names_manifest(State(state): State<Arc<AppState>>) -> impl I
         )
             .into_response(),
     }
-}
-
-/// GET /names/{name} — validates the name (400 on a bad one) and returns its key. The
-/// registration state comes from the covenant follower; until that exists this answers
-/// 503 `syncing` rather than inventing data.
-pub async fn handle_name_lookup(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    let Some(name) = normalize_name(&name) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "invalid_name" })),
-        )
-            .into_response();
-    };
-    if !state.names.is_on() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "unavailable", "message": "names module is off (no manifest)" })),
-        )
-            .into_response();
-    }
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "name": name,
-            "key": name_key_hex(&name),
-            "error": "syncing",
-            "message": "the registry follower is not available yet",
-        })),
-    )
-        .into_response()
 }
 
 #[cfg(test)]

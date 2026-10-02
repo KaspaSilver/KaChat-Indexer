@@ -5,6 +5,7 @@ mod database_postgres_impl;
 mod database_trait;
 mod models;
 mod names;
+mod names_api;
 mod scheduled;
 mod translate;
 mod web_server;

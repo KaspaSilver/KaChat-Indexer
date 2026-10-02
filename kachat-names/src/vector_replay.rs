@@ -133,7 +133,27 @@ fn every_vector_step_applies_exactly() {
         let seeded: HashSet<Outpoint> = reg.utxos.keys().copied().collect();
 
         let tx = tx_of(step);
-        reg.apply(&t, &tx);
+        let events = reg.apply(&t, &tx);
+
+        // The history op the step must produce (none for commits, refunds, withdrawals).
+        let want_op = match step["op"].as_str().unwrap() {
+            "register" => Some("register"),
+            "renew" => Some("renew"),
+            "transfer" => Some("transfer"),
+            "list" if label.starts_with("delist") => Some("delist"),
+            "list" => Some("list"),
+            "buy" => Some("sale"),
+            "offer" => Some("offer"),
+            "acceptOffer" => Some("offer_accepted"),
+            "release" => Some("release"),
+            "reclaim" => Some("reclaim"),
+            _ => None,
+        };
+        let ops: Vec<&str> = events.iter().map(|e| e.op).collect();
+        match want_op {
+            Some(op) => assert_eq!(ops, vec![op], "[{label}] history op"),
+            None => assert!(ops.is_empty(), "[{label}] no history op, got {ops:?}"),
+        }
 
         let expected = registry_outputs(step);
         for (i, script) in &expected {

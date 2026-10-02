@@ -19,6 +19,9 @@ hex = "0.4"
 sha2 = "0.10"
 # .kachat names: key = blake3(name) (KACHAT_NAMES_INDEXER.md §B1).
 blake3 = "1"
+# .kachat names read API: status rules shared with the follower, address <-> key.
+kachat-names = { path = "../kachat-names" }
+kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa.git" }
 clap = { version = "4.5.48", features = ["derive"] }
 axum-prometheus = "0.9"
 base64ct = { version = "1.8.0", features = ["alloc"] }

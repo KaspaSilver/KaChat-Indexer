@@ -1,0 +1,587 @@
+//! `.kachat` read API (KACHAT_NAMES_INDEXER.md Part D, exactly as the apps decode it —
+//! docs/KACHAT_NAMES_APP_CONTRACT.md §2), served from the tables `kachat-names-follower`
+//! keeps (`names_state`, `names_utxos`, `names_history`, `names_profiles`).
+//!
+//! Every lookup answers 503 `syncing` until the follower reports `synced` (caught up and a
+//! clean self-test), its heartbeat is fresh, and it follows the same registry as the loaded
+//! manifest — the apps switch to this indexer on `/names/status`, so a half-built registry
+//! must never be served. Rows the self-test found missing on the node (`refuted`) are
+//! withheld. Owners/buyers are addresses, amounts are sompi strings, times are unix ms.
+
+use std::collections::HashMap;
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use kachat_names::{NameStatus, name_status};
+use kaspa_addresses::{Address, Prefix, Version};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sqlx::{PgPool, Row, postgres::PgRow};
+use std::sync::Arc;
+
+use crate::names::{name_key_hex, normalize_name};
+use crate::web_server::AppState;
+
+/// The follower writes its status every poll; older than this it is treated as down.
+const STALE_MS: i64 = 120_000;
+const MAX_BATCH: usize = 200;
+
+/// The follower's row in `names_state`, if the tables exist and belong to `registry`.
+pub struct FollowerStatus {
+    pub indexed_daa: i64,
+    pub synced: bool,
+    pub grace_ms: i64,
+    pub network: Option<String>,
+}
+
+pub async fn follower_status(pool: &PgPool, registry: &str) -> Option<FollowerStatus> {
+    let row = sqlx::query(
+        "SELECT registry_covenant_id, network, indexed_daa, synced, grace_ms, updated_at FROM names_state WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+    let stored: String = row.get("registry_covenant_id");
+    if !stored.eq_ignore_ascii_case(registry) {
+        return None;
+    }
+    let fresh = now_ms() - row.get::<i64, _>("updated_at") <= STALE_MS;
+    Some(FollowerStatus {
+        indexed_daa: row.get("indexed_daa"),
+        synced: row.get::<bool, _>("synced") && fresh,
+        grace_ms: row.get("grace_ms"),
+        network: row.get("network"),
+    })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+fn err(code: StatusCode, error: &str, message: &str) -> Response {
+    (code, Json(json!({ "error": error, "message": message }))).into_response()
+}
+
+/// Everything a handler needs once the registry is servable.
+struct Ctx {
+    pool: PgPool,
+    prefix: Prefix,
+    grace_ms: i64,
+    indexed_daa: i64,
+    now: i64,
+}
+
+async fn ctx(state: &AppState) -> Result<Ctx, Response> {
+    let Some(registry) = state.names.manifest.as_ref().and_then(|m| m.registry_covenant_id.clone()) else {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "names module is off (no manifest)"));
+    };
+    let pool = state.scheduled_pool.clone();
+    match follower_status(&pool, &registry).await {
+        Some(s) if s.synced => Ok(Ctx {
+            pool,
+            prefix: if s.network.as_deref() == Some("mainnet") { Prefix::Mainnet } else { Prefix::Testnet },
+            grace_ms: s.grace_ms,
+            indexed_daa: s.indexed_daa,
+            now: now_ms(),
+        }),
+        _ => Err(err(StatusCode::SERVICE_UNAVAILABLE, "syncing", "the registry follower is not synced yet")),
+    }
+}
+
+fn internal(e: sqlx::Error) -> Response {
+    tracing::error!("names api: {e}");
+    err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "database error")
+}
+
+// ------------------------------------------------------------------ encoding ----
+
+fn owner_address(prefix: Prefix, xonly: &[u8]) -> Option<String> {
+    (xonly.len() == 32).then(|| Address::new(prefix, Version::PubKey, xonly).to_string())
+}
+
+/// The x-only key behind a schnorr P2PK address (`kaspatest:q…`); `None` for anything else.
+fn address_key(address: &str) -> Option<Vec<u8>> {
+    let a = Address::try_from(address.trim()).ok()?;
+    (a.version == Version::PubKey && a.payload.len() == 32).then(|| a.payload.to_vec())
+}
+
+fn normalize_address(address: &str) -> Option<String> {
+    Address::try_from(address.trim()).ok().map(|a| a.to_string())
+}
+
+fn status_str(s: NameStatus) -> &'static str {
+    match s {
+        NameStatus::Active => "active",
+        NameStatus::Grace => "grace",
+        NameStatus::Lapsed => "lapsed",
+    }
+}
+
+fn outpoint(r: &PgRow) -> Value {
+    json!({ "txId": hex::encode(r.get::<Vec<u8>, _>("txid")), "index": r.get::<i32, _>("idx") })
+}
+
+/// Name rows plus their registration/update times from history.
+const NAME_SELECT: &str = r#"
+    SELECT u.*,
+      (SELECT h.at FROM names_history h WHERE h.key = u.key AND h.op = 'register' ORDER BY h.id DESC LIMIT 1) AS reg_at,
+      (SELECT h.tx_id FROM names_history h WHERE h.key = u.key AND h.op = 'register' ORDER BY h.id DESC LIMIT 1) AS reg_tx,
+      (SELECT max(h.at) FROM names_history h WHERE h.key = u.key) AS upd_at
+    FROM names_utxos u
+    WHERE u.kind = 'name' AND NOT u.refuted"#;
+
+fn row_status(c: &Ctx, r: &PgRow) -> NameStatus {
+    name_status(r.get::<Option<i64>, _>("expires_at").unwrap_or(0), c.grace_ms, c.now)
+}
+
+fn name_json(c: &Ctx, r: &PgRow) -> Value {
+    let owner: Vec<u8> = r.get::<Option<Vec<u8>>, _>("owner").unwrap_or_default();
+    let mut v = json!({
+        "name": r.get::<Option<String>, _>("name").unwrap_or_default(),
+        "key": hex::encode(r.get::<Option<Vec<u8>>, _>("key").unwrap_or_default()),
+        "registered": true,
+        "status": status_str(row_status(c, r)),
+        "owner": owner_address(c.prefix, &owner),
+        "ownerKey": hex::encode(&owner),
+        "price": r.get::<Option<i64>, _>("price").unwrap_or(0).to_string(),
+        "expiresAt": r.get::<Option<i64>, _>("expires_at").unwrap_or(0),
+        "outpoint": outpoint(r),
+    });
+    let o = v.as_object_mut().unwrap();
+    if let Some(at) = r.get::<Option<i64>, _>("reg_at") {
+        o.insert("registeredAt".into(), json!(at));
+    }
+    if let Some(tx) = r.get::<Option<Vec<u8>>, _>("reg_tx") {
+        o.insert("registeredTxId".into(), json!(hex::encode(tx)));
+    }
+    if let Some(at) = r.get::<Option<i64>, _>("upd_at") {
+        o.insert("updatedAt".into(), json!(at));
+    }
+    v
+}
+
+fn gap_json(r: &PgRow) -> Value {
+    json!({
+        "lo": hex::encode(r.get::<Option<Vec<u8>>, _>("lo").unwrap_or_default()),
+        "hi": hex::encode(r.get::<Option<Vec<u8>>, _>("hi").unwrap_or_default()),
+        "outpoint": outpoint(r),
+    })
+}
+
+fn offer_json(c: &Ctx, r: &PgRow, name: Option<String>) -> Value {
+    let refund_after = r.get::<Option<i64>, _>("refund_after").unwrap_or(0);
+    let buyer: Vec<u8> = r.get::<Option<Vec<u8>>, _>("buyer").unwrap_or_default();
+    let mut v = json!({
+        "outpoint": outpoint(r),
+        "buyer": owner_address(c.prefix, &buyer),
+        "amount": r.get::<i64, _>("value").to_string(),
+        "refundAfter": refund_after,
+        "createdAt": r.get::<i64, _>("created_at"),
+        "refundable": c.indexed_daa >= refund_after,
+    });
+    if let Some(n) = name {
+        v.as_object_mut().unwrap().insert("name".into(), json!(n));
+    }
+    v
+}
+
+fn event_json(c: &Ctx, r: &PgRow) -> Value {
+    let addr = |col: &str| r.get::<Option<Vec<u8>>, _>(col).and_then(|k| owner_address(c.prefix, &k));
+    let mut v = json!({
+        "txId": hex::encode(r.get::<Vec<u8>, _>("tx_id")),
+        "op": r.get::<String, _>("op"),
+        "at": r.get::<i64, _>("at"),
+        "daa": r.get::<i64, _>("daa"),
+    });
+    let o = v.as_object_mut().unwrap();
+    if let Some(n) = r.get::<Option<String>, _>("name") {
+        o.insert("name".into(), json!(n));
+    }
+    if let Some(a) = addr("from_key") {
+        o.insert("from".into(), json!(a));
+    }
+    if let Some(a) = addr("to_key") {
+        o.insert("to".into(), json!(a));
+    }
+    if let Some(p) = r.get::<Option<i64>, _>("price") {
+        o.insert("price".into(), json!(p.to_string()));
+    }
+    if let Some(y) = r.get::<Option<i64>, _>("years") {
+        o.insert("years".into(), json!(y));
+    }
+    v
+}
+
+/// Opaque cursors are plain offsets / row ids as strings.
+fn cursor(q: &Option<String>) -> i64 {
+    q.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0).max(0)
+}
+
+#[derive(Deserialize, Default)]
+pub struct PageQuery {
+    cursor: Option<String>,
+    length: Option<i64>,
+    sort: Option<String>,
+    #[serde(rename = "includeInactive")]
+    include_inactive: Option<bool>,
+}
+
+fn page_len(q: &PageQuery) -> i64 {
+    q.length.unwrap_or(50).clamp(1, 200)
+}
+
+// ------------------------------------------------------------------- handlers ----
+
+/// `GET /names/{name}` — the name object, or `registered:false` with the gap to register in.
+pub async fn name_lookup(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let Some(name) = normalize_name(&name) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_name", "a name is 1-32 of a-z, 0-9 and inner hyphens");
+    };
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let key = blake3::hash(name.as_bytes()).as_bytes().to_vec();
+    match sqlx::query(&format!("{NAME_SELECT} AND u.key = $1 LIMIT 1")).bind(&key).fetch_optional(&c.pool).await {
+        Ok(Some(r)) => Json(name_json(&c, &r)).into_response(),
+        Ok(None) => match gap_for(&c, &key).await {
+            Ok(Some(g)) => Json(json!({ "name": name, "key": name_key_hex(&name), "registered": false, "gap": g }))
+                .into_response(),
+            Ok(None) => err(StatusCode::NOT_FOUND, "not_found", "no live gap covers this key"),
+            Err(e) => internal(e),
+        },
+        Err(e) => internal(e),
+    }
+}
+
+async fn gap_for(c: &Ctx, key: &[u8]) -> Result<Option<Value>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT * FROM names_utxos WHERE kind = 'gap' AND NOT refuted AND lo < $1 AND hi > $1 LIMIT 1",
+    )
+    .bind(key)
+    .fetch_optional(&c.pool)
+    .await?;
+    Ok(row.as_ref().map(gap_json))
+}
+
+/// `GET /names/gap/{keyHex}` — the one live gap with `lo < key < hi`.
+pub async fn gap_lookup(State(state): State<Arc<AppState>>, Path(key_hex): Path<String>) -> Response {
+    let key = match hex::decode(key_hex.trim()) {
+        Ok(k) if k.len() == 32 => k,
+        _ => return err(StatusCode::BAD_REQUEST, "invalid_key", "the key is 64 hex characters"),
+    };
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match gap_for(&c, &key).await {
+        Ok(Some(g)) => Json(g).into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, "not_found", "no live gap covers this key"),
+        Err(e) => internal(e),
+    }
+}
+
+/// `GET /names/by-owner/{address}?includeInactive=` — oldest first; active only by default.
+pub async fn by_owner(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+    Query(q): Query<PageQuery>,
+) -> Response {
+    let Some(key) = address_key(&address) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_address", "a schnorr (q…) address is required");
+    };
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let rows = match sqlx::query(&format!("{NAME_SELECT} AND u.owner = $1 ORDER BY u.created_daa ASC"))
+        .bind(&key)
+        .fetch_all(&c.pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let inactive = q.include_inactive.unwrap_or(false);
+    let names: Vec<Value> = rows
+        .iter()
+        .filter(|r| inactive || row_status(&c, r) == NameStatus::Active)
+        .map(|r| name_json(&c, r))
+        .collect();
+    Json(json!({ "names": names })).into_response()
+}
+
+/// `GET /market/listings?sort=recent|price_asc|price_desc&length=&cursor=` — listed, active.
+pub async fn listings(State(state): State<Arc<AppState>>, Query(q): Query<PageQuery>) -> Response {
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let order = match q.sort.as_deref() {
+        Some("price_asc") => "u.price ASC, u.created_daa DESC",
+        Some("price_desc") => "u.price DESC, u.created_daa DESC",
+        _ => "u.created_daa DESC",
+    };
+    let (len, off) = (page_len(&q), cursor(&q.cursor));
+    let sql = format!("{NAME_SELECT} AND u.price > 0 AND u.expires_at > $1 ORDER BY {order} LIMIT $2 OFFSET $3");
+    match sqlx::query(&sql).bind(c.now).bind(len + 1).bind(off).fetch_all(&c.pool).await {
+        Ok(rows) => {
+            let more = rows.len() as i64 > len;
+            let listings: Vec<Value> = rows.iter().take(len as usize).map(|r| name_json(&c, r)).collect();
+            Json(json!({ "listings": listings, "next": more.then(|| (off + len).to_string()) })).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+/// `GET /names/expiring?cursor=` — lapsed names still unspent (reclaimable), oldest first.
+pub async fn expiring(State(state): State<Arc<AppState>>, Query(q): Query<PageQuery>) -> Response {
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let (len, off) = (page_len(&q), cursor(&q.cursor));
+    let sql = format!("{NAME_SELECT} AND u.expires_at + $1 <= $2 ORDER BY u.expires_at ASC LIMIT $3 OFFSET $4");
+    match sqlx::query(&sql).bind(c.grace_ms).bind(c.now).bind(len + 1).bind(off).fetch_all(&c.pool).await {
+        Ok(rows) => {
+            let more = rows.len() as i64 > len;
+            let names: Vec<Value> = rows.iter().take(len as usize).map(|r| name_json(&c, r)).collect();
+            Json(json!({ "names": names, "next": more.then(|| (off + len).to_string()) })).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+/// `GET /names/{name}/offers` — open offers on a name.
+pub async fn name_offers(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let Some(name) = normalize_name(&name) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_name", "a name is 1-32 of a-z, 0-9 and inner hyphens");
+    };
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let key = blake3::hash(name.as_bytes()).as_bytes().to_vec();
+    match sqlx::query(
+        "SELECT * FROM names_utxos WHERE kind = 'offer' AND NOT refuted AND key = $1 ORDER BY created_daa DESC",
+    )
+    .bind(&key)
+    .fetch_all(&c.pool)
+    .await
+    {
+        Ok(rows) => {
+            let offers: Vec<Value> = rows.iter().map(|r| offer_json(&c, r, Some(name.clone()))).collect();
+            Json(json!({ "offers": offers })).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+/// `GET /offers/by-buyer/{address}` — a buyer's open offers, each with its `name`.
+pub async fn offers_by_buyer(State(state): State<Arc<AppState>>, Path(address): Path<String>) -> Response {
+    let Some(buyer) = address_key(&address) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_address", "a schnorr (q…) address is required");
+    };
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    // The offer only carries the name's key; the name string comes from the live name row
+    // or, if it isn't live, from the newest history row for that key.
+    let sql = r#"
+        SELECT o.*, COALESCE(
+            (SELECT n.name FROM names_utxos n WHERE n.kind = 'name' AND n.key = o.key LIMIT 1),
+            (SELECT h.name FROM names_history h WHERE h.key = o.key AND h.name IS NOT NULL ORDER BY h.id DESC LIMIT 1)
+        ) AS offer_name
+        FROM names_utxos o
+        WHERE o.kind = 'offer' AND NOT o.refuted AND o.buyer = $1
+        ORDER BY o.created_daa DESC"#;
+    match sqlx::query(sql).bind(&buyer).fetch_all(&c.pool).await {
+        Ok(rows) => {
+            let offers: Vec<Value> =
+                rows.iter().map(|r| offer_json(&c, r, r.get::<Option<String>, _>("offer_name"))).collect();
+            Json(json!({ "offers": offers })).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+async fn events_page(c: &Ctx, filter: &str, bind_key: Option<Vec<u8>>, q: &PageQuery) -> Response {
+    let len = page_len(q);
+    let before = cursor(&q.cursor);
+    let before = if before > 0 { before } else { i64::MAX };
+    let sql = format!("SELECT * FROM names_history WHERE id < $1 AND {filter} ORDER BY id DESC LIMIT $2");
+    let mut query = sqlx::query(&sql).bind(before).bind(len + 1);
+    if let Some(k) = bind_key {
+        query = query.bind(k);
+    }
+    match query.fetch_all(&c.pool).await {
+        Ok(rows) => {
+            let more = rows.len() as i64 > len;
+            let page = &rows[..rows.len().min(len as usize)];
+            let next = if more { page.last().map(|r| r.get::<i64, _>("id").to_string()) } else { None };
+            let events: Vec<Value> = page.iter().map(|r| event_json(c, r)).collect();
+            Json(json!({ "events": events, "next": next })).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+/// `GET /names/{name}/history?cursor=` — newest first.
+pub async fn name_history(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<PageQuery>,
+) -> Response {
+    let Some(name) = normalize_name(&name) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_name", "a name is 1-32 of a-z, 0-9 and inner hyphens");
+    };
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let key = blake3::hash(name.as_bytes()).as_bytes().to_vec();
+    events_page(&c, "key = $3 AND op <> 'offer'", Some(key), &q).await
+}
+
+/// `GET /market/activity?cursor=` — recent sales, listings and offers across the registry.
+pub async fn market_activity(State(state): State<Arc<AppState>>, Query(q): Query<PageQuery>) -> Response {
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    events_page(&c, "op IN ('sale', 'list', 'offer', 'offer_accepted')", None, &q).await
+}
+
+/// One profile: the stored record (already validated by the follower) or null.
+async fn profile_for(c: &Ctx, address: &str) -> Result<Option<(Value, i64, Vec<u8>)>, sqlx::Error> {
+    let row = sqlx::query("SELECT profile, updated_at, tx_id FROM names_profiles WHERE address = $1")
+        .bind(address)
+        .fetch_optional(&c.pool)
+        .await?;
+    Ok(row.map(|r| {
+        let profile = serde_json::from_str(&r.get::<String, _>("profile")).unwrap_or(Value::Null);
+        (profile, r.get("updated_at"), r.get("tx_id"))
+    }))
+}
+
+/// `GET /profiles/{address}`
+pub async fn profile(State(state): State<Arc<AppState>>, Path(address): Path<String>) -> Response {
+    let Some(address) = normalize_address(&address) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address");
+    };
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match profile_for(&c, &address).await {
+        Ok(Some((p, at, tx))) => {
+            Json(json!({ "address": address, "profile": p, "updatedAt": at, "txId": hex::encode(tx) })).into_response()
+        }
+        Ok(None) => Json(json!({ "address": address, "profile": Value::Null })).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+/// Part C identity: active names (oldest first), the profile, and the label —
+/// `primaryName` while owned and active, else the oldest active name, else null.
+async fn identity_for(c: &Ctx, address: &str) -> Result<Value, sqlx::Error> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(key) = address_key(address) {
+        let rows = sqlx::query(
+            "SELECT name, expires_at FROM names_utxos WHERE kind = 'name' AND NOT refuted AND owner = $1 ORDER BY created_daa ASC",
+        )
+        .bind(&key)
+        .fetch_all(&c.pool)
+        .await?;
+        names = rows
+            .iter()
+            .filter(|r| name_status(r.get::<Option<i64>, _>("expires_at").unwrap_or(0), c.grace_ms, c.now) == NameStatus::Active)
+            .filter_map(|r| r.get::<Option<String>, _>("name"))
+            .collect();
+    }
+    let profile = profile_for(c, address).await?.map(|(p, _, _)| p).unwrap_or(Value::Null);
+    let primary = profile.get("primaryName").and_then(Value::as_str).map(|s| s.trim_end_matches(".kachat").to_string());
+    let label = match primary {
+        Some(p) if names.contains(&p) => Some(p),
+        _ => names.first().cloned(),
+    };
+    Ok(json!({ "address": address, "label": label, "names": names, "profile": profile }))
+}
+
+/// `GET /identity/{address}`
+pub async fn identity(State(state): State<Arc<AppState>>, Path(address): Path<String>) -> Response {
+    let Some(address) = normalize_address(&address) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address");
+    };
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match identity_for(&c, &address).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct BatchBody {
+    addresses: Vec<String>,
+}
+
+/// `POST /identity/batch {"addresses": [...]}` (≤ 200) → `{"identities": {address: identity}}`.
+pub async fn identity_batch(State(state): State<Arc<AppState>>, Json(body): Json<BatchBody>) -> Response {
+    if body.addresses.len() > MAX_BATCH {
+        return err(StatusCode::BAD_REQUEST, "too_many", "at most 200 addresses");
+    }
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let mut out: HashMap<String, Value> = HashMap::new();
+    for raw in &body.addresses {
+        let Some(address) = normalize_address(raw) else { continue };
+        match identity_for(&c, &address).await {
+            Ok(v) => {
+                out.insert(raw.clone(), v);
+            }
+            Err(e) => return internal(e),
+        }
+    }
+    Json(json!({ "identities": out })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // kachat-domains' `kachat-names-vectors` p2pk vector (KaChatTests/KachatNamesVectors.json).
+    const XONLY: &str = "6dece92abd087978562b0e47943d859bd444672f89bc68fc8bfa03a3d0b27ee8";
+    const ADDRESS: &str = "kaspatest:qpk7e6f2h5y8j7zk9v8y09paskdag3r897ymc68u30aq8g7skflwsaxs0p99v";
+
+    #[test]
+    fn owner_key_and_address_round_trip_the_builder_vector() {
+        let key = hex::decode(XONLY).unwrap();
+        assert_eq!(owner_address(Prefix::Testnet, &key).as_deref(), Some(ADDRESS));
+        assert_eq!(address_key(ADDRESS), Some(key));
+        assert_eq!(normalize_address(&format!("  {ADDRESS} ")).as_deref(), Some(ADDRESS));
+    }
+
+    #[test]
+    fn only_schnorr_addresses_name_an_owner() {
+        assert_eq!(address_key("not-an-address"), None);
+        assert_eq!(owner_address(Prefix::Testnet, &[0u8; 31]), None);
+    }
+
+    #[test]
+    fn cursors_are_non_negative_offsets() {
+        assert_eq!(cursor(&None), 0);
+        assert_eq!(cursor(&Some("40".into())), 40);
+        assert_eq!(cursor(&Some("-5".into())), 0);
+        assert_eq!(cursor(&Some("junk".into())), 0);
+    }
+}
