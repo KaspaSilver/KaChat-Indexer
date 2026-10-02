@@ -341,6 +341,8 @@ pub mod transition;
 pub use transition::{Contract, Entry, NameStatus, entry_for_tag, name_status, YEAR_MS};
 
 pub mod ingest;
+pub mod profile;
+pub use profile::{parse_profile, Profile};
 
 #[cfg(test)]
 mod tests;

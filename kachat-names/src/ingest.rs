@@ -321,7 +321,9 @@ impl Registry {
     fn apply_profile(&mut self, tx: &Tx) {
         let Ok(text) = std::str::from_utf8(&tx.payload) else { return };
         let Some(json) = text.strip_prefix("kchat:1:profile:") else { return };
-        if json.len() > 2048 {
+        // Validate against the 2026-10-02 format (one allowlisted social + linktr.ee +
+        // primaryName, <= 2 KB); reject old/oversized/invalid records outright.
+        if crate::parse_profile(json).is_none() {
             return;
         }
         // The chain reader supplies the resolved address via the first output's spk as the
