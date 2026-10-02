@@ -62,6 +62,27 @@ pub enum ExtensionPushEvent {
         /// Opaque payload (hex) forwarded to the callee (e.g. SDP/handshake blob).
         payload: String,
     },
+    /// `.kachat` name event (KACHAT_NAMES_INDEXER.md Part E) for every device registered
+    /// under `to_address`. Posted by the names follower on the same box.
+    Name {
+        /// Recipient's canonical kaspa (primary) address.
+        to_address: String,
+        /// name_offer / name_sold / name_offer_accepted / name_renewal_open / name_expiring / name_grace.
+        event: String,
+        /// The name without `.kachat`.
+        name: String,
+        /// The registry tx (empty for scheduled reminders).
+        tx_id: String,
+        /// Sompi string (name_offer, name_sold).
+        amount: Option<String>,
+        /// 3 or 1 (name_expiring).
+        days: Option<u32>,
+        /// Plain-English fallback; the app's extension rewrites it in the phone's language.
+        title: String,
+        body: String,
+        /// Dedup key (the follower's own, so retries never double-notify).
+        dedup: String,
+    },
 }
 
 /// Address Activity: an accepted tx credited one or more watched (owned / watch-only) addresses

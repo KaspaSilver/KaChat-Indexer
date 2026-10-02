@@ -124,7 +124,10 @@ Spec: `docs/KACHAT_NAMES_INDEXER.md` + `docs/KACHAT_NAMES_UPDATE_2026-10-02.md` 
 2. **Deploy on testnet**: Update the indexer + panel, start Kaspad-testnet + Indexer-testnet,
    set the manifest in the `.kachat` tab, publish the testnet indexer (Proxy & domains,
    Testnet view), send the URL to the app owner.
-3. **Part E push** (name_offer / name_sold / name_offer_accepted / name_expiring / name_grace).
+3. ~~Part E push~~ — done (`kachat-names-follower/src/pushes.rs` → `/internal/push/names`): name_offer,
+   name_sold, name_offer_accepted (from registry events, only when caught up and fresh), and the v2
+   reminders name_renewal_open / name_expiring (3 d, 1 d) / name_grace (claimed once per expiry in
+   `names_reminders`).
 4. **Android call ring**: `/v1/push/ring` is APNs-VoIP only; needs an Android FCM handler first.
 
 ### Test vectors
@@ -144,7 +147,7 @@ are read from there by default (or `KACHAT_NAMES_VECTORS`); `matches_generated_v
 - DONE: no-handshake §5; testnet parallel stack; `.kachat` tab; names engine (codec/transitions/
   applier/undo/loop/profiles), vector replay, live follower, Postgres store, Part D read API,
   self-test, testnet publish target.
-- TODO: Postgres end-to-end run; testnet deploy + URL to the app owner; Part E push; Android
+- TODO: Postgres end-to-end run; testnet deploy + URL to the app owner; Android
   call ring (needs the app's FCM handler first).
 
 ## Next concrete step

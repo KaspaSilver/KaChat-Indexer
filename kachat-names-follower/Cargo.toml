@@ -22,3 +22,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 clap = { version = "4.5.48", features = ["derive", "env"] }
 hex = "0.4"
+# Part E: POST name events to the push service's internal route.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

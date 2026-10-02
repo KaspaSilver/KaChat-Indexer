@@ -99,6 +99,7 @@ impl PushApi {
         Router::new()
             .route("/broadcast", post(internal_broadcast_push))
             .route("/kaposts", post(internal_kaposts_push))
+            .route("/names", post(internal_names_push))
             .route("/submit-tx", post(internal_submit_tx))
     }
 }
@@ -380,6 +381,45 @@ async fn internal_submit_tx(
             (StatusCode::BAD_GATEWAY, format!("submit failed: {e}"))
         }
     }
+}
+
+// `.kachat` name events from the names follower (KACHAT_NAMES_INDEXER.md Part E).
+#[derive(Debug, Deserialize)]
+pub struct InternalNamePush {
+    pub to_address: String,
+    pub event: String,
+    pub name: String,
+    #[serde(default)]
+    pub tx_id: String,
+    #[serde(default)]
+    pub amount: Option<String>,
+    #[serde(default)]
+    pub days: Option<u32>,
+    pub title: String,
+    pub body: String,
+    pub dedup: String,
+}
+
+async fn internal_names_push(
+    State(state): State<PushApi>,
+    headers: HeaderMap,
+    Json(payload): Json<InternalNamePush>,
+) -> impl IntoResponse {
+    if !state.internal_authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let _ = state.ext_push_tx.try_send(ExtensionPushEvent::Name {
+        to_address: payload.to_address,
+        event: payload.event,
+        name: payload.name,
+        tx_id: payload.tx_id,
+        amount: payload.amount,
+        days: payload.days,
+        title: payload.title,
+        body: payload.body,
+        dedup: payload.dedup,
+    });
+    (StatusCode::OK, "ok")
 }
 
 async fn internal_kaposts_push(

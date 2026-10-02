@@ -94,6 +94,15 @@ pub async fn create_schema(pool: &PgPool) -> Result<()> {
             updated_at BIGINT NOT NULL
         )"#,
         "CREATE INDEX IF NOT EXISTS names_profiles_address ON names_profiles (address)",
+        // Part E reminders sent: one row per (name key, expiry, kind) so each is sent once,
+        // and a renewal (new expiresAt) starts a fresh schedule.
+        r#"CREATE TABLE IF NOT EXISTS names_reminders (
+            key BYTEA NOT NULL,
+            expires_at BIGINT NOT NULL,
+            kind TEXT NOT NULL,
+            sent_at BIGINT NOT NULL,
+            PRIMARY KEY (key, expires_at, kind)
+        )"#,
     ] {
         sqlx::query(stmt).execute(pool).await?;
     }
@@ -110,7 +119,7 @@ pub async fn stored_registry(pool: &PgPool) -> Result<Option<String>> {
 /// Wipe everything and record which registry the tables now follow.
 pub async fn reset(pool: &PgPool, registry: &str, network: &str, genesis_txid: &str, grace_ms: i64) -> Result<()> {
     let mut tx = pool.begin().await?;
-    for t in ["names_utxos", "names_history", "names_profiles", "names_state"] {
+    for t in ["names_utxos", "names_history", "names_profiles", "names_reminders", "names_state"] {
         sqlx::query(&format!("DELETE FROM {t}")).execute(&mut *tx).await?;
     }
     sqlx::query(
@@ -317,6 +326,20 @@ async fn write_status(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, s: &Status
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// Claim a reminder; true only the first time (so it is pushed exactly once).
+pub async fn claim_reminder(pool: &PgPool, key: &[u8; 32], expires_at: i64, kind: &str, now: i64) -> Result<bool> {
+    let r = sqlx::query(
+        "INSERT INTO names_reminders (key, expires_at, kind, sent_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+    )
+    .bind(key.to_vec())
+    .bind(expires_at)
+    .bind(kind)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() == 1)
 }
 
 /// Status-only write (no registry change in this batch).

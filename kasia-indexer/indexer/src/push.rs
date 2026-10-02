@@ -1167,6 +1167,23 @@ impl PushRegistry {
         }
     }
 
+    /// Every device registered under primary `address` (canonical bech32). Iterates all
+    /// registrations like the VoIP lookup: `.kachat` name events are rare.
+    fn tokens_for_primary_address_str(&self, address: &str) -> anyhow::Result<Vec<String>> {
+        let rtx = self.tx_keyspace.read_tx();
+        let mut out = Vec::new();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let value = entry?;
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            if reg.primary_address.as_deref() == Some(address) {
+                out.push(reg.device_token);
+            }
+        }
+        Ok(out)
+    }
+
     /// VoIP: every device registered under primary `address` that carries a VoIP token, as
     /// `(device_token, voip_token, apns_environment)`. Iterates all registrations (calls are
     /// infrequent vs chat, so no reverse index). `address` must be canonical bech32.
@@ -1465,6 +1482,10 @@ enum PushRegistryCommand {
         address: String,
         response: RegistryResponse<Vec<(String, String, Option<String>)>>,
     },
+    TokensForPrimaryAddressStr {
+        address: String,
+        response: RegistryResponse<Vec<String>>,
+    },
     RegistrationForToken {
         token: String,
         response: RegistryResponse<Option<DeviceRegistration>>,
@@ -1670,6 +1691,10 @@ impl PushRegistryActor {
                 }
                 PushRegistryCommand::VoipTokensForPrimaryAddress { address, response } => {
                     let result = self.registry.voip_tokens_for_primary_address(&address);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::TokensForPrimaryAddressStr { address, response } => {
+                    let result = self.registry.tokens_for_primary_address_str(&address);
                     let _ = response.send(result);
                 }
                 PushRegistryCommand::RegistrationForToken { token, response } => {
@@ -1950,6 +1975,12 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// Every device registered under primary `address` (canonical bech32).
+    pub async fn tokens_for_primary_address_str(&self, address: String) -> anyhow::Result<Vec<String>> {
+        self.request(|response| PushRegistryCommand::TokensForPrimaryAddressStr { address, response })
+            .await
+    }
+
     /// Fetch a full device registration by (already-normalized) token.
     pub async fn registration_for_token(
         &self,
@@ -2169,6 +2200,7 @@ impl PushDispatcher {
                 ..
             } => Some(format!("{tx_id}:kaposts:{}", kaposts_xonly(target_pubkey))),
             ExtensionPushEvent::Ring { .. } => None,
+            ExtensionPushEvent::Name { dedup, .. } => Some(format!("name:{dedup}")),
         };
         if let Some(event_tx_id) = &event_tx_id
             && !self.sent_cache.mark_seen(event_tx_id)
@@ -2291,6 +2323,60 @@ impl PushDispatcher {
                     data.insert("kaposts_kind".to_string(), kaposts_kind);
                 }
                 self.deliver(tokens, &payload, &data, Some(&tx_id), true).await;
+                Ok(())
+            }
+            ExtensionPushEvent::Name {
+                to_address,
+                event,
+                name,
+                tx_id,
+                amount,
+                days,
+                title,
+                body,
+                dedup,
+            } => {
+                let Some(address) = normalize_primary_address(Some(to_address)) else {
+                    return Ok(());
+                };
+                let mut tokens = self.registry.tokens_for_primary_address_str(address).await?;
+                tokens.sort_unstable();
+                tokens.dedup();
+                if tokens.is_empty() {
+                    return Ok(());
+                }
+                if tokens.len() > MAX_PUSH_FANOUT {
+                    tokens.truncate(MAX_PUSH_FANOUT);
+                }
+                // KACHAT_NAMES_INDEXER.md Part E: same shape as the other app pushes.
+                let payload = NamePayload {
+                    aps: NameAps {
+                        alert: ExtensionAlert { title: title.clone(), subtitle: None, body: body.clone() },
+                        mutable_content: 1,
+                        sound: "default",
+                    },
+                    kind: "name_event",
+                    event: event.clone(),
+                    name: name.clone(),
+                    tx_id: tx_id.clone(),
+                    amount: amount.clone(),
+                    days,
+                };
+                let mut data = BTreeMap::new();
+                data.insert("type".to_string(), "name_event".to_string());
+                data.insert("event".to_string(), event);
+                data.insert("name".to_string(), name);
+                data.insert("tx_id".to_string(), tx_id);
+                data.insert("title".to_string(), title);
+                data.insert("body".to_string(), body);
+                if let Some(amount) = amount {
+                    data.insert("amount".to_string(), amount);
+                }
+                if let Some(days) = days {
+                    data.insert("days".to_string(), days.to_string());
+                }
+                let collapse: String = dedup.chars().take(64).collect();
+                self.deliver(tokens, &payload, &data, Some(&collapse), true).await;
                 Ok(())
             }
             ExtensionPushEvent::Ring {
@@ -2902,6 +2988,30 @@ struct ExtensionAlert {
     #[serde(skip_serializing_if = "Option::is_none")]
     subtitle: Option<String>,
     body: String,
+}
+
+// `.kachat` name event payload (KACHAT_NAMES_INDEXER.md Part E). `mutable-content: 1` is
+// required: the app's notification extension rewrites title/body in the phone's language.
+#[derive(Debug, Serialize)]
+struct NamePayload {
+    aps: NameAps,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    event: String,
+    name: String,
+    tx_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    days: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct NameAps {
+    alert: ExtensionAlert,
+    #[serde(rename = "mutable-content")]
+    mutable_content: u8,
+    sound: &'static str,
 }
 
 // VoIP ring payload — top-level custom keys only (PushKit delivers the raw dictionary; there is no
@@ -4169,5 +4279,42 @@ mod tests {
 
         drop(handle);
         actor_thread.join().expect("actor exits cleanly");
+    }
+}
+
+#[cfg(test)]
+mod name_push_tests {
+    use super::*;
+
+    #[test]
+    fn name_event_payload_matches_part_e() {
+        // KACHAT_NAMES_INDEXER.md Part E example, field for field.
+        let payload = NamePayload {
+            aps: NameAps {
+                alert: ExtensionAlert {
+                    title: "alice.kachat sold".into(),
+                    subtitle: None,
+                    body: "Your listing was bought.".into(),
+                },
+                mutable_content: 1,
+                sound: "default",
+            },
+            kind: "name_event",
+            event: "name_sold".into(),
+            name: "alice".into(),
+            tx_id: "ab".into(),
+            amount: Some("3500000000".into()),
+            days: None,
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "aps": {"alert": {"title": "alice.kachat sold", "body": "Your listing was bought."},
+                        "mutable-content": 1, "sound": "default"},
+                "type": "name_event", "event": "name_sold", "name": "alice", "tx_id": "ab",
+                "amount": "3500000000"
+            })
+        );
     }
 }

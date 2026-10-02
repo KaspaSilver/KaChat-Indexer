@@ -8,6 +8,7 @@
 //! signal, so nothing it serves may be refutable by the chain.
 
 mod node;
+mod pushes;
 mod store;
 
 use std::collections::{HashMap, HashSet};
@@ -63,6 +64,11 @@ struct Args {
     poll_ms: u64,
     #[arg(long, default_value_t = 300)]
     self_test_secs: u64,
+    /// The push service's internal route base (Part E name pushes). Same box, never public.
+    #[arg(long, env = "PUSH_INTERNAL_URL", default_value = "http://127.0.0.1:8600/internal/push")]
+    push_url: String,
+    #[arg(long, env = "INTERNAL_PUSH_SECRET", default_value = "")]
+    push_secret: String,
 }
 
 /// Static facts read from the manifest.
@@ -75,6 +81,7 @@ struct Manifest {
     genesis_gap: GapState,
     scan_from: [u8; 32],
     grace_ms: i64,
+    renew_window_ms: i64,
     templates: Templates,
 }
 
@@ -108,6 +115,8 @@ fn read_manifest(path: &str) -> Result<Manifest> {
         genesis_txid: genesis_txid.to_lowercase(),
         network,
         grace_ms,
+        // Registry v2: renewing opens this long before expiry (10 days).
+        renew_window_ms: raw["params"]["renewWindowMs"].as_i64().unwrap_or(864_000_000),
         templates: Templates::from_manifest(&raw).ok_or_else(|| anyhow!("manifest: incomplete artifacts"))?,
     })
 }
@@ -177,6 +186,15 @@ impl Window {
     }
 }
 
+/// Deliver one name push to its recipient (owner/seller/buyer key → their address).
+async fn send_push(http: &reqwest::Client, base: &str, secret: Option<&str>, prefix: Prefix, p: &pushes::NamePush) {
+    let to = Address::new(prefix, Version::PubKey, &p.to_key).to_string();
+    match pushes::send(http, base, secret, &to, p).await {
+        Ok(()) => info!("[names] push {} {} -> {}", p.event, p.name, to),
+        Err(e) => warn!("[names] push {} {} failed: {e:#}", p.event, p.name),
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -235,6 +253,9 @@ async fn main() -> Result<()> {
     // Names by key, so a release/reclaim event (the name is gone after apply) keeps its name.
     let mut names_by_key: HashMap<[u8; 32], String> = HashMap::new();
     let mut window = Window::default();
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let push_secret = (!args.push_secret.is_empty()).then_some(args.push_secret.as_str());
+    let mut last_reminder_scan = Instant::now() - Duration::from_secs(60);
 
     loop {
         let from = follower.checkpoint.unwrap_or(m.scan_from);
@@ -259,6 +280,7 @@ async fn main() -> Result<()> {
         }
         let before: HashSet<Outpoint> = follower.registry.utxos.keys().copied().collect();
         let profiles_before = follower.registry.profiles.clone();
+        let utxos_before = follower.registry.utxos.clone();
         let (batch, events) = follower.step(&m.templates, &mut Prefetched(Some(batch)))?;
 
         // Metadata for the outputs this batch started tracking.
@@ -344,6 +366,49 @@ async fn main() -> Result<()> {
             }
         } else {
             store::save_status(&pool, &status).await?;
+        }
+
+        // Part E. Only once caught up, and only for events from the last few minutes: the
+        // first sync replays the whole registry history, which must never notify anyone.
+        if caught_up && !events.is_empty() {
+            let fresh: Vec<_> = events.iter().filter(|e| e.at >= now_ms() - 15 * 60_000).cloned().collect();
+            let values: HashMap<Outpoint, u64> = meta.iter().map(|(op, m)| (*op, m.value)).collect();
+            let inputs: HashMap<[u8; 32], Vec<Outpoint>> = batch
+                .accepted
+                .iter()
+                .map(|t| (t.id, t.inputs.iter().map(|i| i.previous_outpoint).collect()))
+                .collect();
+            for p in pushes::event_pushes(&fresh, &utxos_before, &follower.registry.utxos, &values, &names_by_key, &inputs) {
+                send_push(&http, &args.push_url, push_secret, m.prefix, &p).await;
+            }
+        }
+        if status.synced && last_reminder_scan.elapsed() >= Duration::from_secs(60) {
+            last_reminder_scan = Instant::now();
+            let now = now_ms();
+            let due: Vec<_> = follower
+                .registry
+                .utxos
+                .iter()
+                .filter(|(op, _)| !refuted.contains(*op))
+                .filter_map(|(_, t)| match t {
+                    Tracked::Name(n) => pushes::due_reminder(n, now, m.renew_window_ms, m.grace_ms).map(|r| (*n, r)),
+                    _ => None,
+                })
+                .collect();
+            for (n, (event, days, kind)) in due {
+                if store::claim_reminder(&pool, &n.key, n.expires_at, kind, now).await? {
+                    let p = pushes::NamePush {
+                        to_key: n.owner,
+                        event,
+                        name: n.name_str(),
+                        tx_id: String::new(),
+                        amount: None,
+                        days,
+                        dedup: format!("{}:{}:{kind}", hex::encode(n.key), n.expires_at),
+                    };
+                    send_push(&http, &args.push_url, push_secret, m.prefix, &p).await;
+                }
+            }
         }
         if accepted_ids.is_empty() && !fetched_blocks {
             tokio::time::sleep(Duration::from_millis(args.poll_ms)).await;
