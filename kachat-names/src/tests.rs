@@ -101,6 +101,50 @@ fn name_rules() {
 // it field-by-field. Skipped (not failed) when the file isn't present, so the suite
 // runs anywhere; CI/dev point KACHAT_NAMES_VECTORS at a generated file.
 
+/// The real deployed testnet-10 manifest (kachat-domains, committed — not generated).
+fn manifest() -> Option<serde_json::Value> {
+    let path = std::env::var("KACHAT_NAMES_MANIFEST_FILE").unwrap_or_else(|_| {
+        "/home/vahome/kachat-domains/manifests/kachat-names-testnet-10.json".to_string()
+    });
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Authoritative cross-check against the **live chain**: `p2sh(prefix ‖ genesis-gap-state
+/// ‖ suffix)` must byte-for-byte equal the genesis gap output deployed on testnet-10.
+/// This validates p2sh_script (blake2b), the state encoding, and the redeem assembly
+/// against real on-chain bytes — no silverc needed.
+#[test]
+fn reproduces_live_testnet_genesis_gap_output() {
+    let Some(m) = manifest() else {
+        eprintln!("skipping: no live manifest");
+        return;
+    };
+    let gap = &m["artifacts"]["KachatGap"];
+    let prefix = h(gap["prefixHex"].as_str().unwrap());
+    let suffix = h(gap["suffixHex"].as_str().unwrap());
+
+    let ao = m["genesis"]["authorizedOutputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["contract"] == "KachatGap" && o["index"] == 0)
+        .expect("genesis gap output");
+    let lo = h32(ao["state"]["lo"].as_str().unwrap());
+    let hi = h32(ao["state"]["hi"].as_str().unwrap());
+
+    let state = GapState { lo, hi }.encode();
+    assert_eq!(state.len(), gap["stateSpan"]["len"].as_u64().unwrap() as usize, "gap state len");
+
+    let redeem = [prefix.as_slice(), &state, &suffix].concat();
+    assert_eq!(
+        hex::encode(p2sh_script(&redeem)),
+        ao["scriptPublicKey"].as_str().unwrap(),
+        "p2sh(prefix || genesis gap state || suffix) must equal the deployed genesis output"
+    );
+    assert_eq!(GapState::decode(&state), Some(GapState { lo, hi }));
+    eprintln!("live genesis gap output reproduced");
+}
+
 fn vectors() -> Option<serde_json::Value> {
     let path = std::env::var("KACHAT_NAMES_VECTORS")
         .unwrap_or_else(|_| "/home/vahome/kachat-domains/names-vectors.json".to_string());
