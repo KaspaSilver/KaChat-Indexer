@@ -52,11 +52,14 @@ Every field is optional to the decoder, but `registryCovenantId` is the switch.
 Used by `/names/{name}` and as each element of `names` and `listings`:
 ```json
 { "name": "alice", "key": "<64 hex>", "registered": true, "status": "active",
-  "owner": "kaspatest:q…", "ownerKey": "<64 hex x-only>", "price": "0", "expiresAt": 1822000000000,
+  "owner": "kaspatest:q…", "ownerKey": "<64 hex x-only>", "price": "0",
+  "periodStart": 1790000000000, "expiresAt": 1822000000000,
   "outpoint": {"txId": "…", "index": 2},
   "registeredAt": 1790000000000, "registeredTxId": "…", "updatedAt": 1790000000000 }
 ```
-- The app needs `expiresAt`, `outpoint`, and `ownerKey` **or** a decodable `owner` address.
+- The app needs `expiresAt`, `outpoint`, `periodStart` (registry v2: without it the app can't
+  spend the name and shows "the names indexer didn't send this name's paid period"), and
+  `ownerKey` **or** a decodable `owner` address.
 - **Free name:** `{"name": "alice", "key": "…", "registered": false, "gap": <gap object>}`. The
   app registers by spending exactly that gap.
 - **Invalid name:** `400 {"error": "invalid_name"}`.
