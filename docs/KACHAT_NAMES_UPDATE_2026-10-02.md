@@ -14,37 +14,30 @@ It covers:
 
 ## 1. What changed since 2026-10-01
 
-### 1.1 Profiles: one social link, plus Linktree (replaces Part C's old format)
+### 1.1 Profiles: a source link for each piece, plus Linktree (replaces Part C's old format)
 
-The profile record (`kchat:1:profile:<json>`, a self-transfer) now has exactly three fields:
+The profile record (`kchat:1:profile:<json>`, a self-transfer) now has these fields:
 
 ```json
-{ "v": 1, "social": "https://x.com/name", "linktree": "https://linktr.ee/name", "primaryName": "alice" }
+{ "v": 1, "avatar": "https://x.com/name", "banner": "https://www.youtube.com/@name",
+  "bio": "https://t.me/name", "linktree": "https://linktr.ee/name", "primaryName": "alice" }
 ```
 
-- **`social`** is a profile link on one of these platforms, stored normalized by the app:
+- **`avatar`, `banner` and `bio` are profile links.** Each one says where that piece comes from,
+  and they may be three different accounts. They are never the picture or the text itself.
+- **The allowed platforms differ per field.** `docs/KACHAT_NAMES_INDEXER.md` Part C has the full
+  table:
+  - avatar: X, YouTube, Discord invite, Telegram, Twitch, Kick, GitHub, Facebook, Instagram,
+    TikTok, LinkedIn;
+  - banner: X, YouTube, Discord invite;
+  - bio: X, YouTube, Discord invite, Telegram, Twitch, Kick, GitHub.
 
-  | Platform | Normalized form |
-  |---|---|
-  | X | `https://x.com/<handle>` |
-  | YouTube | `https://www.youtube.com/@<handle>` or `/channel\|c\|user/<id>` |
-  | Facebook | `https://www.facebook.com/<handle>` |
-  | Instagram | `https://www.instagram.com/<handle>/` |
-  | TikTok | `https://www.tiktok.com/@<handle>` |
-  | Twitch | `https://www.twitch.tv/<handle>` |
-  | Kick | `https://kick.com/<handle>` |
-  | GitHub | `https://github.com/<handle>` |
-  | Telegram | `https://t.me/<handle>` |
-  | LinkedIn | `https://www.linkedin.com/in\|company/<id>` |
-  | Discord server invite | `https://discord.gg/<code>` |
-
-  Drop anything else.
-- **`linktree`** must be `https://linktr.ee/<name>`. Drop anything else.
-- **Old fields are not part of the format.** `avatar`, `banner`, `bio` and `links` are dropped,
-  even if an older client writes them.
-- **Never fetch pictures or bios.** The app looks up the avatar, banner and bio from the social
-  profile on each device and caches them there. That way the platform's own moderation applies
-  to all three. The indexer stores and serves the two links as strings, nothing more.
+  Drop a link that isn't allowed in its field.
+- **`linktree`** must be `https://linktr.ee/<name>`.
+- **No free text is ever stored**, and there is no display name.
+- **Never fetch pictures or bios.** Each app looks them up from the profiles and caches them on
+  the device, so each platform's moderation applies. The indexer stores and serves the links as
+  strings.
 - Everything else in Part C is unchanged:
   - only a self-transfer from the address counts;
   - the newest record wins, as a full replacement;
