@@ -40,14 +40,36 @@ impl Node {
     /// One batch of the virtual chain after `from`, holding back the newest
     /// `min_confirmations` chain blocks so a shallow reorg never reaches indexed state.
     /// Returns the batch and the DAA score of its last added chain block.
-    pub async fn next_batch(&self, from: [u8; 32], min_confirmations: u64) -> Result<(VccBatch, Option<u64>)> {
+    ///
+    /// `window` caps the batch to chain blocks within that many blue-score units above
+    /// `from`. A full batch is `mergeset_limit × 10` chain blocks, which on a busy network is
+    /// hundreds of thousands of transactions at High verbosity — more than a node serializes
+    /// inside the client's fixed 60 s request timeout. The node only trims a batch by
+    /// confirmations, so the cap is expressed as "everything past `from + window` counts as
+    /// unconfirmed".
+    pub async fn next_batch(
+        &self,
+        from: [u8; 32],
+        min_confirmations: u64,
+        window: Option<u64>,
+    ) -> Result<(VccBatch, Option<u64>)> {
+        let start = RpcHash::from_bytes(from);
+        let mut confirmations = min_confirmations;
+        if let Some(window) = window {
+            let start_score = self
+                .client
+                .get_block(start, false)
+                .await
+                .map_err(|e| anyhow!("getBlock: {e}"))?
+                .header
+                .blue_score;
+            let sink_score =
+                self.client.get_sink_blue_score().await.map_err(|e| anyhow!("getSinkBlueScore: {e}"))?;
+            confirmations = confirmations.max(sink_score.saturating_sub(start_score + window));
+        }
         let resp = self
             .client
-            .get_virtual_chain_from_block_v2(
-                RpcHash::from_bytes(from),
-                Some(RpcDataVerbosityLevel::High),
-                Some(min_confirmations),
-            )
+            .get_virtual_chain_from_block_v2(start, Some(RpcDataVerbosityLevel::High), Some(confirmations))
             .await
             .map_err(|e| anyhow!("getVirtualChainFromBlockV2: {e}"))?;
         map_response(&resp)

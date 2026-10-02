@@ -161,6 +161,22 @@ async fn self_test(node: &Node, m: &Manifest, reg: &kachat_names::ingest::Regist
     Ok(reg.utxos.keys().filter(|op| !on_node.contains(*op)).copied().collect())
 }
 
+/// Batch-size control: uncapped normally; after a timeout, cap to a blue-score window,
+/// halving on every further failure and doubling back to uncapped on success.
+#[derive(Default)]
+struct Window(Option<u64>);
+impl Window {
+    const FIRST: u64 = 1_000;
+    const MIN: u64 = 50;
+    const UNCAPPED_ABOVE: u64 = 64_000;
+    fn failed(&mut self) {
+        self.0 = Some(self.0.map(|w| (w / 2).max(Self::MIN)).unwrap_or(Self::FIRST));
+    }
+    fn succeeded(&mut self) {
+        self.0 = self.0.and_then(|w| (w * 2 <= Self::UNCAPPED_ABOVE).then_some(w * 2));
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -218,13 +234,18 @@ async fn main() -> Result<()> {
     let mut last_self_test = Instant::now() - Duration::from_secs(args.self_test_secs);
     // Names by key, so a release/reclaim event (the name is gone after apply) keeps its name.
     let mut names_by_key: HashMap<[u8; 32], String> = HashMap::new();
+    let mut window = Window::default();
 
     loop {
         let from = follower.checkpoint.unwrap_or(m.scan_from);
-        let (batch, last_daa) = match node.next_batch(from, args.min_confirmations).await {
-            Ok(b) => b,
+        let (batch, last_daa) = match node.next_batch(from, args.min_confirmations, window.0).await {
+            Ok(b) => {
+                window.succeeded();
+                b
+            }
             Err(e) => {
-                warn!("[names] fetch failed: {e:#}");
+                window.failed();
+                warn!("[names] fetch failed ({e:#}); next batch capped to {:?} blue score", window.0);
                 tokio::time::sleep(Duration::from_millis(args.poll_ms * 5)).await;
                 continue;
             }
@@ -341,8 +362,26 @@ async fn probe(args: &Args, m: &Manifest) -> Result<()> {
     follower.seed(m.scan_from, m.genesis_outpoint, m.genesis_gap);
     let mut names_by_key: HashMap<[u8; 32], String> = HashMap::new();
     let (mut blocks, mut txs, mut indexed_daa) = (0usize, 0usize, 0u64);
+    let mut window = Window::default();
+    let mut failures = 0;
     loop {
-        let (batch, last_daa) = node.next_batch(follower.checkpoint.unwrap(), args.min_confirmations).await?;
+        let (batch, last_daa) = match node.next_batch(follower.checkpoint.unwrap(), args.min_confirmations, window.0).await {
+            Ok(b) => {
+                window.succeeded();
+                failures = 0;
+                b
+            }
+            Err(e) => {
+                failures += 1;
+                window.failed();
+                warn!("[probe] fetch failed ({e:#}); retrying capped to {:?} blue score", window.0);
+                if failures > 20 {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
         let added = batch.tip.is_some();
         for (_, n) in follower.registry.names() {
             names_by_key.insert(n.key, n.name_str());
@@ -400,6 +439,24 @@ async fn probe(args: &Args, m: &Manifest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_shrinks_on_failure_and_recovers() {
+        let mut w = Window::default();
+        assert_eq!(w.0, None);
+        w.failed();
+        assert_eq!(w.0, Some(1_000));
+        w.failed();
+        assert_eq!(w.0, Some(500));
+        for _ in 0..10 {
+            w.failed();
+        }
+        assert_eq!(w.0, Some(Window::MIN));
+        for _ in 0..20 {
+            w.succeeded();
+        }
+        assert_eq!(w.0, None, "back to uncapped");
+    }
 
     #[test]
     fn spk_address_matches_the_builder_vector() {
