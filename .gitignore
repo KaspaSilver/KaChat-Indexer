@@ -24,4 +24,4 @@ SKI_2.2.0_MIGRATION_ISSUES.md
 !*.env.example
 # Local backups that may contain secrets.
 *.bak
-*.bak.*
+*.bak.*names-vectors.json
