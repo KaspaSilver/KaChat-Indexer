@@ -31,8 +31,19 @@ pub struct NamesManifest {
     pub network: Option<String>,
     #[serde(rename = "registryCovenantId", default)]
     pub registry_covenant_id: Option<String>,
-    #[serde(rename = "genesisTxId", default)]
-    pub genesis_tx_id: Option<String>,
+    /// The genesis block of the registry. The live manifest nests the tx id + scan
+    /// start here (`genesis.txid`, `genesis.scanFrom`).
+    #[serde(default)]
+    pub genesis: Option<NamesGenesis>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NamesGenesis {
+    #[serde(default)]
+    pub txid: Option<String>,
+    /// The block the follower should start scanning from (safe genesis checkpoint).
+    #[serde(rename = "scanFrom", default)]
+    pub scan_from: Option<String>,
 }
 
 /// The loaded module state. `manifest: None` means the module is OFF (no manifest, or
@@ -127,7 +138,8 @@ pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl Int
         Json(serde_json::json!({
             "network": n.manifest.as_ref().and_then(|m| m.network.clone()),
             "registryCovenantId": n.manifest.as_ref().and_then(|m| m.registry_covenant_id.clone()),
-            "genesisTxId": n.manifest.as_ref().and_then(|m| m.genesis_tx_id.clone()),
+            "genesisTxId": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.txid.clone()),
+            "scanFrom": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.scan_from.clone()),
             "indexedDaa": 0,
             "synced": false,
             "on": n.is_on(),
@@ -204,6 +216,31 @@ mod tests {
         assert_eq!(normalize_name("  Alice.kachat \n").as_deref(), Some("alice"));
         assert_eq!(normalize_name("BOB").as_deref(), Some("bob"));
         assert_eq!(normalize_name("bad_name"), None);
+    }
+
+    #[test]
+    fn parses_the_live_testnet_manifest_shape() {
+        // The real testnet-10 manifest shape (kachat-domains): network + registryCovenantId at the
+        // top level, genesis nested with txid + scanFrom.
+        let json = r#"{
+            "network": "testnet-10",
+            "registryCovenantId": "9444187f09a3e77450e125d448b21eb79b3c54b692a5b3f3e8af38343b9a7a51",
+            "genesis": {
+                "txid": "cba68dd1b07f374410270f1e609a3e71deaf42d3bd3b5849ac9b0e9cc687f45f",
+                "scanFrom": "167f1ce5be24510c328c3a286228bff99d0fde505aa105fc990708ba39edd935",
+                "covenantId": "9444187f09a3e77450e125d448b21eb79b3c54b692a5b3f3e8af38343b9a7a51"
+            },
+            "artifacts": {}, "params": {}, "status": "deployed"
+        }"#;
+        let m: NamesManifest = serde_json::from_str(json).expect("manifest parses");
+        assert_eq!(m.network.as_deref(), Some("testnet-10"));
+        assert_eq!(
+            m.registry_covenant_id.as_deref(),
+            Some("9444187f09a3e77450e125d448b21eb79b3c54b692a5b3f3e8af38343b9a7a51")
+        );
+        let g = m.genesis.expect("genesis present");
+        assert_eq!(g.txid.as_deref(), Some("cba68dd1b07f374410270f1e609a3e71deaf42d3bd3b5849ac9b0e9cc687f45f"));
+        assert!(g.scan_from.is_some());
     }
 
     #[test]
