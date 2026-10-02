@@ -931,8 +931,10 @@ impl PushRegistry {
         target_pubkey: &str,
         actor_pubkey: &str,
     ) -> anyhow::Result<Vec<String>> {
-        let target = target_pubkey.trim().to_lowercase();
-        let actor = actor_pubkey.trim().to_lowercase();
+        // Match on the x-only key: a KaPosts target can arrive as `02+x` (address-derived, e.g.
+        // an @mention) while the device registered its real `03+x` key — same person.
+        let target = kaposts_xonly(target_pubkey);
+        let actor = kaposts_xonly(actor_pubkey);
         let rtx = self.tx_keyspace.read_tx();
         let mut tokens = Vec::new();
         for entry in self.device_partition.iter_values_rtx(&rtx) {
@@ -943,6 +945,7 @@ impl PushRegistry {
             let Some(pk) = reg.kaposts_pubkey.as_deref() else {
                 continue;
             };
+            let pk = kaposts_xonly(pk);
             if pk == target && pk != actor {
                 tokens.push(reg.device_token);
             }
@@ -2155,9 +2158,16 @@ impl PushDispatcher {
         // Dedup by tx id (same 60s window as chat pushes) so a broadcast/KaPosts action that the
         // processor happens to reprocess doesn't fire a second push. VoIP rings carry no tx id and
         // are intentional, so they bypass the dedup gate.
+        // KaPosts dedups per (tx, recipient): one tx can legitimately notify several people (a
+        // reply to its parent author plus each @mention), and keying on the tx alone dropped all
+        // but the first.
         let event_tx_id = match &event {
-            ExtensionPushEvent::Broadcast { tx_id, .. }
-            | ExtensionPushEvent::KaPosts { tx_id, .. } => Some(tx_id.clone()),
+            ExtensionPushEvent::Broadcast { tx_id, .. } => Some(tx_id.clone()),
+            ExtensionPushEvent::KaPosts {
+                tx_id,
+                target_pubkey,
+                ..
+            } => Some(format!("{tx_id}:kaposts:{}", kaposts_xonly(target_pubkey))),
             ExtensionPushEvent::Ring { .. } => None,
         };
         if let Some(event_tx_id) = &event_tx_id
@@ -3705,6 +3715,12 @@ fn normalize_hidden_broadcast_senders(
         })
         .filter(|(channel, senders)| !channel.is_empty() && !senders.is_empty())
         .collect()
+}
+
+/// x-only form of a KaPosts pubkey hex: drops the `02`/`03` parity byte of a compressed key.
+fn kaposts_xonly(pubkey: &str) -> String {
+    let pk = pubkey.trim().to_lowercase();
+    if pk.len() == 66 { pk[2..].to_string() } else { pk }
 }
 
 fn normalize_kaposts_pubkey(pubkey: Option<String>) -> Option<String> {

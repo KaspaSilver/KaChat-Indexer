@@ -1239,6 +1239,40 @@ impl KProtocolProcessor {
         .map(hex::encode)
     }
 
+    /// KaPosts push: notify each @mentioned user (`kaposts_kind: "mention"`). Mentions are
+    /// de-duped on the x-only key (`02+x` from an address and `03+x` from a real key are one
+    /// person), and the author plus anyone in `skip` (e.g. a reply's parent author, who already
+    /// gets the reply push) are left out. `post_id` is the mentioning content itself.
+    fn notify_mentions(
+        sender_pubkey: &str,
+        mentioned_pubkeys: &[String],
+        skip: Option<&str>,
+        base64_message: &str,
+        tx_id: &str,
+    ) {
+        let targets = mention_push_targets(sender_pubkey, mentioned_pubkeys, skip);
+        if targets.is_empty() {
+            return;
+        }
+        let snippet = crate::push_notify::kachat_snippet(base64_message).unwrap_or_default();
+        let body = if snippet.is_empty() {
+            "mentioned you".to_string()
+        } else {
+            format!("mentioned you: {snippet}")
+        };
+        for target in targets {
+            crate::push_notify::notify_kaposts(
+                &target,
+                sender_pubkey,
+                "mention",
+                "mention",
+                body.clone(),
+                Some(tx_id.to_string()),
+                tx_id,
+            );
+        }
+    }
+
     /// Save K post to database
     pub async fn save_k_post_to_database(
         &self,
@@ -1473,6 +1507,13 @@ impl KProtocolProcessor {
                 }
             }
         }
+        Self::notify_mentions(
+            &k_post.sender_pubkey,
+            &k_post.mentioned_pubkeys,
+            None,
+            &k_post.base64_encoded_message,
+            transaction_id,
+        );
         Ok(())
     }
 
@@ -1702,7 +1743,15 @@ impl KProtocolProcessor {
             }
         }
         // KaPosts push: notify the parent post's author of the reply.
-        if let Some(target) = self.content_author_pubkey(&k_reply.post_id).await {
+        let parent_author = self.content_author_pubkey(&k_reply.post_id).await;
+        Self::notify_mentions(
+            &k_reply.sender_pubkey,
+            &k_reply.mentioned_pubkeys,
+            parent_author.as_deref(),
+            &k_reply.base64_encoded_message,
+            transaction_id,
+        );
+        if let Some(target) = parent_author {
             let snippet =
                 crate::push_notify::kachat_snippet(&k_reply.base64_encoded_message).unwrap_or_default();
             let body = if snippet.is_empty() {
@@ -2960,6 +3009,61 @@ impl KProtocolProcessor {
         }
 
         Ok(())
+    }
+}
+
+/// x-only part of a compressed pubkey hex (`02`/`03` + 64 hex), lowercased; other shapes as-is.
+fn xonly_hex(pk: &str) -> String {
+    let pk = pk.trim().to_lowercase();
+    if pk.len() == 66 { pk[2..].to_string() } else { pk }
+}
+
+/// Who gets a mention push: each mentioned pubkey once per x-only key, never the author, never
+/// `skip`. Returned as given (lowercased) — the push service matches on x-only too.
+fn mention_push_targets(
+    sender_pubkey: &str,
+    mentioned_pubkeys: &[String],
+    skip: Option<&str>,
+) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(xonly_hex(sender_pubkey));
+    if let Some(skip) = skip {
+        seen.insert(xonly_hex(skip));
+    }
+    mentioned_pubkeys
+        .iter()
+        .map(|pk| pk.trim().to_lowercase())
+        .filter(|pk| !pk.is_empty() && seen.insert(xonly_hex(pk)))
+        .collect()
+}
+
+#[cfg(test)]
+mod mention_push_tests {
+    use super::*;
+
+    const X1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const X2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const X3: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    #[test]
+    fn dedupes_on_xonly_and_skips_author_and_parent() {
+        let mentioned = vec![
+            format!("02{X2}"),
+            format!("03{X2}"), // same person as above (parity differs)
+            format!("02{X1}"), // the author mentioning themself
+            format!("02{X3}"), // the reply's parent author
+        ];
+        let author = format!("03{X1}");
+        let parent = format!("03{X3}");
+        assert_eq!(
+            mention_push_targets(&author, &mentioned, Some(&parent)),
+            vec![format!("02{X2}")]
+        );
+    }
+
+    #[test]
+    fn no_mentions_no_targets() {
+        assert!(mention_push_targets(&format!("02{X1}"), &[], None).is_empty());
     }
 }
 
