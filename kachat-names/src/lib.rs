@@ -337,5 +337,8 @@ pub fn is_valid_name(name: &[u8]) -> bool {
     name.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
+pub mod transition;
+pub use transition::{Contract, Entry, NameStatus, entry_for_tag, name_status, YEAR_MS};
+
 #[cfg(test)]
 mod tests;
