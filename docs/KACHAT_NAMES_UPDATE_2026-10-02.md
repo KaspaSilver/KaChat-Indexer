@@ -46,7 +46,11 @@ The profile record (`kchat:1:profile:<json>`, a self-transfer) now has these fie
 
 ### 1.2 The testnet-10 registry is live (unchanged since your last commits)
 
-- Registry `9444187f09a3e77450e125d448b21eb79b3c54b692a5b3f3e8af38343b9a7a51`.
+- **Superseded by registry v2** (`docs/KACHAT_NAMES_REGISTRY_V2.md`): live registry
+  `82f4315c8f7b3e0e76fc2f77466fe7651d2c1fac4e0b5810d4da878a9cfa0f89`, genesis
+  `e20325f70db06192b619e6ef161b45b4a24b3cde58b5d2b0188532395175a426`. The v1 values below are
+  retired:
+- (v1) Registry `9444187f09a3e77450e125d448b21eb79b3c54b692a5b3f3e8af38343b9a7a51`.
 - Genesis tx `cba68dd1b07f374410270f1e609a3e71deaf42d3bd3b5849ac9b0e9cc687f45f`, accepted at
   DAA 585,767,203.
 - The manifest is `manifests/kachat-names-testnet-10.json` in KaspaSilver/kachat-domains.

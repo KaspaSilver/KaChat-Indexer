@@ -22,7 +22,7 @@ It also covers three things that block "testnet fully working":
     already does that.
 - **The switch.** On every refresh the app calls `GET {base}/names/status`. It uses the indexer
   when the answer decodes **and** `registryCovenantId` equals the bundled manifest's id
-  (`9444187f…7a51` on testnet-10). Anything else keeps it on its own chain walker. So:
+  (registry v2 `82f4315c…0f89` on testnet-10; v1 `9444187f…7a51` is retired). Anything else keeps it on its own chain walker. So:
   - **Withhold `registryCovenantId` until synced.** Already done in `95645dd`. While it is
     withheld the app keeps walking the chain itself, which is correct.
   - **Never serve a stale or refuted row once you report it.** The app trusts the indexer for
@@ -42,7 +42,7 @@ General rules:
 
 ### `GET /names/status`
 ```json
-{ "network": "testnet-10", "registryCovenantId": "9444…7a51", "genesisTxId": "cba6…f45f",
+{ "network": "testnet-10", "registryCovenantId": "82f4…0f89", "genesisTxId": "e203…a426",
   "indexedDaa": 585800000, "synced": true }
 ```
 Every field is optional to the decoder, but `registryCovenantId` is the switch.

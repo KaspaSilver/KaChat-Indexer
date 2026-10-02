@@ -1,8 +1,17 @@
 # `.kachat` names - registry v2 (2026-10-02)
 
+> **Live on testnet-10:**
+> - registry `82f4315c8f7b3e0e76fc2f77466fe7651d2c1fac4e0b5810d4da878a9cfa0f89`
+> - genesis tx `e20325f70db06192b619e6ef161b45b4a24b3cde58b5d2b0188532395175a426`, accepted at DAA
+>   586,328,979
+> - manifest: `manifests/kachat-names-testnet-10.json` in kachat-domains; v1 is archived in
+>   `manifests/v1/`
+>
+> Re-point `KACHAT_NAMES_MANIFEST_TESTNET` at the new manifest and drop the v1 follower state.
+
 The contracts changed to cap how far ahead a name can be paid: **2 years at most**, with no
 stacking of renewals. Contracts are immutable, so this is a **new registry**. The live
-testnet-10 registry `9444187f…7a51` (v1) is retired once the v2 genesis is sent. It holds only
+testnet-10 registry `9444187f…7a51` (v1) is retired. It held only
 its genesis gap, so no names are stranded.
 
 The source of truth is KaspaSilver/kachat-domains (README "Registry v2", `contracts/*.sil`,
