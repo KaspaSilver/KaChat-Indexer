@@ -88,8 +88,22 @@ pub struct Tx {
     pub inputs: Vec<TxInput>,
     pub outputs: Vec<TxOutput>,
     pub payload: Vec<u8>,
+    /// The chain block that accepted this tx — the undo journal is keyed by it, so a reorg
+    /// that removes the block undoes exactly its transactions.
+    pub accepting_block: [u8; 32],
     pub accepting_daa: u64,
     pub block_time: i64,
+}
+
+/// What one applied transaction changed, enough to reverse it on a reorg (§4.1): the UTXOs
+/// it added (to delete), the UTXOs it consumed (to restore), and any profile it replaced.
+#[derive(Debug, Clone)]
+struct UndoEntry {
+    block: [u8; 32],
+    added: Vec<Outpoint>,
+    removed: Vec<(Outpoint, Tracked)>,
+    /// (address, prior value) — `None` prior means the profile didn't exist before.
+    profile: Option<(Vec<u8>, Option<(String, (u64, [u8; 32]))>)>,
 }
 
 /// A name-registry event, emitted as the applier mutates state (for history + pushes).
@@ -106,8 +120,10 @@ pub struct Event {
 #[derive(Debug, Default)]
 pub struct Registry {
     pub utxos: HashMap<Outpoint, Tracked>,
-    /// address (33-ish bytes / key) -> (profile json, accepting order key)
+    /// address (script-public-key bytes) -> (profile json, accepting order key)
     pub profiles: HashMap<Vec<u8>, (String, (u64, [u8; 32]))>,
+    /// Reorg undo log, oldest first. Each entry reverses one applied transaction.
+    journal: Vec<UndoEntry>,
 }
 
 impl Registry {
@@ -145,6 +161,8 @@ impl Registry {
     /// Apply one accepted transaction. Returns the registry events it produced.
     pub fn apply(&mut self, templates: &Templates, tx: &Tx) -> Vec<Event> {
         let mut events = Vec::new();
+        // Snapshot the UTXO keys so the undo journal can record exactly what this tx added.
+        let before: std::collections::HashSet<Outpoint> = self.utxos.keys().copied().collect();
 
         // Which tracked UTXOs does this tx spend, and under which entry?
         let mut spends: Vec<(usize, Outpoint, Tracked, Entry, crate::SigScript)> = Vec::new();
@@ -163,14 +181,12 @@ impl Registry {
 
         // Offers created by this tx (payload marker, §B4) are handled regardless of spends.
         self.apply_offer_marker(templates, tx, &mut events);
-        // Profiles (§C): a self-send carrying kchat:1:profile:<json>.
-        self.apply_profile(tx);
-
-        if spends.is_empty() {
-            return events;
-        }
+        // Profiles (§C): a self-send carrying kchat:1:profile:<json>. Capture the prior
+        // value for undo.
+        let profile_prior = self.apply_profile(tx);
 
         let mut used_outputs: Vec<usize> = Vec::new();
+        if !spends.is_empty() {
 
         // The multi-input exit (gap merge + name release/reclaim + gap absorbed) and the
         // offer-accept pair are recognised across inputs; everything else is per-name.
@@ -235,13 +251,74 @@ impl Registry {
                 }
             }
         }
+        }
 
-        // Every spent tracked UTXO is consumed.
-        for (_, outpoint, _, _, _) in &spends {
-            self.utxos.remove(outpoint);
+        // Record the undo entry (§4.1) and consume the spent UTXOs. `added` is whatever this
+        // tx inserted (new gaps/names/offers); `removed` is the spent UTXOs' prior states.
+        let removed: Vec<(Outpoint, Tracked)> =
+            spends.iter().map(|(_, op, t, _, _)| (*op, t.clone())).collect();
+        for (op, _) in &removed {
+            self.utxos.remove(op);
+        }
+        let added: Vec<Outpoint> =
+            self.utxos.keys().filter(|k| !before.contains(*k)).copied().collect();
+        if !added.is_empty() || !removed.is_empty() || profile_prior.is_some() {
+            self.journal.push(UndoEntry {
+                block: tx.accepting_block,
+                added,
+                removed,
+                profile: profile_prior,
+            });
         }
 
         events
+    }
+
+    /// Undo every transaction accepted by a removed chain block (a reorg), newest first,
+    /// restoring the exact prior rows (§4.1 / B6). Idempotent for an unknown block.
+    pub fn undo_block(&mut self, block: &[u8; 32]) {
+        let mut undo = Vec::new();
+        let mut keep = Vec::new();
+        for e in self.journal.drain(..) {
+            if &e.block == block {
+                undo.push(e);
+            } else {
+                keep.push(e);
+            }
+        }
+        self.journal = keep;
+        for e in undo.into_iter().rev() {
+            for op in &e.added {
+                self.utxos.remove(op);
+            }
+            for (op, tracked) in e.removed {
+                self.utxos.insert(op, tracked);
+            }
+            if let Some((addr, prior)) = e.profile {
+                match prior {
+                    Some(v) => {
+                        self.profiles.insert(addr, v);
+                    }
+                    None => {
+                        self.profiles.remove(&addr);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop undo entries beyond the most recent `keep_last` transactions (past finality, a
+    /// reorg can't reach them). Called by the reader once a checkpoint is finalized.
+    pub fn prune_journal(&mut self, keep_last: usize) {
+        if self.journal.len() > keep_last {
+            let drop = self.journal.len() - keep_last;
+            self.journal.drain(0..drop);
+        }
+    }
+
+    /// Number of undo entries currently retained (for the reader's pruning + tests).
+    pub fn journal_len(&self) -> usize {
+        self.journal.len()
     }
 
     fn apply_register(
@@ -318,24 +395,23 @@ impl Registry {
     /// §C: a profile record is `kchat:1:profile:<json>` on a self-send (an input of the
     /// address, an output back to it). The newest by accepting order wins. The sender
     /// resolution is left to the chain reader; here we record on the marker + a self output.
-    fn apply_profile(&mut self, tx: &Tx) {
-        let Ok(text) = std::str::from_utf8(&tx.payload) else { return };
-        let Some(json) = text.strip_prefix("kchat:1:profile:") else { return };
+    #[allow(clippy::type_complexity)]
+    fn apply_profile(&mut self, tx: &Tx) -> Option<(Vec<u8>, Option<(String, (u64, [u8; 32]))>)> {
+        let text = std::str::from_utf8(&tx.payload).ok()?;
+        let json = text.strip_prefix("kchat:1:profile:")?;
         // Validate against the 2026-10-02 format (one allowlisted social + linktr.ee +
         // primaryName, <= 2 KB); reject old/oversized/invalid records outright.
-        if crate::parse_profile(json).is_none() {
-            return;
-        }
+        crate::parse_profile(json)?;
         // The chain reader supplies the resolved address via the first output's spk as the
         // identity key (self-send). A fuller sender check lives in the reader.
-        if let Some(first) = tx.outputs.first() {
-            let addr = first.script_public_key.clone();
-            let order = (tx.accepting_daa, tx.id);
-            let newer = self.profiles.get(&addr).map(|(_, o)| order > *o).unwrap_or(true);
-            if newer {
-                self.profiles.insert(addr, (json.to_string(), order));
-            }
+        let addr = tx.outputs.first()?.script_public_key.clone();
+        let order = (tx.accepting_daa, tx.id);
+        let newer = self.profiles.get(&addr).map(|(_, o)| order > *o).unwrap_or(true);
+        if !newer {
+            return None;
         }
+        let prior = self.profiles.insert(addr.clone(), (json.to_string(), order));
+        Some((addr, prior))
     }
 
     fn event(&self, op: &'static str, key: [u8; 32], tx: &Tx) -> Event {

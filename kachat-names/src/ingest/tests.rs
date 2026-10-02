@@ -100,6 +100,7 @@ fn register_splits_gap_and_mints_name() {
             out(vec![0xde, 0xad], 5), // change
         ],
         payload: b"kchat:1:name:register:alice".to_vec(),
+        accepting_block: [0xbb; 32],
         accepting_daa: 585_800_000,
         block_time: NOW,
     };
@@ -140,6 +141,7 @@ fn transfer_updates_owner_and_moves_utxo() {
         }],
         outputs: vec![out(t.name.spk(&cont.encode()), BOND)],
         payload: vec![],
+        accepting_block: [0xbb; 32],
         accepting_daa: 1,
         block_time: NOW,
     };
@@ -167,6 +169,7 @@ fn list_sets_price_then_renew_extends_expiry() {
         }],
         outputs: vec![out(t.name.spk(&listed.encode()), BOND)],
         payload: vec![],
+        accepting_block: [0xbb; 32],
         accepting_daa: 1,
         block_time: NOW,
     };
@@ -184,6 +187,7 @@ fn list_sets_price_then_renew_extends_expiry() {
         }],
         outputs: vec![out(t.name.spk(&renewed.encode()), BOND)],
         payload: vec![],
+        accepting_block: [0xbb; 32],
         accepting_daa: 2,
         block_time: NOW,
     };
@@ -206,6 +210,7 @@ fn offer_marker_tracks_the_offer() {
         inputs: vec![],
         outputs: vec![out(t.offer.spk(&offer.encode()), 3 * BOND)],
         payload: payload.into_bytes(),
+        accepting_block: [0xbb; 32],
         accepting_daa: 1,
         block_time: NOW,
     };
@@ -246,6 +251,7 @@ fn release_exit_merges_gaps_and_removes_name() {
         ],
         outputs: vec![out(t.gap.spk(&merged.encode()), 100_000_000)],
         payload: vec![],
+        accepting_block: [0xbb; 32],
         accepting_daa: 1,
         block_time: NOW,
     };
@@ -255,4 +261,127 @@ fn release_exit_merges_gaps_and_removes_name() {
     assert_eq!(reg.utxos.len(), 1);
     let only = reg.utxos.values().next().unwrap();
     assert_eq!(only, &Tracked::Gap(merged));
+}
+
+// --- reorg undo journal (§4.1) --------------------------------------------------
+
+#[test]
+fn undo_block_reverses_a_register() {
+    let t = templates();
+    let mut reg = Registry::new();
+    let genesis = ([0x9au8; 32], 0u32);
+    let gap = GapState { lo: [0u8; 32], hi: [0xff; 32] };
+    reg.seed_genesis(genesis, gap);
+    let key = name_key(b"alice");
+    let (left, right, nm) = crate::transition::register(&gap, b"alice", [7u8; 32], NOW, 2);
+
+    let block = [0xc0u8; 32];
+    let tx = Tx {
+        id: [0x11; 32],
+        inputs: vec![TxInput {
+            previous_outpoint: genesis,
+            signature_script: sig_script(
+                &[b"alice".to_vec(), [7u8; 32].to_vec(), [3u8; 32].to_vec(), scriptnum(NOW), scriptnum(2), vec![], vec![]],
+                [0x86, 0x67, 0xaf, 0x5e],
+                &t.gap.redeem(&gap.encode()),
+            ),
+        }],
+        outputs: vec![
+            out(t.gap.spk(&left.encode()), BOND),
+            out(t.gap.spk(&right.encode()), BOND),
+            out(t.name.spk(&nm.encode()), BOND),
+        ],
+        payload: vec![],
+        accepting_block: block,
+        accepting_daa: 1,
+        block_time: NOW,
+    };
+    reg.apply(&t, &tx);
+    assert!(reg.name_by_key(&key).is_some());
+    assert_eq!(reg.utxos.len(), 3);
+
+    // Reorg: the accepting block is removed. The registry returns to exactly genesis.
+    reg.undo_block(&block);
+    assert!(reg.name_by_key(&key).is_none());
+    assert_eq!(reg.utxos.len(), 1);
+    assert_eq!(reg.utxos.get(&genesis), Some(&Tracked::Gap(gap)));
+    assert_eq!(reg.journal_len(), 0);
+}
+
+#[test]
+fn undo_restores_prior_owner_and_outpoint_on_transfer() {
+    let t = templates();
+    let mut reg = Registry::new();
+    let old_op = ([0x22; 32], 2);
+    let ns = seed_name(&mut reg, old_op, [1u8; 32], 0, NOW + crate::YEAR_MS);
+    let cont = crate::transition::name_transfer(&ns, [2u8; 32]);
+    let block = [0xc1u8; 32];
+    let tx = Tx {
+        id: [0x33; 32],
+        inputs: vec![TxInput {
+            previous_outpoint: old_op,
+            signature_script: sig_script(&[[2u8; 32].to_vec(), [9u8; 65].to_vec()], [0x79, 0x4d, 0xca, 0x54], &t.name.redeem(&ns.encode())),
+        }],
+        outputs: vec![out(t.name.spk(&cont.encode()), BOND)],
+        payload: vec![],
+        accepting_block: block,
+        accepting_daa: 1,
+        block_time: NOW,
+    };
+    reg.apply(&t, &tx);
+    assert_eq!(reg.name_by_key(&ns.key).unwrap().1.owner, [2u8; 32]);
+
+    reg.undo_block(&block);
+    let (op, got) = reg.name_by_key(&ns.key).unwrap();
+    assert_eq!(op, old_op, "name back at its original outpoint");
+    assert_eq!(got.owner, [1u8; 32], "prior owner restored");
+}
+
+#[test]
+fn undo_restores_a_replaced_profile() {
+    let t = templates();
+    let mut reg = Registry::new();
+    let addr = vec![0xab, 0xcd];
+    let out_self = TxOutput { script_public_key: addr.clone(), value: 1 };
+    let mk = |id: [u8; 8], daa: u64, block: [u8; 32], handle: &str| Tx {
+        id: { let mut x = [0u8; 32]; x[..8].copy_from_slice(&id); x },
+        inputs: vec![],
+        outputs: vec![out_self.clone()],
+        payload: format!("kchat:1:profile:{{\"v\":1,\"social\":\"https://x.com/{handle}\"}}").into_bytes(),
+        accepting_block: block,
+        accepting_daa: daa,
+        block_time: NOW,
+    };
+    reg.apply(&t, &mk([1; 8], 1, [0xd0; 32], "first"));
+    assert!(reg.profiles.get(&addr).unwrap().0.contains("first"));
+
+    let b2 = [0xd1u8; 32];
+    reg.apply(&t, &mk([2; 8], 2, b2, "second"));
+    assert!(reg.profiles.get(&addr).unwrap().0.contains("second"));
+
+    reg.undo_block(&b2);
+    assert!(reg.profiles.get(&addr).unwrap().0.contains("first"), "prior profile restored");
+}
+
+#[test]
+fn prune_journal_keeps_recent() {
+    let mut reg = Registry::new();
+    // fabricate entries by applying no-op-ish profile txs across blocks
+    let t = templates();
+    let addr = vec![0x01];
+    for i in 0..5u64 {
+        let tx = Tx {
+            id: { let mut x = [0u8; 32]; x[0] = i as u8; x },
+            inputs: vec![],
+            outputs: vec![TxOutput { script_public_key: addr.clone(), value: 1 }],
+            payload: b"kchat:1:profile:{\"v\":1,\"social\":\"https://x.com/a\"}".to_vec(),
+            accepting_block: { let mut b = [0u8; 32]; b[0] = i as u8; b },
+            accepting_daa: i,
+            block_time: NOW,
+        };
+        reg.apply(&t, &tx);
+    }
+    assert_eq!(reg.journal_len(), 5);
+    reg.prune_journal(2);
+    assert_eq!(reg.journal_len(), 2);
 }
