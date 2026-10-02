@@ -56,6 +56,7 @@ fn state_roundtrip() {
         name: pad_name(b"alice"),
         owner: [7u8; 32],
         price: 500_000_000,
+        period_start: 1_790_000_000_000,
         expires_at: 1_822_000_000_000,
     };
     let dec = NameState::decode(&name.encode()).unwrap();
@@ -229,6 +230,9 @@ fn matches_generated_vectors() {
     assert_eq!(hex::encode(name.owner), st["name"]["owner"].as_str().unwrap());
     assert_eq!(name.price, st["name"]["price"].as_i64().unwrap());
     assert_eq!(name.expires_at, st["name"]["expiresAt"].as_i64().unwrap());
+    if let Some(ps) = st["name"]["periodStart"].as_i64() {
+        assert_eq!(name.period_start, ps, "periodStart (v2)");
+    }
 
     let offer = OfferState::decode(&h(st["offer"]["state"].as_str().unwrap())).unwrap();
     assert_eq!(hex::encode(offer.key), st["offer"]["key"].as_str().unwrap());

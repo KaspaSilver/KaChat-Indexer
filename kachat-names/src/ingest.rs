@@ -275,6 +275,12 @@ impl Registry {
                             self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, "renew", Some(old), None, Some(years));
                         }
                     }
+                    (Tracked::Name(old), Entry::NameExtend) => {
+                        if let Some(years) = sig.args.first().and_then(|a| a.as_i64()) {
+                            let ns = transition::name_extend(old, years);
+                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, "extend", Some(old), None, Some(years));
+                        }
+                    }
                     (Tracked::Offer(offer), Entry::OfferAccept) => {
                         // The accepted name goes to the buyer; verify a name output matches.
                         if let Some((_, name)) = self.name_by_key(&offer.key) {

@@ -112,6 +112,13 @@ Spec: `docs/KACHAT_NAMES_INDEXER.md` + `docs/KACHAT_NAMES_UPDATE_2026-10-02.md` 
   (`vector_replay.rs`, vectors at `KaChat/KaChatTests/KachatNamesVectors.json`); follower and
   API helper tests against the builder's p2pk vector and the live manifest.
 
+### Registry v2 (2026-10-02)
+- Live registry `82f4315c…0f89` (genesis `e20325f7…a426`); v1 `9444187f…` retired.
+- Engine: 126-B name state with `periodStart`, new `extend` entry (`2ce7cceb`), `renew` opens a
+  new period at the old expiry. All 32 v2 vector transactions replay exactly; the v2 genesis
+  gap output is reproduced. API name objects carry `periodStart`; history op `extend`.
+- Follower tables gain `period_start` (added in place); a registry-id change resets them.
+
 ### REMAINING
 1. **Postgres end-to-end** (follower writes → API reads) — not yet run against a real DB.
 2. **Deploy on testnet**: Update the indexer + panel, start Kaspad-testnet + Indexer-testnet,

@@ -148,6 +148,8 @@ fn name_json(c: &Ctx, r: &PgRow) -> Value {
         "owner": owner_address(c.prefix, &owner),
         "ownerKey": hex::encode(&owner),
         "price": r.get::<Option<i64>, _>("price").unwrap_or(0).to_string(),
+        // Registry v2: the app needs the paid period to spend (extend/renew) the name.
+        "periodStart": r.get::<Option<i64>, _>("period_start").unwrap_or(0),
         "expiresAt": r.get::<Option<i64>, _>("expires_at").unwrap_or(0),
         "outpoint": outpoint(r),
     });

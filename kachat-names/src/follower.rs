@@ -73,7 +73,7 @@ mod tests {
     fn templates() -> Templates {
         use crate::ingest::ContractTemplate;
         let t = |len| ContractTemplate { prefix: vec![0x6b], suffix: vec![0xaa, 0xbb, 0xcc], state_offset: 1, state_len: len };
-        Templates { gap: t(66), name: t(117), offer: t(75) }
+        Templates { gap: t(66), name: t(126), offer: t(75) }
     }
 
     fn scriptnum(v: i64) -> Vec<u8> {

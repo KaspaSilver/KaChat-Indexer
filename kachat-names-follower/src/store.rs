@@ -57,13 +57,15 @@ pub async fn create_schema(pool: &PgPool) -> Result<()> {
             kind TEXT NOT NULL,
             value BIGINT NOT NULL,
             lo BYTEA, hi BYTEA,
-            key BYTEA, name TEXT, owner BYTEA, price BIGINT, expires_at BIGINT,
+            key BYTEA, name TEXT, owner BYTEA, price BIGINT, period_start BIGINT, expires_at BIGINT,
             buyer BYTEA, refund_after BIGINT,
             created_at BIGINT NOT NULL,
             created_daa BIGINT NOT NULL,
             refuted BOOLEAN NOT NULL DEFAULT FALSE,
             PRIMARY KEY (txid, idx)
         )"#,
+        // Registry v2 added periodStart; tables created before it get the column here.
+        "ALTER TABLE names_utxos ADD COLUMN IF NOT EXISTS period_start BIGINT",
         "CREATE INDEX IF NOT EXISTS names_utxos_key ON names_utxos (key)",
         "CREATE INDEX IF NOT EXISTS names_utxos_owner ON names_utxos (owner)",
         "CREATE INDEX IF NOT EXISTS names_utxos_buyer ON names_utxos (buyer)",
@@ -147,6 +149,7 @@ pub async fn load(
                 name: kachat_names::pad_name(r.get::<Option<String>, _>("name").unwrap_or_default().as_bytes()),
                 owner: b32(r.get("owner")).unwrap_or_default(),
                 price: r.get::<Option<i64>, _>("price").unwrap_or(0),
+                period_start: r.get::<Option<i64>, _>("period_start").unwrap_or(0),
                 expires_at: r.get::<Option<i64>, _>("expires_at").unwrap_or(0),
             }),
             "offer" => Tracked::Offer(OfferState {
@@ -207,9 +210,9 @@ pub async fn persist(
         for (op, tracked) in &reg.utxos {
             let m = meta.get(op).copied().unwrap_or(UtxoMeta { value: 0, created_at: 0, created_daa: 0 });
             let q = sqlx::query(
-                r#"INSERT INTO names_utxos (txid, idx, kind, value, lo, hi, key, name, owner, price, expires_at,
-                       buyer, refund_after, created_at, created_daa, refuted)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
+                r#"INSERT INTO names_utxos (txid, idx, kind, value, lo, hi, key, name, owner, price, period_start,
+                       expires_at, buyer, refund_after, created_at, created_daa, refuted)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"#,
             )
             .bind(op.0.to_vec())
             .bind(op.1 as i32);
@@ -224,6 +227,7 @@ pub async fn persist(
                     .bind(None::<Vec<u8>>)
                     .bind(None::<i64>)
                     .bind(None::<i64>)
+                    .bind(None::<i64>)
                     .bind(None::<Vec<u8>>)
                     .bind(None::<i64>),
                 Tracked::Name(n) => q
@@ -235,6 +239,7 @@ pub async fn persist(
                     .bind(Some(n.name_str()))
                     .bind(Some(n.owner.to_vec()))
                     .bind(Some(n.price))
+                    .bind(Some(n.period_start))
                     .bind(Some(n.expires_at))
                     .bind(None::<Vec<u8>>)
                     .bind(None::<i64>),
@@ -246,6 +251,7 @@ pub async fn persist(
                     .bind(Some(o.key.to_vec()))
                     .bind(None::<String>)
                     .bind(None::<Vec<u8>>)
+                    .bind(None::<i64>)
                     .bind(None::<i64>)
                     .bind(None::<i64>)
                     .bind(Some(o.buyer.to_vec()))

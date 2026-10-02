@@ -234,7 +234,9 @@ pub struct GapState {
     pub hi: [u8; 32],
 }
 
-/// `0x20 key[32] 0x20 name[32] 0x20 owner[32] 0x08 price[8] 0x08 expiresAt[8]` (117 B).
+/// Registry v2: `0x20 key[32] 0x20 name[32] 0x20 owner[32] 0x08 price[8] 0x08 periodStart[8]
+/// 0x08 expiresAt[8]` (126 B). `periodStart` is the start of the current paid period
+/// (docs/KACHAT_NAMES_REGISTRY_V2.md §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NameState {
     pub key: [u8; 32],
@@ -242,6 +244,7 @@ pub struct NameState {
     pub name: [u8; 32],
     pub owner: [u8; 32],
     pub price: i64,
+    pub period_start: i64,
     pub expires_at: i64,
 }
 
@@ -276,17 +279,19 @@ impl NameState {
     pub fn encode(&self) -> Vec<u8> {
         [
             &[0x20u8][..], &self.key, &[0x20], &self.name, &[0x20], &self.owner,
-            &[0x08], &num8_encode(self.price), &[0x08], &num8_encode(self.expires_at),
+            &[0x08], &num8_encode(self.price), &[0x08], &num8_encode(self.period_start),
+            &[0x08], &num8_encode(self.expires_at),
         ]
         .concat()
     }
     pub fn decode(state: &[u8]) -> Option<Self> {
-        if state.len() != 117
+        if state.len() != 126
             || state[0] != 0x20
             || state[33] != 0x20
             || state[66] != 0x20
             || state[99] != 0x08
             || state[108] != 0x08
+            || state[117] != 0x08
         {
             return None;
         }
@@ -295,7 +300,8 @@ impl NameState {
             name: take32(state, 34)?,
             owner: take32(state, 67)?,
             price: num8_decode(&take8(state, 100)?),
-            expires_at: num8_decode(&take8(state, 109)?),
+            period_start: num8_decode(&take8(state, 109)?),
+            expires_at: num8_decode(&take8(state, 118)?),
         })
     }
     /// The name as a UTF-8 string (trailing zero padding removed).

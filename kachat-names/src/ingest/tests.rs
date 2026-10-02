@@ -7,7 +7,7 @@ fn templates() -> Templates {
     // Arbitrary but self-consistent prefix/suffix (the applier only needs them to build
     // and match P2SH); real deployments load them from the manifest.
     let t = |len| ContractTemplate { prefix: vec![0x6b], suffix: vec![0xaa, 0xbb, 0xcc], state_offset: 1, state_len: len };
-    Templates { gap: t(66), name: t(117), offer: t(75) }
+    Templates { gap: t(66), name: t(126), offer: t(75) }
 }
 
 /// Minimal LE sign-magnitude script number (how int args travel).
@@ -119,7 +119,7 @@ fn register_splits_gap_and_mints_name() {
 }
 
 fn seed_name(reg: &mut Registry, outpoint: Outpoint, owner: [u8; 32], price: i64, expires: i64) -> NameState {
-    let ns = NameState { key: name_key(b"alice"), name: pad_name(b"alice"), owner, price, expires_at: expires };
+    let ns = NameState { key: name_key(b"alice"), name: pad_name(b"alice"), owner, price, period_start: expires - crate::YEAR_MS, expires_at: expires };
     reg.utxos.insert(outpoint, Tracked::Name(ns));
     ns
 }
@@ -194,6 +194,8 @@ fn list_sets_price_then_renew_extends_expiry() {
     reg.apply(&t, &tx2);
     let (_, got3) = reg.name_by_key(&ns.key).unwrap();
     assert_eq!(got3.expires_at, (NOW + crate::YEAR_MS) + 2 * crate::YEAR_MS);
+    // v2: renew opens a new period at the old expiry.
+    assert_eq!(got3.period_start, NOW + crate::YEAR_MS);
 }
 
 #[test]
@@ -233,7 +235,7 @@ fn release_exit_merges_gaps_and_removes_name() {
     // name key sits between the two gaps.
     let lo_gap = GapState { lo: [0u8; 32], hi: key };
     let hi_gap = GapState { lo: key, hi: [0xff; 32] };
-    let name = NameState { key, name: pad_name(b"alice"), owner: [1u8; 32], price: 0, expires_at: NOW };
+    let name = NameState { key, name: pad_name(b"alice"), owner: [1u8; 32], price: 0, period_start: NOW - crate::YEAR_MS, expires_at: NOW };
     let lo_op = ([0x60; 32], 0);
     let name_op = ([0x60; 32], 1);
     let hi_op = ([0x60; 32], 2);

@@ -480,7 +480,8 @@ mod tests {
             return;
         }
         let m = read_manifest(path).unwrap();
-        assert_eq!(m.registry, "9444187f09a3e77450e125d448b21eb79b3c54b692a5b3f3e8af38343b9a7a51");
+        // Registry v2 (docs/KACHAT_NAMES_REGISTRY_V2.md); v1 9444187f… is retired.
+        assert_eq!(m.registry, "82f4315c8f7b3e0e76fc2f77466fe7651d2c1fac4e0b5810d4da878a9cfa0f89");
         assert_eq!(m.network, "testnet-10");
         assert_eq!(hex::encode(m.genesis_outpoint.0), m.genesis_txid);
         assert_eq!(m.genesis_gap.lo, [0u8; 32]);

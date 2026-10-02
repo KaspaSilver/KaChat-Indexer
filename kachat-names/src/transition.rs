@@ -28,6 +28,8 @@ pub enum Entry {
     NameList,
     NameBuy,
     NameRenew,
+    /// Registry v2: add years to the current paid period (capped at 2 years ahead).
+    NameExtend,
     NameRelease,
     NameReclaim,
     OfferAccept,
@@ -40,7 +42,7 @@ impl Entry {
         use Entry::*;
         match self {
             GapRegister | GapMerge | GapAbsorbed => Contract::Gap,
-            NameTransfer | NameList | NameBuy | NameRenew | NameRelease | NameReclaim => Contract::Name,
+            NameTransfer | NameList | NameBuy | NameRenew | NameExtend | NameRelease | NameReclaim => Contract::Name,
             OfferAccept | OfferWithdraw | OfferRefund => Contract::Offer,
         }
     }
@@ -70,6 +72,7 @@ pub fn entry_for_tag(tag: &[u8; 4]) -> Option<Entry> {
         [0x67, 0x4a, 0x8e, 0xa4] => Entry::NameList,
         [0x76, 0xa0, 0x2e, 0xb9] => Entry::NameBuy,
         [0xb7, 0x06, 0xac, 0x38] => Entry::NameRenew,
+        [0x2c, 0xe7, 0xcc, 0xeb] => Entry::NameExtend,
         [0x38, 0x8a, 0xd0, 0xb4] => Entry::NameRelease,
         [0xf5, 0x6a, 0xf4, 0xdf] => Entry::NameReclaim,
         [0x9d, 0x40, 0x43, 0xb4] => Entry::OfferAccept,
@@ -83,7 +86,7 @@ pub fn entry_for_tag(tag: &[u8; 4]) -> Option<Entry> {
 
 /// gap `register(name, ownerKey, …, now, years)` on gap `(lo, hi)` produces, in output
 /// order 0/1/2: gap `(lo, key)`, gap `(key, hi)`, and the new name
-/// `(key, pad(name), ownerKey, price=0, expiresAt = now + years·YEAR)`.
+/// `(key, pad(name), ownerKey, price=0, periodStart = now, expiresAt = now + years·YEAR)`.
 pub fn register(
     gap: &GapState,
     name: &[u8],
@@ -99,6 +102,7 @@ pub fn register(
         name: crate::pad_name(name),
         owner: owner_key,
         price: 0,
+        period_start: now_ms,
         expires_at: now_ms + years * YEAR_MS,
     };
     (left, right, nm)
@@ -119,8 +123,14 @@ pub fn name_buy(name: &NameState, new_owner: [u8; 32]) -> NameState {
     NameState { owner: new_owner, price: 0, ..*name }
 }
 
-/// name `renew(years)`: push the expiry out, from the OLD expiry even when lapsed.
+/// name `renew(years)` (v2): a new paid period starting at the OLD expiry (even in grace):
+/// `periodStart = old expiresAt`, `expiresAt = old expiresAt + years·YEAR`.
 pub fn name_renew(name: &NameState, years: i64) -> NameState {
+    NameState { period_start: name.expires_at, expires_at: name.expires_at + years * YEAR_MS, ..*name }
+}
+
+/// name `extend(years)` (v2): more years on the current period; `periodStart` unchanged.
+pub fn name_extend(name: &NameState, years: i64) -> NameState {
     NameState { expires_at: name.expires_at + years * YEAR_MS, ..*name }
 }
 
@@ -165,6 +175,8 @@ mod tests {
         assert_eq!(entry_for_tag(&[0x86, 0x67, 0xaf, 0x5e]), Some(Entry::GapRegister));
         assert_eq!(entry_for_tag(&[0x79, 0x4d, 0xca, 0x54]), Some(Entry::NameTransfer));
         assert_eq!(entry_for_tag(&[0x9d, 0x40, 0x43, 0xb4]), Some(Entry::OfferAccept));
+        assert_eq!(entry_for_tag(&[0x2c, 0xe7, 0xcc, 0xeb]), Some(Entry::NameExtend));
+        assert_eq!(Entry::NameExtend.contract(), Contract::Name);
         assert_eq!(entry_for_tag(&[0, 0, 0, 0]), None);
         assert_eq!(Entry::NameTransfer.contract(), Contract::Name);
         assert!(Entry::OfferWithdraw.is_exit());
@@ -183,6 +195,7 @@ mod tests {
         assert_eq!(nm.key, key);
         assert_eq!(nm.owner, owner);
         assert_eq!(nm.price, 0);
+        assert_eq!(nm.period_start, now);
         assert_eq!(nm.expires_at, now + 2 * YEAR_MS);
         assert_eq!(nm.name_str(), "alice");
     }
@@ -194,15 +207,21 @@ mod tests {
             name: crate::pad_name(b"alice"),
             owner: [1u8; 32],
             price: 0,
+            period_start: 500,
             expires_at: 1_000,
         };
         assert_eq!(name_list(&nm, 500).price, 500);
         assert_eq!(name_transfer(&nm, [2u8; 32]).owner, [2u8; 32]);
         assert_eq!(name_transfer(&name_list(&nm, 500), [2u8; 32]).price, 0, "transfer delists");
         assert_eq!(name_buy(&name_list(&nm, 500), [3u8; 32]).owner, [3u8; 32]);
+        // v2 renew starts a new period at the old expiry; extend keeps the period.
+        assert_eq!(name_renew(&nm, 2).period_start, 1_000);
         assert_eq!(name_renew(&nm, 2).expires_at, 1_000 + 2 * YEAR_MS);
-        // expiry unchanged on transfer/list
+        assert_eq!(name_extend(&nm, 1).period_start, 500);
+        assert_eq!(name_extend(&nm, 1).expires_at, 1_000 + YEAR_MS);
+        // period + expiry unchanged on transfer/list/buy
         assert_eq!(name_transfer(&nm, [2u8; 32]).expires_at, 1_000);
+        assert_eq!(name_buy(&nm, [3u8; 32]).period_start, 500);
     }
 
     #[test]

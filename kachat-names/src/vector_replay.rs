@@ -51,6 +51,7 @@ fn prior_states(records: &Value) -> Vec<(Outpoint, Tracked, Vec<u8>)> {
                 name: pad_name(r["name"].as_str().unwrap().as_bytes()),
                 owner: h32(&r["owner"]),
                 price: r["price"].as_i64().unwrap(),
+                period_start: r["periodStart"].as_i64().expect("v2 name record carries periodStart"),
                 expires_at: r["expiresAt"].as_i64().unwrap(),
             }),
             "offer" => Tracked::Offer(OfferState {
@@ -122,6 +123,7 @@ fn every_vector_step_applies_exactly() {
         return;
     };
     let t = Templates::from_manifest(&v["manifest"]).expect("templates from the vectors manifest");
+    let mut replayed: Vec<&str> = Vec::new();
 
     for step in v["steps"].as_array().unwrap() {
         let label = step["label"].as_str().unwrap();
@@ -139,6 +141,7 @@ fn every_vector_step_applies_exactly() {
         let want_op = match step["op"].as_str().unwrap() {
             "register" => Some("register"),
             "renew" => Some("renew"),
+            "extend" => Some("extend"),
             "transfer" => Some("transfer"),
             "list" if label.starts_with("delist") => Some("delist"),
             "list" => Some("list"),
@@ -169,7 +172,9 @@ fn every_vector_step_applies_exactly() {
             reg.utxos.keys().filter(|(id, _)| *id == tx.id).map(|(_, i)| *i).collect();
         let want: HashSet<u32> = expected.iter().map(|(i, _)| *i).collect();
         assert_eq!(added, want, "[{label}] exactly the registry outputs are tracked");
+        replayed.push(step["op"].as_str().unwrap());
     }
+    eprintln!("replayed {} vector transactions: {:?}", replayed.len(), replayed);
 }
 
 /// The connected lifecycle (steps up to `reclaim lapse-tn`): start from the genesis gap only
