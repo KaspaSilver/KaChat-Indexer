@@ -1152,7 +1152,7 @@ fn chat_indexer_running() -> bool {
 /// `kachat-transaction-processor/src/k_protocol.rs` (separate crate, so duplicated here). Exposed to
 /// the dashboard/panel as `available_broadcast_channels` so the UI shows suggestions without
 /// hardcoding them.
-const DEFAULT_BROADCAST_CHANNELS: [&str; 14] = [
+const DEFAULT_BROADCAST_CHANNELS: [&str; 16] = [
     "kaspa",
     "kachat-bugs",
     "kaspa-indonesia",
@@ -1167,6 +1167,10 @@ const DEFAULT_BROADCAST_CHANNELS: [&str; 14] = [
     "kaspa-korean",
     "kaspa-hebrew",
     "kaspa-romania",
+    "kaspa-russian",
+    // Chess Tournaments transport (not a chat room). Dropping it from a saved list stops
+    // chess on every client, so it has to be offered here too.
+    "chess-arena",
 ];
 
 #[derive(Serialize)]

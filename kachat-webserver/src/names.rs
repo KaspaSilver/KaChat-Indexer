@@ -131,17 +131,25 @@ pub fn name_key_hex(name: &str) -> String {
 /// GET /names/status — `{network, registryCovenantId, genesisTxId, indexedDaa, synced}`
 /// plus `on`. Until the covenant follower exists, `indexedDaa` is 0 and `synced` is
 /// false; `on` reflects whether a manifest is loaded.
+///
+/// `registryCovenantId` is the clients' switch: iOS, Android and Desktop stop walking the
+/// chain and route every `/names/*` lookup here as soon as it matches their manifest. So it
+/// is withheld (null) until the follower can actually answer those lookups; the manifest's
+/// id is reported separately as `manifestRegistryCovenantId` for the panel.
 pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let n = &state.names;
+    let synced = false;
+    let manifest_registry = n.manifest.as_ref().and_then(|m| m.registry_covenant_id.clone());
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "network": n.manifest.as_ref().and_then(|m| m.network.clone()),
-            "registryCovenantId": n.manifest.as_ref().and_then(|m| m.registry_covenant_id.clone()),
+            "registryCovenantId": if synced { manifest_registry.clone() } else { None },
+            "manifestRegistryCovenantId": manifest_registry,
             "genesisTxId": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.txid.clone()),
             "scanFrom": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.scan_from.clone()),
             "indexedDaa": 0,
-            "synced": false,
+            "synced": synced,
             "on": n.is_on(),
             "manifestPath": n.path,
         })),
