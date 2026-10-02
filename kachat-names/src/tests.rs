@@ -104,7 +104,7 @@ fn name_rules() {
 /// The real deployed testnet-10 manifest (kachat-domains, committed — not generated).
 fn manifest() -> Option<serde_json::Value> {
     let path = std::env::var("KACHAT_NAMES_MANIFEST_FILE").unwrap_or_else(|_| {
-        "/home/vahome/kachat-domains/manifests/kachat-names-testnet-10.json".to_string()
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../kachat-domains/manifests/kachat-names-testnet-10.json").to_string()
     });
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
@@ -147,7 +147,7 @@ fn reproduces_live_testnet_genesis_gap_output() {
 
 fn vectors() -> Option<serde_json::Value> {
     let path = std::env::var("KACHAT_NAMES_VECTORS")
-        .unwrap_or_else(|_| "/home/vahome/kachat-domains/names-vectors.json".to_string());
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../KaChat/KaChatTests/KachatNamesVectors.json").to_string());
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -199,6 +199,9 @@ fn matches_generated_vectors() {
         match &pushes[0] {
             Push::Data(d) => assert_eq!(d, &data, "push data"),
             Push::Num(0) => assert!(data.is_empty(), "OP_0 only for empty data"),
+            // Minimal encoding: a single byte 0x01..=0x10 is OP_1..OP_16, 0x81 is OP_1NEGATE.
+            Push::Num(-1) => assert_eq!(data, vec![0x81], "OP_1NEGATE only for 0x81"),
+            Push::Num(n @ 1..=16) => assert_eq!(data, vec![*n as u8], "OP_{n} for byte {n}"),
             other => panic!("unexpected push {other:?}"),
         }
     }

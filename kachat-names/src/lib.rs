@@ -347,3 +347,5 @@ pub use profile::{parse_profile, Profile};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vector_replay;

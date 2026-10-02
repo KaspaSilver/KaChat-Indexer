@@ -55,6 +55,21 @@ pub struct Templates {
 }
 
 impl Templates {
+    /// Build the three templates from a names manifest's `artifacts` (`KachatGap`,
+    /// `KachatName`, `KachatOffer`: `prefixHex`, `suffixHex`, `stateSpan {offset,len}`).
+    pub fn from_manifest(manifest: &serde_json::Value) -> Option<Self> {
+        let one = |contract: &str| -> Option<ContractTemplate> {
+            let a = manifest.get("artifacts")?.get(contract)?;
+            Some(ContractTemplate {
+                prefix: hex::decode(a.get("prefixHex")?.as_str()?).ok()?,
+                suffix: hex::decode(a.get("suffixHex")?.as_str()?).ok()?,
+                state_offset: a.get("stateSpan")?.get("offset")?.as_u64()? as usize,
+                state_len: a.get("stateSpan")?.get("len")?.as_u64()? as usize,
+            })
+        };
+        Some(Templates { gap: one("KachatGap")?, name: one("KachatName")?, offer: one("KachatOffer")? })
+    }
+
     fn gap_spk(&self, s: &GapState) -> Vec<u8> {
         self.gap.spk(&s.encode())
     }
