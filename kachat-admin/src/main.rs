@@ -79,6 +79,17 @@ struct Args {
     libretranslate_url: String,
 }
 
+/// True when this indexer runs on testnet (the stack passes NETWORK=testnet-10).
+fn is_testnet() -> bool {
+    std::env::var("NETWORK").map(|n| n.starts_with("testnet")).unwrap_or(false)
+}
+
+/// A flag still at its mainnet default takes the testnet equivalent on a testnet
+/// indexer (explorer API, chat store directory); an explicit value always wins.
+fn network_default(value: &str, mainnet_default: &str, testnet_default: &str) -> String {
+    if is_testnet() && value == mainnet_default { testnet_default.to_string() } else { value.to_string() }
+}
+
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
@@ -142,13 +153,13 @@ async fn main() -> anyhow::Result<()> {
         chat_metrics_url: args.chat_metrics_url.clone(),
         webserver_health_url: args.webserver_health_url.clone(),
         chat_import_url: args.chat_import_url.clone(),
-        explorer_url: args.explorer_url.clone(),
+        explorer_url: network_default(&args.explorer_url, "https://api.kaspa.org", "https://api-tn10.kaspa.org"),
         chat_export_url: args.chat_export_url.clone(),
         chat_import_file_url: args.chat_import_file_url.clone(),
         chat_purge_url: args.chat_purge_url.clone(),
         personal_file: args.personal_file.clone(),
         personal_groups_file: args.personal_groups_file.clone(),
-        chat_data_dir: args.chat_data_dir.clone(),
+        chat_data_dir: network_default(&args.chat_data_dir, "/app/data/mainnet", "/app/data/testnet"),
         libretranslate_url: args.libretranslate_url.clone(),
     };
 
@@ -731,8 +742,9 @@ async fn post_chat_import(
         pages: 0,
         error: None,
     };
-    if !address.starts_with("kaspa:") {
-        resp.error = Some("address must start with kaspa:".into());
+    let prefix = if is_testnet() { "kaspatest:" } else { "kaspa:" };
+    if !address.starts_with(prefix) {
+        resp.error = Some(format!("address must start with {prefix} on this network"));
         return Json(resp);
     }
 
