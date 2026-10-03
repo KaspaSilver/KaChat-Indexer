@@ -85,7 +85,7 @@ fn register_splits_gap_and_mints_name() {
 
     let tx = Tx {
         id: [0x11; 32],
-        inputs: vec![TxInput {
+        inputs: vec![TxInput { spent_script: Vec::new(),
             previous_outpoint: genesis,
             signature_script: sig_script(
                 &[b"alice".to_vec(), owner.to_vec(), [3u8; 32].to_vec(), scriptnum(NOW), scriptnum(2), vec![], vec![]],
@@ -135,7 +135,7 @@ fn transfer_updates_owner_and_moves_utxo() {
 
     let tx = Tx {
         id: [0x33; 32],
-        inputs: vec![TxInput {
+        inputs: vec![TxInput { spent_script: Vec::new(),
             previous_outpoint: old_op,
             signature_script: sig_script(&[new_owner.to_vec(), [9u8; 65].to_vec()], [0x79, 0x4d, 0xca, 0x54], &t.name.redeem(&ns.encode())),
         }],
@@ -163,7 +163,7 @@ fn list_sets_price_then_renew_extends_expiry() {
     let listed = crate::transition::name_list(&ns, 500_000_000);
     let tx = Tx {
         id: [0x45; 32],
-        inputs: vec![TxInput {
+        inputs: vec![TxInput { spent_script: Vec::new(),
             previous_outpoint: op,
             signature_script: sig_script(&[scriptnum(500_000_000), [9u8; 65].to_vec()], [0x67, 0x4a, 0x8e, 0xa4], &t.name.redeem(&ns.encode())),
         }],
@@ -181,7 +181,7 @@ fn list_sets_price_then_renew_extends_expiry() {
     let renewed = crate::transition::name_renew(&got, 2);
     let tx2 = Tx {
         id: [0x46; 32],
-        inputs: vec![TxInput {
+        inputs: vec![TxInput { spent_script: Vec::new(),
             previous_outpoint: op2,
             signature_script: sig_script(&[scriptnum(2)], [0xb7, 0x06, 0xac, 0x38], &t.name.redeem(&got.encode())),
         }],
@@ -247,9 +247,9 @@ fn release_exit_merges_gaps_and_removes_name() {
     let tx = Tx {
         id: [0x61; 32],
         inputs: vec![
-            TxInput { previous_outpoint: lo_op, signature_script: sig_script(&[], [0x63, 0xd2, 0x5b, 0xc2], &t.gap.redeem(&lo_gap.encode())) },
-            TxInput { previous_outpoint: name_op, signature_script: sig_script(&[[9u8; 65].to_vec()], [0x38, 0x8a, 0xd0, 0xb4], &t.name.redeem(&name.encode())) },
-            TxInput { previous_outpoint: hi_op, signature_script: sig_script(&[], [0xda, 0xb7, 0x63, 0x55], &t.gap.redeem(&hi_gap.encode())) },
+            TxInput { spent_script: Vec::new(), previous_outpoint: lo_op, signature_script: sig_script(&[], [0x63, 0xd2, 0x5b, 0xc2], &t.gap.redeem(&lo_gap.encode())) },
+            TxInput { spent_script: Vec::new(), previous_outpoint: name_op, signature_script: sig_script(&[[9u8; 65].to_vec()], [0x38, 0x8a, 0xd0, 0xb4], &t.name.redeem(&name.encode())) },
+            TxInput { spent_script: Vec::new(), previous_outpoint: hi_op, signature_script: sig_script(&[], [0xda, 0xb7, 0x63, 0x55], &t.gap.redeem(&hi_gap.encode())) },
         ],
         outputs: vec![out(t.gap.spk(&merged.encode()), 100_000_000)],
         payload: vec![],
@@ -280,7 +280,7 @@ fn undo_block_reverses_a_register() {
     let block = [0xc0u8; 32];
     let tx = Tx {
         id: [0x11; 32],
-        inputs: vec![TxInput {
+        inputs: vec![TxInput { spent_script: Vec::new(),
             previous_outpoint: genesis,
             signature_script: sig_script(
                 &[b"alice".to_vec(), [7u8; 32].to_vec(), [3u8; 32].to_vec(), scriptnum(NOW), scriptnum(2), vec![], vec![]],
@@ -320,7 +320,7 @@ fn undo_restores_prior_owner_and_outpoint_on_transfer() {
     let block = [0xc1u8; 32];
     let tx = Tx {
         id: [0x33; 32],
-        inputs: vec![TxInput {
+        inputs: vec![TxInput { spent_script: Vec::new(),
             previous_outpoint: old_op,
             signature_script: sig_script(&[[2u8; 32].to_vec(), [9u8; 65].to_vec()], [0x79, 0x4d, 0xca, 0x54], &t.name.redeem(&ns.encode())),
         }],
@@ -345,9 +345,10 @@ fn undo_restores_a_replaced_profile() {
     let mut reg = Registry::new();
     let addr = vec![0xab, 0xcd];
     let out_self = TxOutput { script_public_key: addr.clone(), value: 1 };
+    let self_input = TxInput { spent_script: addr.clone(), previous_outpoint: ([0x77; 32], 0), signature_script: vec![] };
     let mk = |id: [u8; 8], daa: u64, block: [u8; 32], handle: &str| Tx {
         id: { let mut x = [0u8; 32]; x[..8].copy_from_slice(&id); x },
-        inputs: vec![],
+        inputs: vec![self_input.clone()],
         outputs: vec![out_self.clone()],
         payload: format!("kchat:1:profile:{{\"v\":1,\"social\":\"https://x.com/{handle}\"}}").into_bytes(),
         accepting_block: block,
@@ -366,6 +367,33 @@ fn undo_restores_a_replaced_profile() {
 }
 
 #[test]
+fn a_profile_paid_to_someone_else_is_ignored() {
+    // Dust to the victim's address carrying a profile payload, spent from the attacker's
+    // own address: not a self-send, so it must not become the victim's profile.
+    let t = templates();
+    let mut reg = Registry::new();
+    let victim = vec![0x20, 0x01, 0xac];
+    let attacker = vec![0x20, 0x02, 0xac];
+    let tx = Tx {
+        id: [0x99; 32],
+        inputs: vec![TxInput { spent_script: attacker, previous_outpoint: ([0x55; 32], 0), signature_script: vec![] }],
+        outputs: vec![TxOutput { script_public_key: victim.clone(), value: 1 }],
+        payload: b"kchat:1:profile:{\"v\":1,\"linktree\":\"https://linktr.ee/evil\"}".to_vec(),
+        accepting_block: [0xe0; 32],
+        accepting_daa: 1,
+        block_time: NOW,
+    };
+    reg.apply(&t, &tx);
+    assert!(reg.profiles.get(&victim).is_none(), "no profile for an address that did not send it");
+
+    // Unknown spent scripts prove nothing either.
+    let mut unknown = tx.clone();
+    unknown.inputs[0].spent_script = vec![];
+    reg.apply(&t, &unknown);
+    assert!(reg.profiles.get(&victim).is_none());
+}
+
+#[test]
 fn prune_journal_keeps_recent() {
     let mut reg = Registry::new();
     // fabricate entries by applying no-op-ish profile txs across blocks
@@ -374,7 +402,7 @@ fn prune_journal_keeps_recent() {
     for i in 0..5u64 {
         let tx = Tx {
             id: { let mut x = [0u8; 32]; x[0] = i as u8; x },
-            inputs: vec![],
+            inputs: vec![TxInput { spent_script: addr.clone(), previous_outpoint: ([0x77; 32], 0), signature_script: vec![] }],
             outputs: vec![TxOutput { script_public_key: addr.clone(), value: 1 }],
             payload: b"kchat:1:profile:{\"v\":1,\"social\":\"https://x.com/a\"}".to_vec(),
             accepting_block: { let mut b = [0u8; 32]; b[0] = i as u8; b },

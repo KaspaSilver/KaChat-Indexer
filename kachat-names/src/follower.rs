@@ -132,7 +132,7 @@ mod tests {
         let (left, right, nm) = crate::transition::register(gap, b"alice", [7u8; 32], 1_790_000_000_000, 2);
         Tx {
             id: [0x11; 32],
-            inputs: vec![TxInput {
+            inputs: vec![TxInput { spent_script: Vec::new(),
                 previous_outpoint: genesis,
                 signature_script: sig(
                     &[b"alice".to_vec(), [7u8; 32].to_vec(), [3u8; 32].to_vec(), scriptnum(1_790_000_000_000), scriptnum(2), vec![], vec![]],

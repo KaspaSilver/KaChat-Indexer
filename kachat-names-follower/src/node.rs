@@ -123,6 +123,15 @@ fn map_tx(tx: &RpcOptionalTransaction, block: [u8; 32], daa: u64, time: i64) -> 
         inputs.push(TxInput {
             previous_outpoint: (bytes32(txid), index),
             signature_script: input.signature_script.clone().unwrap_or_default(),
+            // High verbosity carries the spent output's script; profiles need it to prove
+            // a self-send.
+            spent_script: input
+                .verbose_data
+                .as_ref()
+                .and_then(|v| v.utxo_entry.as_ref())
+                .and_then(|u| u.script_public_key.as_ref())
+                .map(|s| s.script().to_vec())
+                .unwrap_or_default(),
         });
     }
     let outputs = tx

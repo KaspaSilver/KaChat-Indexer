@@ -75,7 +75,7 @@ fn tx_of(step: &Value) -> Tx {
             .as_array()
             .unwrap()
             .iter()
-            .map(|i| TxInput {
+            .map(|i| TxInput { spent_script: Vec::new(),
                 previous_outpoint: (h32(&i["txid"]), i["index"].as_u64().unwrap() as u32),
                 signature_script: h(&i["signatureScript"]),
             })

@@ -86,6 +86,9 @@ impl Templates {
 pub struct TxInput {
     pub previous_outpoint: Outpoint,
     pub signature_script: Vec<u8>,
+    /// The scriptPublicKey of the output this input spends (empty when unknown). A profile
+    /// record is honoured only on a real self-send: an input spent from the same address.
+    pub spent_script: Vec<u8>,
 }
 
 /// A transaction output.
@@ -461,9 +464,13 @@ impl Registry {
         // Validate against the 2026-10-02 format (one allowlisted social + linktr.ee +
         // primaryName, <= 2 KB); reject old/oversized/invalid records outright.
         crate::parse_profile(json)?;
-        // The chain reader supplies the resolved address via the first output's spk as the
-        // identity key (self-send). A fuller sender check lives in the reader.
+        // A self-send: the record's address is its first output, and the tx must spend from
+        // that same address. Otherwise anyone could pay you dust with a profile payload and
+        // set yours. An input whose spent script is unknown proves nothing.
         let addr = tx.outputs.first()?.script_public_key.clone();
+        if !tx.inputs.iter().any(|i| !i.spent_script.is_empty() && i.spent_script == addr) {
+            return None;
+        }
         let order = (tx.accepting_daa, tx.id);
         let newer = self.profiles.get(&addr).map(|(_, o)| order > *o).unwrap_or(true);
         if !newer {
