@@ -93,7 +93,7 @@ async fn ctx(state: &AppState) -> Result<Ctx, Response> {
 }
 
 fn internal(e: sqlx::Error) -> Response {
-    tracing::error!("names api: {e}");
+    tracing::error!("[names] api: {e}");
     err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "database error")
 }
 

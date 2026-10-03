@@ -72,9 +72,9 @@ impl NamesState {
                 Ok(raw) => {
                     let manifest = serde_json::from_value::<NamesManifest>(raw.clone()).ok();
                     if manifest.is_none() {
-                        tracing::warn!(%path, "KACHAT_NAMES_MANIFEST did not parse; names module OFF");
+                        tracing::warn!(%path, "[names] manifest did not parse; module off");
                     } else {
-                        tracing::info!(%path, "names module ON (manifest loaded)");
+                        tracing::info!(%path, "[names] module on (manifest loaded)");
                     }
                     Self {
                         manifest: manifest.map(Arc::new),
@@ -83,12 +83,12 @@ impl NamesState {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(%path, error = %e, "KACHAT_NAMES_MANIFEST is not valid JSON; names module OFF");
+                    tracing::warn!(%path, error = %e, "[names] manifest is not valid JSON; module off");
                     Self { path: Some(path), ..Self::default() }
                 }
             },
             Err(e) => {
-                tracing::warn!(%path, error = %e, "KACHAT_NAMES_MANIFEST unreadable; names module OFF");
+                tracing::warn!(%path, error = %e, "[names] manifest unreadable; module off");
                 Self { path: Some(path), ..Self::default() }
             }
         }

@@ -200,10 +200,21 @@ fn now_ms() -> i64 {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    // No ANSI colour: the panel filters this container's output on the `[names]` tag
+    // (docs/KACHAT_NAMES_PANEL_LOGS.md).
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    // A crash must be visible in the names log: tag it before supervisord restarts us.
+    if let Err(e) = run().await {
+        tracing::error!("[names] fatal: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
     let m = read_manifest(&args.manifest)?;
     info!("[names] registry {} on {} (scanFrom {})", m.registry, m.network, hex::encode(m.scan_from));
@@ -256,6 +267,7 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
     let push_secret = (!args.push_secret.is_empty()).then_some(args.push_secret.as_str());
     let mut last_reminder_scan = Instant::now() - Duration::from_secs(60);
+    let mut last_heartbeat = Instant::now() - Duration::from_secs(60);
 
     loop {
         let from = follower.checkpoint.unwrap_or(m.scan_from);
@@ -340,7 +352,20 @@ async fn main() -> Result<()> {
                 Err(e) => warn!("[names] self-test failed to run: {e:#}"),
             }
         }
+        let was_synced = status.synced;
         status.synced = caught_up && status.self_test_ok;
+        // Progress heartbeat: once a minute and whenever `synced` flips, with the same
+        // numbers /names/status reports, so a long catch-up or a quiet registry is not silent.
+        if status.synced != was_synced || last_heartbeat.elapsed() >= Duration::from_secs(60) {
+            last_heartbeat = Instant::now();
+            info!(
+                "[names] at DAA {} (tip {}, {} behind, synced={})",
+                status.indexed_daa,
+                status.virtual_daa,
+                status.virtual_daa.saturating_sub(status.indexed_daa),
+                status.synced
+            );
+        }
 
         if changed {
             let mut profiles = Vec::new();
@@ -422,7 +447,7 @@ async fn main() -> Result<()> {
 /// `--probe`: the same engine path as the service, in memory, from scanFrom to the tip.
 async fn probe(args: &Args, m: &Manifest) -> Result<()> {
     let node = Node::connect(&args.node_url, &m.network).await?;
-    info!("[probe] connected to {}", args.node_url);
+    info!("[names] [probe] connected to {}", args.node_url);
     let mut follower = Follower::new(args.journal_keep);
     follower.seed(m.scan_from, m.genesis_outpoint, m.genesis_gap);
     let mut names_by_key: HashMap<[u8; 32], String> = HashMap::new();
@@ -439,7 +464,7 @@ async fn probe(args: &Args, m: &Manifest) -> Result<()> {
             Err(e) => {
                 failures += 1;
                 window.failed();
-                warn!("[probe] fetch failed ({e:#}); retrying capped to {:?} blue score", window.0);
+                warn!("[names] [probe] fetch failed ({e:#}); retrying capped to {:?} blue score", window.0);
                 if failures > 20 {
                     return Err(e);
                 }
@@ -462,7 +487,7 @@ async fn probe(args: &Args, m: &Manifest) -> Result<()> {
         }
         for e in &events {
             info!(
-                "[probe] daa {} {:<14} {:<24} tx {}",
+                "[names] [probe] daa {} {:<14} {:<24} tx {}",
                 e.daa,
                 e.op,
                 names_by_key.get(&e.key).map(String::as_str).unwrap_or("?"),
@@ -471,7 +496,7 @@ async fn probe(args: &Args, m: &Manifest) -> Result<()> {
         }
         let virtual_daa = node.virtual_daa().await?;
         info!(
-            "[probe] batch {blocks}: indexed DAA {indexed_daa} / virtual {virtual_daa} ({} behind), {txs} txs so far, {} live rows",
+            "[names] [probe] batch {blocks}: indexed DAA {indexed_daa} / virtual {virtual_daa} ({} behind), {txs} txs so far, {} live rows",
             virtual_daa.saturating_sub(indexed_daa),
             follower.registry.utxos.len()
         );
@@ -486,16 +511,16 @@ async fn probe(args: &Args, m: &Manifest) -> Result<()> {
         Tracked::Name(_) => (g, o),
     });
     info!(
-        "[probe] caught up at DAA {indexed_daa} after {blocks} batch(es), {txs} accepted txs: {} names {:?}, {gaps} gaps, {offers} offers, {} profiles",
+        "[names] [probe] caught up at DAA {indexed_daa} after {blocks} batch(es), {txs} accepted txs: {} names {:?}, {gaps} gaps, {offers} offers, {} profiles",
         names.len(),
         names,
         follower.registry.profiles.len()
     );
     let missing = self_test(&node, m, &follower.registry).await?;
     if missing.is_empty() {
-        info!("[probe] self-test: every live row is unspent on the node");
+        info!("[names] [probe] self-test: every live row is unspent on the node");
     } else {
-        warn!("[probe] self-test: {} live row(s) not on the node: {:?}", missing.len(),
+        warn!("[names] [probe] self-test: {} live row(s) not on the node: {:?}", missing.len(),
             missing.iter().map(|o| format!("{}:{}", hex::encode(o.0), o.1)).collect::<Vec<_>>());
     }
     Ok(())
