@@ -4,6 +4,16 @@
 // block or fail the indexing pipeline.
 
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set once at startup from the processor's --network: push subtitles show the actor's
+/// address with this network's prefix (kaspa: / kaspatest:). Routing never uses it --
+/// KaPosts pushes are matched by pubkey.
+static TESTNET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_network(network: &str) {
+    TESTNET.store(network.starts_with("testnet"), Ordering::Relaxed);
+}
 use serde_json::json;
 
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
@@ -59,7 +69,8 @@ fn shorten_kaspa(addr: &str) -> String {
     }
 }
 
-/// Derive the mainnet kaspa address from a compressed (66-hex) or x-only (64-hex) pubkey.
+/// Derive the kaspa address (this network's prefix) from a compressed (66-hex) or x-only
+/// (64-hex) pubkey.
 fn address_from_pubkey_hex(pubkey_hex: &str) -> Option<String> {
     let pk = pubkey_hex.trim();
     let xonly_hex = if pk.len() >= 64 { &pk[pk.len() - 64..] } else { pk };
@@ -69,7 +80,11 @@ fn address_from_pubkey_hex(pubkey_hex: &str) -> Option<String> {
     }
     Some(
         kaspa_addresses::Address::new(
-            kaspa_addresses::Prefix::Mainnet,
+            if TESTNET.load(Ordering::Relaxed) {
+                kaspa_addresses::Prefix::Testnet
+            } else {
+                kaspa_addresses::Prefix::Mainnet
+            },
             kaspa_addresses::Version::PubKey,
             &bytes,
         )
@@ -201,6 +216,15 @@ pub fn notify_kaposts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitle_address_follows_the_network() {
+        let pk = "6dece92abd087978562b0e47943d859bd444672f89bc68fc8bfa03a3d0b27ee8";
+        set_network("testnet-10");
+        assert!(address_from_pubkey_hex(pk).unwrap().starts_with("kaspatest:"));
+        set_network("mainnet");
+        assert!(address_from_pubkey_hex(pk).unwrap().starts_with("kaspa:"));
+    }
 
     #[test]
     fn reply_preview_reads_inner_text_not_raw_json() {

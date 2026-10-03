@@ -124,6 +124,7 @@ async fn main() -> Result<()> {
 
     // Load configuration from CLI arguments only
     let config = AppConfig::from_args(&args);
+    crate::push_notify::set_network(&config.network);
     info!(
         "Configuration loaded: {} workers, channel: {}, network: {}, reindex: {}",
         config.workers.count,
