@@ -349,7 +349,7 @@ pub use transition::{Contract, Entry, NameStatus, entry_for_tag, name_status, YE
 pub mod ingest;
 pub mod follower;
 pub mod profile;
-pub use profile::{parse_profile, Profile};
+pub use profile::{parse_profile, platform_of, Profile};
 
 #[cfg(test)]
 mod tests;

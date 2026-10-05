@@ -8,6 +8,7 @@
 //! signal, so nothing it serves may be refutable by the chain.
 
 mod node;
+mod profiles;
 mod pushes;
 mod store;
 
@@ -30,9 +31,21 @@ use crate::store::UtxoMeta;
 #[derive(Parser, Debug)]
 #[command(about = ".kachat names registry follower")]
 struct Args {
-    /// Names manifest (kachat-domains/manifests/kachat-names-<network>.json).
+    /// Names manifest (kachat-domains/manifests/kachat-names-<network>.json). Required for
+    /// the names follower; in `--profiles` mode only its scanFrom is used, as a start block.
     #[arg(long, env = "KACHAT_NAMES_MANIFEST")]
-    manifest: String,
+    manifest: Option<String>,
+    /// Run the address-profiles follower instead (docs/KACHAT_PROFILES.md): every network,
+    /// no manifest needed, sole writer of `names_profiles`.
+    #[arg(long)]
+    profiles: bool,
+    /// The network this stack follows (`mainnet`, `testnet-10`); used by `--profiles`.
+    #[arg(long, env = "NETWORK", default_value = "mainnet")]
+    network: String,
+    /// `--profiles` first-run start block (hex hash). Default: the manifest's scanFrom if
+    /// there is one, else the node's pruning point. The stored checkpoint wins afterwards.
+    #[arg(long, env = "KACHAT_PROFILES_SCAN_FROM")]
+    profiles_scan_from: Option<String>,
     /// The node's wRPC Borsh endpoint (Toccata-capable, --utxoindex for the self-test), or
     /// `resolver` for a public node of the manifest's network.
     #[arg(long, env = "KACHAT_NAMES_NODE_URL", default_value = "ws://127.0.0.1:17210")]
@@ -207,16 +220,19 @@ async fn main() {
         .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    // A crash must be visible in the names log: tag it before supervisord restarts us.
-    if let Err(e) = run().await {
-        tracing::error!("[names] fatal: {e:#}");
+    // A crash must be visible in the panel's log: tag it before supervisord restarts us.
+    let args = Args::parse();
+    let tag = if args.profiles { "[profiles]" } else { "[names]" };
+    let result = if args.profiles { profiles::run(&args).await } else { run(args).await };
+    if let Err(e) = result {
+        tracing::error!("{tag} fatal: {e:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
-    let args = Args::parse();
-    let m = read_manifest(&args.manifest)?;
+async fn run(args: Args) -> Result<()> {
+    let manifest = args.manifest.as_deref().ok_or_else(|| anyhow!("KACHAT_NAMES_MANIFEST is not set"))?;
+    let m = read_manifest(manifest)?;
     info!("[names] registry {} on {} (scanFrom {})", m.registry, m.network, hex::encode(m.scan_from));
     if args.probe {
         return probe(&args, &m).await;
@@ -237,7 +253,7 @@ async fn run() -> Result<()> {
         info!("[names] fresh registry tables for {}", m.registry);
         store::reset(&pool, &m.registry, &m.network, &m.genesis_txid, m.grace_ms).await?;
     }
-    let (registry, mut meta, mut profile_times, mut status) = store::load(&pool).await?;
+    let (registry, mut meta, mut status) = store::load(&pool).await?;
     let mut follower = Follower::new(args.journal_keep);
     follower.registry = registry;
     match status.checkpoint {
@@ -291,7 +307,6 @@ async fn run() -> Result<()> {
             names_by_key.insert(n.key, n.name_str());
         }
         let before: HashSet<Outpoint> = follower.registry.utxos.keys().copied().collect();
-        let profiles_before = follower.registry.profiles.clone();
         let utxos_before = follower.registry.utxos.clone();
         let (batch, events) = follower.step(&m.templates, &mut Prefetched(Some(batch)))?;
 
@@ -305,13 +320,6 @@ async fn run() -> Result<()> {
                 meta.insert(*op, UtxoMeta { value, created_at: tx.block_time, created_daa: tx.accepting_daa });
             }
         }
-        for (spk, (_, (_, txid))) in &follower.registry.profiles {
-            if profiles_before.get(spk).map(|p| &p.1.1) != Some(txid)
-                && let Some(tx) = txs.get(txid)
-            {
-                profile_times.insert(spk.clone(), tx.block_time);
-            }
-        }
         for (_, n) in follower.registry.names() {
             names_by_key.insert(n.key, n.name_str());
         }
@@ -320,8 +328,7 @@ async fn run() -> Result<()> {
             || !removed.is_empty()
             || !events.is_empty()
             || follower.registry.utxos.len() != before.len()
-            || follower.registry.utxos.keys().any(|op| !before.contains(op))
-            || follower.registry.profiles != profiles_before;
+            || follower.registry.utxos.keys().any(|op| !before.contains(op));
 
         if let Some(daa) = last_daa {
             status.indexed_daa = daa;
@@ -368,14 +375,8 @@ async fn run() -> Result<()> {
         }
 
         if changed {
-            let mut profiles = Vec::new();
-            for (spk, (json, (daa, txid))) in &follower.registry.profiles {
-                let Some(address) = spk_address(m.prefix, spk) else { continue };
-                let at = profile_times.get(spk).copied().unwrap_or(0);
-                profiles.push((spk.clone(), address, json.clone(), *daa, *txid, at));
-            }
             let named: Vec<_> = events.iter().map(|e| (e.clone(), names_by_key.get(&e.key).cloned())).collect();
-            store::persist(&pool, &follower.registry, &meta, &refuted, &profiles, &removed, &named, true, &status)
+            store::persist(&pool, &follower.registry, &meta, &refuted, &removed, &named, true, &status)
                 .await?;
             dirty = false;
             for e in &events {

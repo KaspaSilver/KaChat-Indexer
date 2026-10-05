@@ -421,6 +421,7 @@ impl WebServer {
             .route("/offers/by-buyer/:address", get(crate::names_api::offers_by_buyer))
             .route("/market/listings", get(crate::names_api::listings))
             .route("/market/activity", get(crate::names_api::market_activity))
+            .route("/profiles/stats", get(crate::names_api::profile_stats))
             .route("/profiles/:address", get(crate::names_api::profile))
             .route("/identity/batch", post(crate::names_api::identity_batch))
             .route("/identity/:address", get(crate::names_api::identity))

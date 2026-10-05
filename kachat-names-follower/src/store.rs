@@ -21,9 +21,6 @@ pub struct UtxoMeta {
     pub created_daa: u64,
 }
 
-/// A profile row to write: (spk, address, json, accepting daa, tx id, updated-at ms).
-pub type ProfileRow = (Vec<u8>, String, String, u64, [u8; 32], i64);
-
 /// Sync status row (one per database).
 #[derive(Debug, Clone, Default)]
 pub struct Status {
@@ -119,7 +116,8 @@ pub async fn stored_registry(pool: &PgPool) -> Result<Option<String>> {
 /// Wipe everything and record which registry the tables now follow.
 pub async fn reset(pool: &PgPool, registry: &str, network: &str, genesis_txid: &str, grace_ms: i64) -> Result<()> {
     let mut tx = pool.begin().await?;
-    for t in ["names_utxos", "names_history", "names_profiles", "names_reminders", "names_state"] {
+    // names_profiles is not ours: the profiles follower owns it (docs/KACHAT_PROFILES.md).
+    for t in ["names_utxos", "names_history", "names_reminders", "names_state"] {
         sqlx::query(&format!("DELETE FROM {t}")).execute(&mut *tx).await?;
     }
     sqlx::query(
@@ -140,9 +138,7 @@ fn b32(v: Option<Vec<u8>>) -> Option<[u8; 32]> {
 }
 
 /// Load the persisted registry, per-UTXO metadata, profile times and checkpoint.
-pub async fn load(
-    pool: &PgPool,
-) -> Result<(Registry, HashMap<Outpoint, UtxoMeta>, HashMap<Vec<u8>, i64>, Status)> {
+pub async fn load(pool: &PgPool) -> Result<(Registry, HashMap<Outpoint, UtxoMeta>, Status)> {
     let mut reg = Registry::new();
     let mut meta = HashMap::new();
     for r in sqlx::query("SELECT * FROM names_utxos").fetch_all(pool).await? {
@@ -178,13 +174,6 @@ pub async fn load(
             },
         );
     }
-    let mut profile_times = HashMap::new();
-    for r in sqlx::query("SELECT spk, profile, daa, tx_id, updated_at FROM names_profiles").fetch_all(pool).await? {
-        let spk: Vec<u8> = r.get("spk");
-        let order = (r.get::<i64, _>("daa") as u64, b32(r.get("tx_id")).unwrap_or_default());
-        profile_times.insert(spk.clone(), r.get::<i64, _>("updated_at"));
-        reg.profiles.insert(spk, (r.get("profile"), order));
-    }
     let status = match sqlx::query("SELECT * FROM names_state WHERE id = 1").fetch_optional(pool).await? {
         Some(r) => Status {
             checkpoint: b32(r.get("checkpoint")),
@@ -196,7 +185,7 @@ pub async fn load(
         },
         None => Status::default(),
     };
-    Ok((reg, meta, profile_times, status))
+    Ok((reg, meta, status))
 }
 
 /// One committed write after a batch: the full live set (when it changed), the history
@@ -207,7 +196,6 @@ pub async fn persist(
     reg: &Registry,
     meta: &HashMap<Outpoint, UtxoMeta>,
     refuted: &std::collections::HashSet<Outpoint>,
-    profiles: &[ProfileRow],
     removed_blocks: &[[u8; 32]],
     events: &[(Event, Option<String>)],
     rewrite_live_set: bool,
@@ -267,20 +255,6 @@ pub async fn persist(
                     .bind(Some(o.refund_after)),
             };
             q.bind(m.created_at).bind(m.created_daa as i64).bind(refuted.contains(op)).execute(&mut *tx).await?;
-        }
-        sqlx::query("DELETE FROM names_profiles").execute(&mut *tx).await?;
-        for (spk, address, json, daa, txid, at) in profiles {
-            sqlx::query(
-                "INSERT INTO names_profiles (spk, address, profile, daa, tx_id, updated_at) VALUES ($1,$2,$3,$4,$5,$6)",
-            )
-            .bind(spk)
-            .bind(address)
-            .bind(json)
-            .bind(*daa as i64)
-            .bind(txid.to_vec())
-            .bind(at)
-            .execute(&mut *tx)
-            .await?;
         }
     }
     for block in removed_blocks {

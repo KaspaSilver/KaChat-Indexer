@@ -88,6 +88,27 @@ pub fn parse_profile(json: &str) -> Option<Profile> {
     })
 }
 
+/// The platform a stored profile link points at (`x`, `youtube`, …), for stats. `None` for
+/// anything not on the allowlist.
+pub fn platform_of(url: &str) -> Option<&'static str> {
+    [
+        (X, "x"),
+        (YOUTUBE, "youtube"),
+        (DISCORD, "discord"),
+        (TELEGRAM, "telegram"),
+        (TWITCH, "twitch"),
+        (KICK, "kick"),
+        (GITHUB, "github"),
+        (FACEBOOK, "facebook"),
+        (INSTAGRAM, "instagram"),
+        (TIKTOK, "tiktok"),
+        (LINKEDIN, "linkedin"),
+    ]
+    .into_iter()
+    .find(|(h, _)| url.starts_with(h))
+    .map(|(_, p)| p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +159,13 @@ mod tests {
         assert!(parse_profile(r#"{"v":2,"avatar":"https://x.com/a"}"#).is_none());
         let big = format!("{{\"v\":1,\"avatar\":\"https://x.com/{}\"}}", "a".repeat(2100));
         assert!(parse_profile(&big).is_none());
+    }
+
+    #[test]
+    fn platform_from_host() {
+        assert_eq!(platform_of("https://x.com/a"), Some("x"));
+        assert_eq!(platform_of("https://www.youtube.com/@a"), Some("youtube"));
+        assert_eq!(platform_of("https://linktr.ee/a"), None);
     }
 
     #[test]

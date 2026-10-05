@@ -318,6 +318,15 @@ impl Registry {
         events
     }
 
+    /// Apply only the profile rules (§C) to one accepted transaction: the profiles follower,
+    /// which runs on every network whether or not a registry exists. Journaled like
+    /// [`Self::apply`] so a reorg rolls it back. True when the record was accepted.
+    pub fn apply_profile_only(&mut self, tx: &Tx) -> bool {
+        let Some(prior) = self.apply_profile(tx) else { return false };
+        self.journal.push(UndoEntry { block: tx.accepting_block, added: Vec::new(), removed: Vec::new(), profile: Some(prior) });
+        true
+    }
+
     /// Undo every transaction accepted by a removed chain block (a reorg), newest first,
     /// restoring the exact prior rows (§4.1 / B6). Idempotent for an unknown block.
     pub fn undo_block(&mut self, block: &[u8; 32]) {

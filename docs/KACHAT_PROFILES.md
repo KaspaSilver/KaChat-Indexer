@@ -5,6 +5,15 @@
 **Status:** the app and the panel are both done (KaChat `main`, Kaspa-Quick-Start `main`). This
 document covers what the indexer needs so they work end to end.
 
+**Indexer: implemented (2026-10-05).** `kachat-names-follower --profiles` runs as the
+supervisord program `profiles` (`docker/kachat/app/run-profiles.sh`) on both networks, always
+on, and is the only writer of `names_profiles` (the names follower no longer touches it).
+State is in `profiles_state`; saves in `profile_saves`; `names_profiles.created_at` added.
+Start block: `KACHAT_PROFILES_SCAN_FROM`, else the manifest's `scanFrom`, else the node's
+pruning point. A block older than the pruning point falls back to it. `/profiles/*` and
+`/identity/*` work without a manifest (profile-only identity). `GET /profiles/stats` is
+served while the follower runs. Logs are tagged `[profiles]` with a heartbeat.
+
 ## Why
 
 A KaChat profile isn't tied to a `.kachat` name. The avatar, banner, bio and Linktree are

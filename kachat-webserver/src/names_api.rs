@@ -459,16 +459,61 @@ pub async fn market_activity(State(state): State<Arc<AppState>>, Query(q): Query
     events_page(&c, "op IN ('sale', 'list', 'offer', 'offer_accepted')", None, &q).await
 }
 
-/// One profile: the stored record (already validated by the follower) or null.
-async fn profile_for(c: &Ctx, address: &str) -> Result<Option<(Value, i64, Vec<u8>)>, sqlx::Error> {
+/// A stored record as served: re-checked against the per-field allowlist, so a link that
+/// is not allowed in its field is dropped and the rest kept (`v: 1` preserved).
+fn clean_profile(raw: &str) -> Value {
+    match kachat_names::parse_profile(raw) {
+        Some(p) => {
+            let mut v = serde_json::to_value(p).unwrap_or_else(|_| json!({}));
+            v["v"] = json!(1);
+            v
+        }
+        None => Value::Null,
+    }
+}
+
+/// One profile: the stored record (validated by the follower) or null.
+async fn profile_for(pool: &PgPool, address: &str) -> Result<Option<(Value, i64, Vec<u8>)>, sqlx::Error> {
     let row = sqlx::query("SELECT profile, updated_at, tx_id FROM names_profiles WHERE address = $1")
         .bind(address)
-        .fetch_optional(&c.pool)
+        .fetch_optional(pool)
         .await?;
-    Ok(row.map(|r| {
-        let profile = serde_json::from_str(&r.get::<String, _>("profile")).unwrap_or(Value::Null);
-        (profile, r.get("updated_at"), r.get("tx_id"))
-    }))
+    Ok(row.map(|r| (clean_profile(&r.get::<String, _>("profile")), r.get("updated_at"), r.get("tx_id"))))
+}
+
+// ------------------------------------------------------------------ profiles ----
+//
+// Address profiles are kept by the profiles follower (`kachat-names-follower --profiles`,
+// docs/KACHAT_PROFILES.md) on every network, with or without a names registry.
+
+/// The profiles follower's row in `profiles_state`, if it is running (heartbeat fresh).
+pub struct ProfilesStatus {
+    pub network: String,
+    pub indexed_daa: i64,
+    pub synced: bool,
+}
+
+pub async fn profiles_status(pool: &PgPool) -> Option<ProfilesStatus> {
+    let row = sqlx::query("SELECT network, indexed_daa, synced, updated_at FROM profiles_state WHERE id = 1")
+        .fetch_optional(pool)
+        .await
+        .ok()??;
+    (now_ms() - row.get::<i64, _>("updated_at") <= STALE_MS).then(|| ProfilesStatus {
+        network: row.get("network"),
+        indexed_daa: row.get("indexed_daa"),
+        synced: row.get("synced"),
+    })
+}
+
+/// Profile reads need the follower on and caught up: a profile missing because the scan
+/// has not reached it yet must not be served as "no profile".
+async fn profiles_pool(state: &AppState) -> Result<PgPool, Response> {
+    let pool = state.scheduled_pool.clone();
+    match profiles_status(&pool).await {
+        Some(s) if s.synced => Ok(pool),
+        Some(_) => Err(err(StatusCode::SERVICE_UNAVAILABLE, "syncing", "the profiles follower is catching up")),
+        None => Err(err(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "the profiles follower is not running")),
+    }
 }
 
 /// `GET /profiles/{address}`
@@ -476,11 +521,11 @@ pub async fn profile(State(state): State<Arc<AppState>>, Path(address): Path<Str
     let Some(address) = normalize_address(&address) else {
         return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address");
     };
-    let c = match ctx(&state).await {
-        Ok(c) => c,
+    let pool = match profiles_pool(&state).await {
+        Ok(p) => p,
         Err(e) => return e,
     };
-    match profile_for(&c, &address).await {
+    match profile_for(&pool, &address).await {
         Ok(Some((p, at, tx))) => {
             Json(json!({ "address": address, "profile": p, "updatedAt": at, "txId": hex::encode(tx) })).into_response()
         }
@@ -506,7 +551,7 @@ async fn identity_for(c: &Ctx, address: &str) -> Result<Value, sqlx::Error> {
             .filter_map(|r| r.get::<Option<String>, _>("name"))
             .collect();
     }
-    let profile = profile_for(c, address).await?.map(|(p, _, _)| p).unwrap_or(Value::Null);
+    let profile = profile_for(&c.pool, address).await?.map(|(p, _, _)| p).unwrap_or(Value::Null);
     let primary = profile.get("primaryName").and_then(Value::as_str).map(|s| s.trim_end_matches(".kachat").to_string());
     let label = match primary {
         Some(p) if names.contains(&p) => Some(p),
@@ -515,16 +560,40 @@ async fn identity_for(c: &Ctx, address: &str) -> Result<Value, sqlx::Error> {
     Ok(json!({ "address": address, "label": label, "names": names, "profile": profile }))
 }
 
+/// Where identities come from: the registry (names + label + profile) when a names
+/// manifest is loaded, else profiles only (`label: null`, `names: []`) — mainnet today.
+enum IdentitySource {
+    Registry(Ctx),
+    ProfilesOnly(PgPool),
+}
+
+async fn identity_source(state: &AppState) -> Result<IdentitySource, Response> {
+    if state.names.is_on() {
+        return ctx(state).await.map(IdentitySource::Registry);
+    }
+    profiles_pool(state).await.map(IdentitySource::ProfilesOnly)
+}
+
+async fn identity_from(src: &IdentitySource, address: &str) -> Result<Value, sqlx::Error> {
+    match src {
+        IdentitySource::Registry(c) => identity_for(c, address).await,
+        IdentitySource::ProfilesOnly(pool) => {
+            let profile = profile_for(pool, address).await?.map(|(p, _, _)| p).unwrap_or(Value::Null);
+            Ok(json!({ "address": address, "label": Value::Null, "names": [], "profile": profile }))
+        }
+    }
+}
+
 /// `GET /identity/{address}`
 pub async fn identity(State(state): State<Arc<AppState>>, Path(address): Path<String>) -> Response {
     let Some(address) = normalize_address(&address) else {
         return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address");
     };
-    let c = match ctx(&state).await {
-        Ok(c) => c,
+    let src = match identity_source(&state).await {
+        Ok(s) => s,
         Err(e) => return e,
     };
-    match identity_for(&c, &address).await {
+    match identity_from(&src, &address).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => internal(e),
     }
@@ -540,14 +609,14 @@ pub async fn identity_batch(State(state): State<Arc<AppState>>, Json(body): Json
     if body.addresses.len() > MAX_BATCH {
         return err(StatusCode::BAD_REQUEST, "too_many", "at most 200 addresses");
     }
-    let c = match ctx(&state).await {
-        Ok(c) => c,
+    let src = match identity_source(&state).await {
+        Ok(s) => s,
         Err(e) => return e,
     };
     let mut out: HashMap<String, Value> = HashMap::new();
     for raw in &body.addresses {
         let Some(address) = normalize_address(raw) else { continue };
-        match identity_for(&c, &address).await {
+        match identity_from(&src, &address).await {
             Ok(v) => {
                 out.insert(raw.clone(), v);
             }
@@ -555,6 +624,110 @@ pub async fn identity_batch(State(state): State<Arc<AppState>>, Json(body): Json
         }
     }
     Json(json!({ "identities": out })).into_response()
+}
+
+/// `GET /profiles/stats` — the Kaspa Quick Start panel's KaChat → Profiles tab
+/// (docs/KACHAT_PROFILES.md §4). Served while the follower runs, synced or not (`synced`
+/// says which); 503 when it is off. Links only: pictures and bios are never fetched.
+pub async fn profile_stats(State(state): State<Arc<AppState>>) -> Response {
+    let pool = state.scheduled_pool.clone();
+    let Some(status) = profiles_status(&pool).await else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "the profiles follower is not running");
+    };
+    match compute_stats(&pool, &status).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+async fn compute_stats(pool: &PgPool, status: &ProfilesStatus) -> Result<Value, sqlx::Error> {
+    const DAY: i64 = 86_400_000;
+    let now = now_ms();
+    let rows = sqlx::query("SELECT address, profile, tx_id, updated_at, created_at FROM names_profiles ORDER BY updated_at DESC")
+        .fetch_all(pool)
+        .await?;
+    let saves7d: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profile_saves WHERE block_time >= $1")
+        .bind(now - 7 * DAY)
+        .fetch_one(pool)
+        .await?;
+    let records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profile_saves").fetch_one(pool).await?;
+
+    let mut c = ProfileCounts::default();
+    let mut recent = Vec::new();
+    for r in &rows {
+        let Some(p) = kachat_names::parse_profile(&r.get::<String, _>("profile")) else { continue };
+        c.add(&p, r.get::<Option<i64>, _>("created_at").unwrap_or(0), now);
+        if recent.len() < 25 {
+            recent.push(json!({
+                "address": r.get::<String, _>("address"),
+                "updatedAt": r.get::<i64, _>("updated_at"),
+                "txId": hex::encode(r.get::<Vec<u8>, _>("tx_id")),
+                "avatar": p.avatar,
+                "banner": p.banner,
+                "bio": p.bio,
+                "linktree": p.linktree,
+            }));
+        }
+    }
+    Ok(json!({
+        "network": status.network,
+        "synced": status.synced,
+        "indexedDaa": status.indexed_daa,
+        "total": c.total,
+        "new24h": c.new24h,
+        "new7d": c.new7d,
+        "new30d": c.new30d,
+        "saves7d": saves7d,
+        "records": records,
+        "withAvatar": c.with_avatar,
+        "withBanner": c.with_banner,
+        "withBio": c.with_bio,
+        "withLinktree": c.with_linktree,
+        "withPrimaryName": c.with_primary_name,
+        "platforms": { "avatar": c.avatar, "banner": c.banner, "bio": c.bio },
+        "recent": recent,
+    }))
+}
+
+/// Per-profile tallies for `/profiles/stats` (kept apart from the query so it is testable).
+#[derive(Default)]
+struct ProfileCounts {
+    total: i64,
+    new24h: i64,
+    new7d: i64,
+    new30d: i64,
+    with_avatar: i64,
+    with_banner: i64,
+    with_bio: i64,
+    with_linktree: i64,
+    with_primary_name: i64,
+    avatar: std::collections::BTreeMap<&'static str, i64>,
+    banner: std::collections::BTreeMap<&'static str, i64>,
+    bio: std::collections::BTreeMap<&'static str, i64>,
+}
+
+impl ProfileCounts {
+    fn add(&mut self, p: &kachat_names::Profile, created_at: i64, now: i64) {
+        const DAY: i64 = 86_400_000;
+        self.total += 1;
+        let age = now - created_at;
+        self.new24h += i64::from(age <= DAY);
+        self.new7d += i64::from(age <= 7 * DAY);
+        self.new30d += i64::from(age <= 30 * DAY);
+        let tally = |field: &Option<String>, count: &mut i64, map: &mut std::collections::BTreeMap<&'static str, i64>| {
+            if let Some(url) = field {
+                *count += 1;
+                if let Some(platform) = kachat_names::platform_of(url) {
+                    *map.entry(platform).or_default() += 1;
+                }
+            }
+        };
+        tally(&p.avatar, &mut self.with_avatar, &mut self.avatar);
+        tally(&p.banner, &mut self.with_banner, &mut self.banner);
+        tally(&p.bio, &mut self.with_bio, &mut self.bio);
+        self.with_linktree += i64::from(p.linktree.is_some());
+        self.with_primary_name += i64::from(p.primary_name.is_some());
+    }
 }
 
 #[cfg(test)]
@@ -585,5 +758,30 @@ mod tests {
         assert_eq!(cursor(&Some("40".into())), 40);
         assert_eq!(cursor(&Some("-5".into())), 0);
         assert_eq!(cursor(&Some("junk".into())), 0);
+    }
+
+    #[test]
+    fn stats_count_fields_platforms_and_windows() {
+        const DAY: i64 = 86_400_000;
+        let now = 100 * DAY;
+        let mut c = ProfileCounts::default();
+        let a = kachat_names::parse_profile(r#"{"v":1,"avatar":"https://x.com/a","bio":"https://github.com/a","linktree":"https://linktr.ee/a"}"#).unwrap();
+        let b = kachat_names::parse_profile(r#"{"v":1,"avatar":"https://x.com/b","banner":"https://www.youtube.com/@b"}"#).unwrap();
+        c.add(&a, now - DAY / 2, now);
+        c.add(&b, now - 10 * DAY, now);
+        assert_eq!((c.total, c.new24h, c.new7d, c.new30d), (2, 1, 1, 2));
+        assert_eq!((c.with_avatar, c.with_banner, c.with_bio, c.with_linktree, c.with_primary_name), (2, 1, 1, 1, 0));
+        assert_eq!(c.avatar.get("x"), Some(&2));
+        assert_eq!(c.banner.get("youtube"), Some(&1));
+        assert_eq!(c.bio.get("github"), Some(&1));
+    }
+
+    #[test]
+    fn served_profiles_drop_disallowed_links() {
+        let v = clean_profile(r#"{"v":1,"avatar":"https://x.com/a","banner":"https://github.com/a"}"#);
+        assert_eq!(v["avatar"], "https://x.com/a");
+        assert!(v.get("banner").is_none(), "github is not a banner platform");
+        assert_eq!(v["v"], 1);
+        assert_eq!(clean_profile(r#"{"avatar":"https://x.com/a"}"#), Value::Null);
     }
 }

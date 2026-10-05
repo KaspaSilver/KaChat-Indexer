@@ -64,6 +64,24 @@ impl Follower {
     }
 }
 
+impl Follower {
+    /// [`Self::step`] for the profiles follower: the same reorg-safe order, applying only the
+    /// profile rules (no registry templates needed). Returns the batch and the ids of the
+    /// transactions whose profile record was accepted.
+    pub fn step_profiles<S: ChainSource>(&mut self, src: &mut S) -> Result<(VccBatch, Vec<[u8; 32]>), S::Error> {
+        let batch = src.next_batch(self.checkpoint)?;
+        for block in &batch.removed_blocks {
+            self.registry.undo_block(block);
+        }
+        let applied = batch.accepted.iter().filter(|tx| self.registry.apply_profile_only(tx)).map(|tx| tx.id).collect();
+        if let Some(tip) = batch.tip {
+            self.checkpoint = Some(tip);
+        }
+        self.registry.prune_journal(self.finality_keep);
+        Ok((batch, applied))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +205,60 @@ mod tests {
         assert_eq!(f.registry.utxos.get(&genesis), Some(&crate::ingest::Tracked::Gap(gap)));
         assert_eq!(f.checkpoint, Some(scan_from));
         assert_eq!(src.seen_from[1], Some(block_a), "second pull resumes from the checkpoint");
+    }
+
+    fn profile_tx(id: u8, block: [u8; 32], daa: u64, from: &[u8], to: &[u8], json: &str) -> Tx {
+        Tx {
+            id: [id; 32],
+            inputs: vec![TxInput { previous_outpoint: ([id ^ 0xff; 32], 0), signature_script: vec![], spent_script: from.to_vec() }],
+            outputs: vec![TxOutput { script_public_key: to.to_vec(), value: 1 }],
+            payload: format!("kchat:1:profile:{json}").into_bytes(),
+            accepting_block: block,
+            accepting_daa: daa,
+            block_time: daa as i64,
+        }
+    }
+
+    #[test]
+    fn profiles_follow_newest_wins_and_roll_back() {
+        let alice = b"alice-spk".to_vec();
+        let bob = b"bob-spk".to_vec();
+        let v1 = r#"{"v":1,"avatar":"https://x.com/alice"}"#;
+        let v2 = r#"{"v":1,"avatar":"https://github.com/alice"}"#;
+        let (a, b) = ([0xa1; 32], [0xb2; 32]);
+        let mut src = Fake {
+            batches: std::collections::VecDeque::from(vec![
+                VccBatch {
+                    removed_blocks: vec![],
+                    accepted: vec![
+                        profile_tx(1, a, 10, &alice, &alice, v1),
+                        // Paid *to* alice by bob: not a self-send, ignored.
+                        profile_tx(2, a, 11, &bob, &alice, v2),
+                        // Not a v1 record: ignored.
+                        profile_tx(3, a, 12, &bob, &bob, r#"{"avatar":"https://x.com/b"}"#),
+                    ],
+                    tip: Some(a),
+                },
+                VccBatch { removed_blocks: vec![], accepted: vec![profile_tx(4, b, 20, &alice, &alice, v2)], tip: Some(b) },
+                // Reorg: block b goes, alice is back to v1.
+                VccBatch { removed_blocks: vec![b], accepted: vec![], tip: Some(a) },
+            ]),
+            seen_from: vec![],
+        };
+        let mut f = Follower::new(100);
+        f.checkpoint = Some([0; 32]);
+
+        let (_, applied) = f.step_profiles(&mut src).unwrap();
+        assert_eq!(applied, vec![[1; 32]]);
+        assert_eq!(f.registry.profiles.get(&alice).map(|p| p.0.as_str()), Some(v1));
+        assert!(!f.registry.profiles.contains_key(&bob));
+
+        let (_, applied) = f.step_profiles(&mut src).unwrap();
+        assert_eq!(applied, vec![[4; 32]]);
+        assert_eq!(f.registry.profiles.get(&alice).map(|p| p.0.as_str()), Some(v2));
+
+        f.step_profiles(&mut src).unwrap();
+        assert_eq!(f.registry.profiles.get(&alice).map(|p| p.0.as_str()), Some(v1), "reorg restores the prior record");
+        assert_eq!(f.checkpoint, Some(a));
     }
 }
