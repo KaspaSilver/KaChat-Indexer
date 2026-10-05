@@ -13,6 +13,9 @@ Start block: `KACHAT_PROFILES_SCAN_FROM`, else the manifest's `scanFrom`, else t
 pruning point. A block older than the pruning point falls back to it. `/profiles/*` and
 `/identity/*` work without a manifest (profile-only identity). `GET /profiles/stats` is
 served while the follower runs. Logs are tagged `[profiles]` with a heartbeat.
+`GET /profiles/history?limit=&offset=&address=` serves every save, all time, newest first
+(`{total, items: [{address, txId, savedAt, current, avatar, banner, bio, linktree,
+primaryName}]}`), for the panel's paged "Every profile save" list.
 
 ## Why
 

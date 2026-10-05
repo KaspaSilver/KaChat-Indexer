@@ -689,6 +689,76 @@ async fn compute_stats(pool: &PgPool, status: &ProfilesStatus) -> Result<Value, 
     }))
 }
 
+#[derive(Deserialize)]
+pub struct HistoryQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    /// Only this address's saves.
+    address: Option<String>,
+}
+
+/// `GET /profiles/history?limit=&offset=&address=` — every accepted profile record, all
+/// time, newest first: `{total, items: [{address, txId, savedAt, current, avatar, banner,
+/// bio, linktree, primaryName}]}`. `current` = still the address's live record. For the
+/// panel's numbered pager, like KaPosts' `moderation/recent`. Links only.
+pub async fn profile_history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
+    let pool = state.scheduled_pool.clone();
+    if profiles_status(&pool).await.is_none() {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "the profiles follower is not running");
+    }
+    let limit = q.limit.unwrap_or(25).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let address = match q.address.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => match normalize_address(a) {
+            Some(a) => Some(a),
+            None => return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address"),
+        },
+        None => None,
+    };
+    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM profile_saves WHERE ($1::TEXT IS NULL OR address = $1)")
+        .bind(&address)
+        .fetch_one(&pool)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => return internal(e),
+    };
+    let rows = match sqlx::query(
+        r#"SELECT s.address, s.tx_id, s.block_time, s.profile, (p.tx_id IS NOT NULL) AS current
+           FROM profile_saves s LEFT JOIN names_profiles p ON p.spk = s.spk AND p.tx_id = s.tx_id
+           WHERE ($1::TEXT IS NULL OR s.address = $1)
+           ORDER BY s.block_time DESC, s.daa DESC, s.tx_id DESC
+           LIMIT $2 OFFSET $3"#,
+    )
+    .bind(&address)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let p = r.get::<Option<String>, _>("profile").and_then(|j| kachat_names::parse_profile(&j)).unwrap_or_default();
+            json!({
+                "address": r.get::<String, _>("address"),
+                "txId": hex::encode(r.get::<Vec<u8>, _>("tx_id")),
+                "savedAt": r.get::<i64, _>("block_time"),
+                "current": r.get::<bool, _>("current"),
+                "avatar": p.avatar,
+                "banner": p.banner,
+                "bio": p.bio,
+                "linktree": p.linktree,
+                "primaryName": p.primary_name,
+            })
+        })
+        .collect();
+    Json(json!({ "total": total, "items": items })).into_response()
+}
+
 /// Per-profile tallies for `/profiles/stats` (kept apart from the query so it is testable).
 #[derive(Default)]
 struct ProfileCounts {

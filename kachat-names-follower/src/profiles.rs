@@ -68,6 +68,11 @@ async fn create_schema(pool: &PgPool) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS profile_saves_time ON profile_saves (block_time)",
         "CREATE INDEX IF NOT EXISTS profile_saves_block ON profile_saves (block)",
         "CREATE INDEX IF NOT EXISTS profile_saves_spk ON profile_saves (spk)",
+        // The record itself, for the panel's all-time history (/profiles/history). Saves
+        // indexed before this column existed get it back where it is still the current one.
+        "ALTER TABLE profile_saves ADD COLUMN IF NOT EXISTS profile TEXT",
+        r#"UPDATE profile_saves s SET profile = p.profile FROM names_profiles p
+           WHERE s.profile IS NULL AND s.tx_id = p.tx_id"#,
     ] {
         sqlx::query(stmt).execute(pool).await?;
     }
@@ -230,8 +235,8 @@ pub async fn run(args: &Args) -> Result<()> {
                 let spk = &t.outputs[0].script_public_key;
                 let Some(address) = spk_address(prefix, spk) else { continue };
                 sqlx::query(
-                    r#"INSERT INTO profile_saves (tx_id, spk, address, block, daa, block_time)
-                       VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (tx_id) DO NOTHING"#,
+                    r#"INSERT INTO profile_saves (tx_id, spk, address, block, daa, block_time, profile)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (tx_id) DO NOTHING"#,
                 )
                 .bind(t.id.to_vec())
                 .bind(spk)
@@ -239,6 +244,7 @@ pub async fn run(args: &Args) -> Result<()> {
                 .bind(t.accepting_block.to_vec())
                 .bind(t.accepting_daa as i64)
                 .bind(t.block_time)
+                .bind(std::str::from_utf8(&t.payload).ok().and_then(|p| p.strip_prefix("kchat:1:profile:")))
                 .execute(&mut *tx)
                 .await?;
                 info!("[profiles] saved {address} tx {}", hex::encode(t.id));
