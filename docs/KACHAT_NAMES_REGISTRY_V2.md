@@ -1,5 +1,7 @@
 # `.kachat` names - registry v2 (2026-10-02)
 
+> **Superseded by registry v3** (`docs/KACHAT_NAMES_REGISTRY_V3.md`) once its genesis is sent.
+
 > **Live on testnet-10:**
 > - registry `82f4315c8f7b3e0e76fc2f77466fe7651d2c1fac4e0b5810d4da878a9cfa0f89`
 > - genesis tx `e20325f70db06192b619e6ef161b45b4a24b3cde58b5d2b0188532395175a426`, accepted at DAA

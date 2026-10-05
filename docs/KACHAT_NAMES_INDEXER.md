@@ -1,5 +1,12 @@
 # Indexer handoff: testnet-10 + `.kachat` names and profiles
 
+> **Registry v3 (2026-10-05, genesis pending):** prices move into an on-chain price record
+> (8 shards under their own covenant; register, extend and renew read one). There is a 10-minute
+> `periodMs` clock on testnet. Offers carry the seller, and there is a new `decline` entry. Every
+> dispatch tag that matters changed. The details are in `docs/KACHAT_NAMES_REGISTRY_V3.md`. The
+> API adds `priceCovenantId` to `/names/status`, `seller` to offers, and `GET /names/prices`.
+> Keep following v2 until the v3 manifest lands.
+
 > **Registry v2 (2026-10-02):** names carry `periodStart` (126-byte state). There is a new
 > `extend` entry, and `renew` now opens 10 days before expiry and starts a new period. The
 > details are in `docs/KACHAT_NAMES_REGISTRY_V2.md` in the indexer repo and in KACHAT_NAMES.md
