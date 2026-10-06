@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use kachat_names::follower::VccBatch;
-use kachat_names::ingest::{Tx, TxInput, TxOutput};
+use kachat_names::ingest::{CovenantBinding, Tx, TxInput, TxOutput};
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_rpc_core::model::{
     GetVirtualChainFromBlockV2Response, RpcChainBlockAcceptedTransactions, RpcDataVerbosityLevel, RpcHash,
@@ -140,6 +140,12 @@ fn map_tx(tx: &RpcOptionalTransaction, block: [u8; 32], daa: u64, time: i64) -> 
         .map(|o| TxOutput {
             script_public_key: o.script_public_key.as_ref().map(|s| s.script().to_vec()).unwrap_or_default(),
             value: o.value.unwrap_or(0),
+            // Registry v3 matches covenant outputs on their binding (which input authorized
+            // them, under which covenant id), not on the script alone.
+            covenant: o.covenant.as_ref().and_then(|c| c.0.as_ref()).map(|b| CovenantBinding {
+                authorizing_input: b.0.authorizing_input,
+                covenant_id: b.0.covenant_id.as_bytes(),
+            }),
         })
         .collect();
     Ok(Tx {

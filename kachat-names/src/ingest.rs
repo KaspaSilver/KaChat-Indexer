@@ -13,8 +13,8 @@
 
 use std::collections::HashMap;
 
-use crate::transition::{self, Entry};
-use crate::{decode_sig_script, GapState, NameState, OfferState};
+use crate::transition::{self, Contract, Entry};
+use crate::{decode_sig_script, GapState, NameState, OfferState, PriceState};
 
 /// A transaction outpoint: `(txid, output index)`.
 pub type Outpoint = ([u8; 32], u32);
@@ -25,6 +25,19 @@ pub enum Tracked {
     Gap(GapState),
     Name(NameState),
     Offer(OfferState),
+    /// Registry v3: a price shard (its own covenant).
+    Shard(PriceState),
+}
+
+impl Tracked {
+    pub fn contract(&self) -> Contract {
+        match self {
+            Tracked::Gap(_) => Contract::Gap,
+            Tracked::Name(_) => Contract::Name,
+            Tracked::Offer(_) => Contract::Offer,
+            Tracked::Shard(_) => Contract::Price,
+        }
+    }
 }
 
 /// The per-contract redeem layout from the manifest: `redeem = prefix ‖ state ‖ suffix`,
@@ -46,17 +59,37 @@ impl ContractTemplate {
     }
 }
 
-/// All three contract templates for one network (built from the manifest's artifacts).
+/// The contract templates and rules for one registry (built from the manifest).
+///
+/// Registry v2 manifests give the gap/name/offer templates; v3 adds the price template, the
+/// two covenant ids, `periodMs` and per-contract dispatch tags (docs/KACHAT_NAMES_REGISTRY_V3.md).
+/// Everything version-specific is decided from these, so one applier serves both.
 #[derive(Debug, Clone)]
 pub struct Templates {
     pub gap: ContractTemplate,
     pub name: ContractTemplate,
     pub offer: ContractTemplate,
+    /// Registry v3: the price shard template.
+    pub price: Option<ContractTemplate>,
+    /// Per-contract dispatch tags from the manifest. Empty = the pinned v2 tags.
+    pub tags: Vec<(Contract, [u8; 4], Entry)>,
+    /// One registration period (v3 `periodMs`; a year before).
+    pub period_ms: i64,
+    /// Registry v3: registry outputs must carry this covenant id (and the authorizing input).
+    pub registry_id: Option<[u8; 32]>,
+    /// Registry v3: price shard outputs must carry this covenant id.
+    pub price_id: Option<[u8; 32]>,
 }
 
 impl Templates {
-    /// Build the three templates from a names manifest's `artifacts` (`KachatGap`,
-    /// `KachatName`, `KachatOffer`: `prefixHex`, `suffixHex`, `stateSpan {offset,len}`).
+    /// Registry v2 templates with the pinned tags and a one-year period (tests, old manifests).
+    pub fn new(gap: ContractTemplate, name: ContractTemplate, offer: ContractTemplate) -> Self {
+        Self { gap, name, offer, price: None, tags: Vec::new(), period_ms: transition::YEAR_MS, registry_id: None, price_id: None }
+    }
+
+    /// Build the templates from a names manifest's `artifacts` (`KachatGap`, `KachatName`,
+    /// `KachatOffer`, v3 `KachatPrice`: `prefixHex`, `suffixHex`, `stateSpan {offset,len}`,
+    /// `dispatchTags`), plus v3's `params.periodMs`, `registryCovenantId`, `priceCovenantId`.
     pub fn from_manifest(manifest: &serde_json::Value) -> Option<Self> {
         let one = |contract: &str| -> Option<ContractTemplate> {
             let a = manifest.get("artifacts")?.get(contract)?;
@@ -67,17 +100,77 @@ impl Templates {
                 state_len: a.get("stateSpan")?.get("len")?.as_u64()? as usize,
             })
         };
-        Some(Templates { gap: one("KachatGap")?, name: one("KachatName")?, offer: one("KachatOffer")? })
+        let mut t = Templates::new(one("KachatGap")?, one("KachatName")?, one("KachatOffer")?);
+        let version = manifest
+            .get("registryVersion")
+            .or_else(|| manifest.get("params").and_then(|p| p.get("registryVersion")))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2);
+        let id = |key: &str| manifest.get(key).and_then(|v| v.as_str()).and_then(|s| decode32(s).ok());
+        if version >= 3 {
+            t.price = Some(one("KachatPrice")?);
+            t.registry_id = Some(id("registryCovenantId")?);
+            t.price_id = Some(id("priceCovenantId")?);
+            t.period_ms = manifest.get("params")?.get("periodMs")?.as_i64()?;
+        }
+        // Tags only mean something per contract (v3 reuses none of v2's register/renew/
+        // extend/accept tags), so they are matched against the contract being spent.
+        for (artifact, contract) in [
+            ("KachatGap", Contract::Gap),
+            ("KachatName", Contract::Name),
+            ("KachatOffer", Contract::Offer),
+            ("KachatPrice", Contract::Price),
+        ] {
+            let Some(tags) = manifest.get("artifacts").and_then(|a| a.get(artifact)).and_then(|a| a.get("dispatchTags"))
+            else {
+                continue;
+            };
+            for (name, tag) in tags.as_object()? {
+                let entry = Entry::from_manifest_name(contract, name)?;
+                let bytes: [u8; 4] = hex::decode(tag.as_str()?).ok()?.try_into().ok()?;
+                t.tags.push((contract, bytes, entry));
+            }
+        }
+        if version >= 3 && t.tags.is_empty() {
+            return None; // a v3 manifest must pin its tags
+        }
+        Some(t)
     }
 
-    fn gap_spk(&self, s: &GapState) -> Vec<u8> {
+    /// Registry v3 (price record, seller-bound offers, covenant-checked outputs).
+    pub fn is_v3(&self) -> bool {
+        self.price.is_some()
+    }
+
+    /// The entry a spend of `contract` with this dispatch tag calls.
+    pub fn entry(&self, contract: Contract, tag: &[u8; 4]) -> Option<Entry> {
+        if self.tags.is_empty() {
+            return transition::entry_for_tag(tag).filter(|e| e.contract() == contract);
+        }
+        self.tags.iter().find(|(c, t, _)| *c == contract && t == tag).map(|(_, _, e)| *e)
+    }
+
+    pub fn gap_spk(&self, s: &GapState) -> Vec<u8> {
         self.gap.spk(&s.encode())
     }
-    fn name_spk(&self, s: &NameState) -> Vec<u8> {
+    pub fn name_spk(&self, s: &NameState) -> Vec<u8> {
         self.name.spk(&s.encode())
     }
-    fn offer_spk(&self, s: &OfferState) -> Vec<u8> {
+    pub fn offer_spk(&self, s: &OfferState) -> Vec<u8> {
         self.offer.spk(&s.encode())
+    }
+    /// A shard's script (v3 only; empty otherwise, which matches no output).
+    pub fn price_spk(&self, s: &PriceState) -> Vec<u8> {
+        self.price.as_ref().map(|p| p.spk(&s.encode())).unwrap_or_default()
+    }
+    /// The script of any tracked UTXO.
+    pub fn tracked_spk(&self, t: &Tracked) -> Vec<u8> {
+        match t {
+            Tracked::Gap(g) => self.gap_spk(g),
+            Tracked::Name(n) => self.name_spk(n),
+            Tracked::Offer(o) => self.offer_spk(o),
+            Tracked::Shard(p) => self.price_spk(p),
+        }
     }
 }
 
@@ -96,6 +189,15 @@ pub struct TxInput {
 pub struct TxOutput {
     pub script_public_key: Vec<u8>,
     pub value: u64,
+    /// The output's covenant binding (Toccata), when the node reports one.
+    pub covenant: Option<CovenantBinding>,
+}
+
+/// Which input authorized a covenant output, under which covenant id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CovenantBinding {
+    pub authorizing_input: u16,
+    pub covenant_id: [u8; 32],
 }
 
 /// An accepted transaction, in the shape the applier consumes (the chain reader maps the
@@ -175,15 +277,52 @@ impl Registry {
         self.names().find(|(_, n)| &n.key == key).map(|(o, n)| (*o, *n))
     }
 
-    /// Find the output index whose scriptPublicKey matches `spk`, not already claimed.
-    fn find_output(tx: &Tx, spk: &[u8], used: &mut Vec<usize>) -> Option<usize> {
+    /// Seed a registry v3 price shard from the price genesis.
+    pub fn seed_shard(&mut self, outpoint: Outpoint, shard: PriceState) {
+        self.utxos.insert(outpoint, Tracked::Shard(shard));
+    }
+
+    /// The live price shards, in shard order (registry v3).
+    pub fn shards(&self) -> Vec<(Outpoint, PriceState)> {
+        let mut v: Vec<_> = self
+            .utxos
+            .iter()
+            .filter_map(|(o, t)| match t {
+                Tracked::Shard(p) => Some((*o, *p)),
+                _ => None,
+            })
+            .collect();
+        v.sort_by_key(|(_, p)| p.shard);
+        v
+    }
+
+    /// Find an unclaimed output whose scriptPublicKey is `spk`.
+    ///
+    /// `bind`: registry v3 covenant outputs must also be authorized by that input under that
+    /// covenant id, so a look-alike output someone pays to the same script (no covenant, or
+    /// another input) is never taken for the real continuation. When the node reported no
+    /// covenant on any output of the transaction, the binding is unknown and only the script
+    /// is matched (as in v2).
+    fn find_output(tx: &Tx, spk: &[u8], used: &mut Vec<usize>, bind: Option<(usize, [u8; 32])>) -> Option<usize> {
+        let bindings_known = tx.outputs.iter().any(|o| o.covenant.is_some());
         for (i, o) in tx.outputs.iter().enumerate() {
-            if !used.contains(&i) && o.script_public_key == spk {
-                used.push(i);
-                return Some(i);
+            if used.contains(&i) || o.script_public_key != spk {
+                continue;
             }
+            if let (Some((auth, id)), true) = (bind, bindings_known)
+                && o.covenant != Some(CovenantBinding { authorizing_input: auth as u16, covenant_id: id })
+            {
+                continue;
+            }
+            used.push(i);
+            return Some(i);
         }
         None
+    }
+
+    /// The binding a registry output predicted from input `auth` must carry (v3 only).
+    fn reg_bind(templates: &Templates, auth: usize) -> Option<(usize, [u8; 32])> {
+        templates.registry_id.map(|id| (auth, id))
     }
 
     /// Apply one accepted transaction. Returns the registry events it produced.
@@ -192,7 +331,8 @@ impl Registry {
         // Snapshot the UTXO keys so the undo journal can record exactly what this tx added.
         let before: std::collections::HashSet<Outpoint> = self.utxos.keys().copied().collect();
 
-        // Which tracked UTXOs does this tx spend, and under which entry?
+        // Which tracked UTXOs does this tx spend, and under which entry? A tag only means
+        // something for the contract being spent.
         let mut spends: Vec<(usize, Outpoint, Tracked, Entry, crate::SigScript)> = Vec::new();
         for (idx, input) in tx.inputs.iter().enumerate() {
             let Some(tracked) = self.utxos.get(&input.previous_outpoint).cloned() else {
@@ -201,7 +341,7 @@ impl Registry {
             let Some(sig) = decode_sig_script(&input.signature_script) else {
                 continue;
             };
-            let Some(entry) = transition::entry_for_tag(&sig.dispatch_tag) else {
+            let Some(entry) = templates.entry(tracked.contract(), &sig.dispatch_tag) else {
                 continue;
             };
             spends.push((idx, input.previous_outpoint, tracked, entry, sig));
@@ -215,90 +355,11 @@ impl Registry {
 
         let mut used_outputs: Vec<usize> = Vec::new();
         if !spends.is_empty() {
-
-        // The multi-input exit (gap merge + name release/reclaim + gap absorbed) and the
-        // offer-accept pair are recognised across inputs; everything else is per-name.
-        let has = |e: Entry| spends.iter().any(|s| s.3 == e);
-
-        if has(Entry::GapMerge) {
-            // Exit: collapse the two gaps around the released/reclaimed name.
-            let lo_gap = spends.iter().find_map(|s| match (&s.2, s.3) {
-                (Tracked::Gap(g), Entry::GapMerge) => Some(*g),
-                _ => None,
-            });
-            let hi_gap = spends.iter().find_map(|s| match (&s.2, s.3) {
-                (Tracked::Gap(g), Entry::GapAbsorbed) => Some(*g),
-                _ => None,
-            });
-            if let (Some(lo), Some(hi)) = (lo_gap, hi_gap) {
-                let merged = transition::merge_gaps(&lo, &hi);
-                if let Some(i) = Self::find_output(tx, &templates.gap_spk(&merged), &mut used_outputs) {
-                    self.utxos.insert((tx.id, i as u32), Tracked::Gap(merged));
-                }
-            }
-            for s in &spends {
-                if let Tracked::Name(n) = &s.2 {
-                    let mut e = self.event(if s.3 == Entry::NameReclaim { "reclaim" } else { "release" }, n.key, tx);
-                    e.from = Some(n.owner);
-                    events.push(e);
-                }
-            }
-        } else if has(Entry::GapRegister) {
-            self.apply_register(templates, tx, &spends, &mut used_outputs, &mut events);
-        } else {
-            // Per-name continuations (transfer / list / buy / renew) + offer accept.
-            for (_, _, tracked, entry, sig) in &spends {
-                match (tracked, entry) {
-                    (Tracked::Name(old), Entry::NameTransfer | Entry::NameBuy) => {
-                        let new_owner = sig.args.first().and_then(|a| a.data()).and_then(|d| d.try_into().ok());
-                        if let Some(owner) = new_owner {
-                            let ns = transition::name_transfer(old, owner);
-                            // A transfer co-spent with an offer accept is the offer being taken.
-                            let op = if *entry == Entry::NameBuy {
-                                "sale"
-                            } else if has(Entry::OfferAccept) {
-                                "offer_accepted"
-                            } else {
-                                "transfer"
-                            };
-                            let price = (*entry == Entry::NameBuy).then_some(old.price);
-                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, op, Some(old), price, None);
-                        }
-                    }
-                    (Tracked::Name(old), Entry::NameList) => {
-                        if let Some(price) = sig.args.first().and_then(|a| a.as_i64()) {
-                            let ns = transition::name_list(old, price);
-                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events,
-                                if price == 0 { "delist" } else { "list" }, Some(old), Some(price), None);
-                        }
-                    }
-                    (Tracked::Name(old), Entry::NameRenew) => {
-                        if let Some(years) = sig.args.first().and_then(|a| a.as_i64()) {
-                            let ns = transition::name_renew(old, years);
-                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, "renew", Some(old), None, Some(years));
-                        }
-                    }
-                    (Tracked::Name(old), Entry::NameExtend) => {
-                        if let Some(years) = sig.args.first().and_then(|a| a.as_i64()) {
-                            let ns = transition::name_extend(old, years);
-                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, "extend", Some(old), None, Some(years));
-                        }
-                    }
-                    (Tracked::Offer(offer), Entry::OfferAccept) => {
-                        // The accepted name goes to the buyer; verify a name output matches.
-                        if let Some((_, name)) = self.name_by_key(&offer.key) {
-                            let ns = transition::offer_accept(&name, offer);
-                            self.record_name(templates, tx, &ns, &mut used_outputs, &mut events, "offer_accepted", Some(&name), None, None);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+            self.apply_spends(templates, tx, &spends, &mut used_outputs, &mut events);
         }
 
         // Record the undo entry (§4.1) and consume the spent UTXOs. `added` is whatever this
-        // tx inserted (new gaps/names/offers); `removed` is the spent UTXOs' prior states.
+        // tx inserted (new gaps/names/offers/shards); `removed` is the spent UTXOs' prior states.
         let removed: Vec<(Outpoint, Tracked)> =
             spends.iter().map(|(_, op, t, _, _)| (*op, t.clone())).collect();
         for (op, _) in &removed {
@@ -316,6 +377,169 @@ impl Registry {
         }
 
         events
+    }
+
+    fn apply_spends(
+        &mut self,
+        templates: &Templates,
+        tx: &Tx,
+        spends: &[(usize, Outpoint, Tracked, Entry, crate::SigScript)],
+        used: &mut Vec<usize>,
+        events: &mut Vec<Event>,
+    ) {
+        let has = |e: Entry| spends.iter().any(|s| s.3 == e);
+
+        // Price shards (v3): `use` continues unchanged; `update` (shard 0) rewrites every
+        // shard in the tx, each continuation authorized by that shard's own input.
+        self.apply_price_spends(templates, tx, spends, used, events);
+
+        // Offer exits that carry no name: decline (v3), withdraw, refund.
+        for (_, _, tracked, entry, _) in spends {
+            if let Tracked::Offer(o) = tracked {
+                let op = match entry {
+                    Entry::OfferDecline => "offer_decline",
+                    Entry::OfferWithdraw => "offer_withdraw",
+                    Entry::OfferRefund => "offer_refund",
+                    _ => continue,
+                };
+                let mut e = self.event(op, o.key, tx);
+                e.to = Some(o.buyer);
+                e.from = o.seller;
+                events.push(e);
+            }
+        }
+
+        if has(Entry::GapMerge) {
+            // Exit: collapse the two gaps around the released/reclaimed name.
+            let lo = spends.iter().find_map(|s| match (&s.2, s.3) {
+                (Tracked::Gap(g), Entry::GapMerge) => Some((s.0, *g)),
+                _ => None,
+            });
+            let hi_gap = spends.iter().find_map(|s| match (&s.2, s.3) {
+                (Tracked::Gap(g), Entry::GapAbsorbed) => Some(*g),
+                _ => None,
+            });
+            if let (Some((auth, lo_gap)), Some(hi_gap)) = (lo, hi_gap) {
+                let merged = transition::merge_gaps(&lo_gap, &hi_gap);
+                if let Some(i) = Self::find_output(tx, &templates.gap_spk(&merged), used, Self::reg_bind(templates, auth)) {
+                    self.utxos.insert((tx.id, i as u32), Tracked::Gap(merged));
+                }
+            }
+            for s in spends {
+                if let Tracked::Name(n) = &s.2 {
+                    let mut e = self.event(if s.3 == Entry::NameReclaim { "reclaim" } else { "release" }, n.key, tx);
+                    e.from = Some(n.owner);
+                    events.push(e);
+                }
+            }
+        } else if has(Entry::GapRegister) {
+            self.apply_register(templates, tx, spends, used, events);
+        } else {
+            // Per-name continuations (transfer / list / buy / renew / extend) + offer accept.
+            for (auth, _, tracked, entry, sig) in spends {
+                let auth = *auth;
+                match (tracked, entry) {
+                    (Tracked::Name(old), Entry::NameTransfer | Entry::NameBuy) => {
+                        let new_owner = sig.args.first().and_then(|a| a.data()).and_then(|d| d.try_into().ok());
+                        if let Some(owner) = new_owner {
+                            let ns = transition::name_transfer(old, owner);
+                            // A transfer co-spent with an offer accept is the offer being taken.
+                            let op = if *entry == Entry::NameBuy {
+                                "sale"
+                            } else if has(Entry::OfferAccept) {
+                                "offer_accepted"
+                            } else {
+                                "transfer"
+                            };
+                            let price = (*entry == Entry::NameBuy).then_some(old.price);
+                            self.record_name(templates, tx, auth, &ns, used, events, op, Some(old), price, None);
+                        }
+                    }
+                    (Tracked::Name(old), Entry::NameList) => {
+                        if let Some(price) = sig.args.first().and_then(|a| a.as_i64()) {
+                            let ns = transition::name_list(old, price);
+                            self.record_name(templates, tx, auth, &ns, used, events,
+                                if price == 0 { "delist" } else { "list" }, Some(old), Some(price), None);
+                        }
+                    }
+                    (Tracked::Name(old), Entry::NameRenew) => {
+                        if let Some(years) = sig.args.first().and_then(|a| a.as_i64()) {
+                            let ns = transition::name_renew_with_period(old, years, templates.period_ms);
+                            self.record_name(templates, tx, auth, &ns, used, events, "renew", Some(old), None, Some(years));
+                        }
+                    }
+                    (Tracked::Name(old), Entry::NameExtend) => {
+                        if let Some(years) = sig.args.first().and_then(|a| a.as_i64()) {
+                            let ns = transition::name_extend_with_period(old, years, templates.period_ms);
+                            self.record_name(templates, tx, auth, &ns, used, events, "extend", Some(old), None, Some(years));
+                        }
+                    }
+                    (Tracked::Offer(offer), Entry::OfferAccept) if !has(Entry::NameTransfer) => {
+                        // v2: the accepted name goes to the buyer; verify a name output matches.
+                        // (With a name transfer in the same tx, that spend records it.)
+                        if let Some((_, name)) = self.name_by_key(&offer.key) {
+                            let ns = transition::offer_accept(&name, offer);
+                            self.record_name(templates, tx, auth, &ns, used, events, "offer_accepted", Some(&name), None, None);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn apply_price_spends(
+        &mut self,
+        templates: &Templates,
+        tx: &Tx,
+        spends: &[(usize, Outpoint, Tracked, Entry, crate::SigScript)],
+        used: &mut Vec<usize>,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(price_id) = templates.price_id else { return };
+        let shard_ins: Vec<(usize, PriceState)> = spends
+            .iter()
+            .filter_map(|s| match &s.2 {
+                Tracked::Shard(p) => Some((s.0, *p)),
+                _ => None,
+            })
+            .collect();
+        for (auth, _, tracked, entry, sig) in spends {
+            let Tracked::Shard(cur) = tracked else { continue };
+            match entry {
+                Entry::PriceUse => {
+                    if let Some(i) = Self::find_output(tx, &templates.price_spk(cur), used, Some((*auth, price_id))) {
+                        self.utxos.insert((tx.id, i as u32), Tracked::Shard(*cur));
+                    }
+                }
+                Entry::PriceUpdate => {
+                    // update(newAuthority, n1..n5, sig)
+                    let authority: Option<[u8; 32]> = sig.args.first().and_then(|a| a.data()).and_then(|d| d.try_into().ok());
+                    let prices: Option<Vec<i64>> = (1..=5).map(|k| sig.args.get(k).and_then(|a| a.as_i64())).collect();
+                    let (Some(authority), Some(prices)) = (authority, prices) else { continue };
+                    let prices: [i64; 5] = prices.try_into().unwrap_or([0; 5]);
+                    if prices.iter().any(|p| *p < 0) {
+                        continue;
+                    }
+                    let mut moved = 0;
+                    for (j, other) in &shard_ins {
+                        let next = PriceState { shard: other.shard, authority, prices };
+                        if let Some(i) = Self::find_output(tx, &templates.price_spk(&next), used, Some((*j, price_id))) {
+                            self.utxos.insert((tx.id, i as u32), Tracked::Shard(next));
+                            moved += 1;
+                        }
+                    }
+                    if moved > 0 {
+                        let op = if prices == cur.prices { "price_authority" } else { "prices" };
+                        let mut e = self.event(op, [0u8; 32], tx);
+                        e.from = Some(cur.authority);
+                        e.to = Some(authority);
+                        events.push(e);
+                    }
+                }
+                _ => {} // follow: its continuation is written by update
+            }
+        }
     }
 
     /// Apply only the profile rules (§C) to one accepted transaction: the profiles follower,
@@ -382,12 +606,12 @@ impl Registry {
         used: &mut Vec<usize>,
         events: &mut Vec<Event>,
     ) {
-        let Some((_, _, Tracked::Gap(gap), _, sig)) =
+        let Some((auth, _, Tracked::Gap(gap), _, sig)) =
             spends.iter().find(|s| s.3 == Entry::GapRegister).cloned()
         else {
             return;
         };
-        // register(name, ownerKey, salt, now, years, namePrefix, nameSuffix)
+        // register(name, ownerKey, salt, now, years, namePrefix, nameSuffix[, priceIdx (v3)])
         let name = sig.args.first().and_then(|a| a.data()).map(|d| d.to_vec());
         let owner: Option<[u8; 32]> = sig.args.get(1).and_then(|a| a.data()).and_then(|d| d.try_into().ok());
         let now = sig.args.get(3).and_then(|a| a.as_i64());
@@ -398,13 +622,14 @@ impl Registry {
         if !crate::is_valid_name(&name) {
             return;
         }
-        let (left, right, nm) = transition::register(&gap, &name, owner, now, years);
+        let (left, right, nm) = transition::register_with_period(&gap, &name, owner, now, years, templates.period_ms);
+        let bind = Self::reg_bind(templates, auth);
         for g in [left, right] {
-            if let Some(i) = Self::find_output(tx, &templates.gap_spk(&g), used) {
+            if let Some(i) = Self::find_output(tx, &templates.gap_spk(&g), used, bind) {
                 self.utxos.insert((tx.id, i as u32), Tracked::Gap(g));
             }
         }
-        if let Some(i) = Self::find_output(tx, &templates.name_spk(&nm), used) {
+        if let Some(i) = Self::find_output(tx, &templates.name_spk(&nm), used, bind) {
             self.utxos.insert((tx.id, i as u32), Tracked::Name(nm));
             let mut e = self.event("register", nm.key, tx);
             e.to = Some(nm.owner);
@@ -418,6 +643,7 @@ impl Registry {
         &mut self,
         templates: &Templates,
         tx: &Tx,
+        auth: usize,
         ns: &NameState,
         used: &mut Vec<usize>,
         events: &mut Vec<Event>,
@@ -426,7 +652,7 @@ impl Registry {
         price: Option<i64>,
         years: Option<i64>,
     ) {
-        if let Some(i) = Self::find_output(tx, &templates.name_spk(ns), used) {
+        if let Some(i) = Self::find_output(tx, &templates.name_spk(ns), used, Self::reg_bind(templates, auth)) {
             self.utxos.insert((tx.id, i as u32), Tracked::Name(*ns));
             let mut e = self.event(op, ns.key, tx);
             if let Some(old) = old
@@ -441,22 +667,41 @@ impl Registry {
         }
     }
 
-    /// §B4: an offer-creating tx carries `kchat:1:offer:<keyHex>:<buyerHex>:<refundAfterDaa>`;
-    /// trust it only if `P2SH(offerState)` matches one of the outputs.
+    /// §B4: an offer-creating tx carries `kchat:1:offer:<keyHex>:<buyerHex>:<refundAfterDaa>`
+    /// (v2), or `kchat:1:offer:<keyHex>:<buyerHex>:<sellerHex>:<refundAfterDaa>` (v3, 108-B
+    /// state). Trust it only if `P2SH(offerState)` matches an output that carries no covenant.
     fn apply_offer_marker(&mut self, templates: &Templates, tx: &Tx, events: &mut Vec<Event>) {
         let Ok(text) = std::str::from_utf8(&tx.payload) else { return };
         let Some(rest) = text.strip_prefix("kchat:1:offer:") else { return };
         let parts: Vec<&str> = rest.split(':').collect();
-        let [key_hex, buyer_hex, refund_dec] = parts.as_slice() else { return };
-        let (Ok(key), Ok(buyer)) = (decode32(key_hex), decode32(buyer_hex)) else { return };
-        let Ok(refund_after) = refund_dec.parse::<i64>() else { return };
-        let offer = OfferState { key, buyer, refund_after };
+        let offer = match (templates.offer.state_len, parts.as_slice()) {
+            (75, [key_hex, buyer_hex, refund_dec]) => {
+                let (Ok(key), Ok(buyer), Ok(refund_after)) = (decode32(key_hex), decode32(buyer_hex), refund_dec.parse::<i64>()) else {
+                    return;
+                };
+                OfferState { key, buyer, seller: None, refund_after }
+            }
+            (108, [key_hex, buyer_hex, seller_hex, refund_dec]) => {
+                let (Ok(key), Ok(buyer), Ok(seller), Ok(refund_after)) =
+                    (decode32(key_hex), decode32(buyer_hex), decode32(seller_hex), refund_dec.parse::<i64>())
+                else {
+                    return;
+                };
+                OfferState { key, buyer, seller: Some(seller), refund_after }
+            }
+            _ => return,
+        };
+        if offer.refund_after < 0 {
+            return;
+        }
         let spk = templates.offer_spk(&offer);
         for (i, o) in tx.outputs.iter().enumerate() {
-            if o.script_public_key == spk {
+            if o.script_public_key == spk && o.covenant.is_none() {
                 self.utxos.insert((tx.id, i as u32), Tracked::Offer(offer));
-                let mut e = self.event("offer", key, tx);
-                e.to = Some(buyer);
+                let mut e = self.event("offer", offer.key, tx);
+                e.to = Some(offer.buyer);
+                e.from = offer.seller;
+                e.price = Some(o.value as i64);
                 events.push(e);
                 return;
             }

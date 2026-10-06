@@ -36,11 +36,13 @@ pub struct FollowerStatus {
     pub synced: bool,
     pub grace_ms: i64,
     pub network: Option<String>,
+    /// Registry v3: the price covenant the follower tracks.
+    pub price_covenant_id: Option<String>,
 }
 
 pub async fn follower_status(pool: &PgPool, registry: &str) -> Option<FollowerStatus> {
     let row = sqlx::query(
-        "SELECT registry_covenant_id, network, indexed_daa, synced, grace_ms, updated_at FROM names_state WHERE id = 1",
+        "SELECT registry_covenant_id, network, indexed_daa, synced, grace_ms, updated_at, price_covenant_id FROM names_state WHERE id = 1",
     )
     .fetch_optional(pool)
     .await
@@ -55,7 +57,16 @@ pub async fn follower_status(pool: &PgPool, registry: &str) -> Option<FollowerSt
         synced: row.get::<bool, _>("synced") && fresh,
         grace_ms: row.get("grace_ms"),
         network: row.get("network"),
+        price_covenant_id: row.get("price_covenant_id"),
     })
+}
+
+/// A v3 manifest's price covenant must be the one the follower tracks; v2 has none.
+pub fn same_price_covenant(manifest: Option<&str>, follower: Option<&str>) -> bool {
+    match manifest {
+        None => true,
+        Some(m) => follower.is_some_and(|f| f.eq_ignore_ascii_case(m)),
+    }
 }
 
 fn now_ms() -> i64 {
@@ -79,9 +90,11 @@ async fn ctx(state: &AppState) -> Result<Ctx, Response> {
     let Some(registry) = state.names.manifest.as_ref().and_then(|m| m.registry_covenant_id.clone()) else {
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "names module is off (no manifest)"));
     };
+    // Registry v3: the follower must also follow the manifest's price covenant.
+    let price_id = state.names.manifest.as_ref().and_then(|m| m.price_covenant_id.clone());
     let pool = state.scheduled_pool.clone();
     match follower_status(&pool, &registry).await {
-        Some(s) if s.synced => Ok(Ctx {
+        Some(s) if s.synced && same_price_covenant(price_id.as_deref(), s.price_covenant_id.as_deref()) => Ok(Ctx {
             pool,
             prefix: if s.network.as_deref() == Some("mainnet") { Prefix::Mainnet } else { Prefix::Testnet },
             grace_ms: s.grace_ms,
@@ -185,6 +198,10 @@ fn offer_json(c: &Ctx, r: &PgRow, name: Option<String>) -> Value {
         "createdAt": r.get::<i64, _>("created_at"),
         "refundable": c.indexed_daa >= refund_after,
     });
+    // Registry v3: the owner the offer was made to. The app drops offers without one.
+    if let Some(seller) = r.get::<Option<Vec<u8>>, _>("seller").and_then(|k| owner_address(c.prefix, &k)) {
+        v.as_object_mut().unwrap().insert("seller".into(), json!(seller));
+    }
     if let Some(n) = name {
         v.as_object_mut().unwrap().insert("name".into(), json!(n));
     }
@@ -456,7 +473,48 @@ pub async fn market_activity(State(state): State<Arc<AppState>>, Query(q): Query
         Ok(c) => c,
         Err(e) => return e,
     };
-    events_page(&c, "op IN ('sale', 'list', 'offer', 'offer_accepted')", None, &q).await
+    events_page(&c, "op IN ('sale', 'list', 'offer', 'offer_accepted', 'offer_decline')", None, &q).await
+}
+
+/// `GET /names/prices` (registry v3): the current prices and every live shard, in shard
+/// order. Prices and values are sompi decimal strings; `prices`/`authority` at the top are
+/// the current ones (every shard agrees after a change). 404 on a v2 registry.
+pub async fn prices(State(state): State<Arc<AppState>>) -> Response {
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    if state.names.manifest.as_ref().and_then(|m| m.price_covenant_id.as_ref()).is_none() {
+        return err(StatusCode::NOT_FOUND, "no_price_record", "this registry has no price record (v2)");
+    }
+    let rows = match sqlx::query("SELECT * FROM names_utxos WHERE kind = 'shard' AND NOT refuted ORDER BY shard ASC")
+        .fetch_all(&c.pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let shards: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let prices: Vec<String> =
+                r.get::<Option<String>, _>("prices").unwrap_or_default().split(',').filter(|p| !p.is_empty()).map(String::from).collect();
+            json!({
+                "shard": r.get::<Option<i64>, _>("shard").unwrap_or(0),
+                "outpoint": outpoint(r),
+                "authority": hex::encode(r.get::<Option<Vec<u8>>, _>("authority").unwrap_or_default()),
+                "prices": prices,
+                "value": r.get::<i64, _>("value").to_string(),
+            })
+        })
+        .collect();
+    let first = shards.first();
+    Json(json!({
+        "prices": first.map(|s| s["prices"].clone()).unwrap_or_else(|| json!([])),
+        "authority": first.map(|s| s["authority"].clone()).unwrap_or(Value::Null),
+        "shards": shards,
+    }))
+    .into_response()
 }
 
 /// A stored record as served: re-checked against the per-field allowlist, so a link that
@@ -844,6 +902,14 @@ mod tests {
         assert_eq!(c.avatar.get("x"), Some(&2));
         assert_eq!(c.banner.get("youtube"), Some(&1));
         assert_eq!(c.bio.get("github"), Some(&1));
+    }
+
+    #[test]
+    fn v3_needs_the_follower_on_the_same_price_covenant() {
+        assert!(same_price_covenant(None, None), "v2: no price covenant");
+        assert!(same_price_covenant(Some("AB"), Some("ab")));
+        assert!(!same_price_covenant(Some("ab"), None), "a v2 follower cannot serve a v3 manifest");
+        assert!(!same_price_covenant(Some("ab"), Some("cd")));
     }
 
     #[test]

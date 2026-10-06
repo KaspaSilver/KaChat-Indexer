@@ -412,6 +412,7 @@ impl WebServer {
             // kachat-names-follower tables in names_api (docs/KACHAT_NAMES_APP_CONTRACT.md).
             .route("/names/status", get(crate::names::handle_names_status))
             .route("/names/manifest", get(crate::names::handle_names_manifest))
+            .route("/names/prices", get(crate::names_api::prices))
             .route("/names/expiring", get(crate::names_api::expiring))
             .route("/names/by-owner/:address", get(crate::names_api::by_owner))
             .route("/names/gap/:key", get(crate::names_api::gap_lookup))

@@ -214,7 +214,7 @@ mod tests {
         let offer_op = ([9u8; 32], 0);
         let after: HashMap<_, _> = [
             (([5u8; 32], 2), Tracked::Name(name(key, owner, 0, NOW + 400 * DAY_MS))),
-            (offer_op, Tracked::Offer(OfferState { key, buyer, refund_after: 10 })),
+            (offer_op, Tracked::Offer(OfferState { key, buyer, seller: None, refund_after: 10 })),
         ]
         .into();
         let values: HashMap<_, _> = [(offer_op, 900_000_000u64)].into();
@@ -231,7 +231,7 @@ mod tests {
     fn offer_accept_tells_buyer_and_pays_seller_the_offer() {
         let (key, seller, buyer) = ([1u8; 32], [2u8; 32], [3u8; 32]);
         let offer_op = ([8u8; 32], 0);
-        let before: HashMap<_, _> = [(offer_op, Tracked::Offer(OfferState { key, buyer, refund_after: 10 }))].into();
+        let before: HashMap<_, _> = [(offer_op, Tracked::Offer(OfferState { key, buyer, seller: None, refund_after: 10 }))].into();
         let values: HashMap<_, _> = [(offer_op, 1_000_000_000u64)].into();
         let names: HashMap<_, _> = [(key, "bravo".to_string())].into();
         let inputs: HashMap<_, _> = [([7u8; 32], vec![([6u8; 32], 2), offer_op])].into();

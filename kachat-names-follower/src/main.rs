@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use kachat_names::follower::{ChainSource, Follower, VccBatch};
 use kachat_names::ingest::{Outpoint, Templates, Tracked};
-use kachat_names::GapState;
+use kachat_names::{GapState, PriceState};
 use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_rpc_core::api::rpc::RpcApi;
 use sqlx::postgres::PgPoolOptions;
@@ -96,6 +96,11 @@ struct Manifest {
     grace_ms: i64,
     renew_window_ms: i64,
     templates: Templates,
+    /// 2 or 3 (docs/KACHAT_NAMES_REGISTRY_V3.md).
+    version: i32,
+    /// Registry v3: the price covenant id and the K genesis shards.
+    price_covenant_id: Option<String>,
+    price_shards: Vec<(Outpoint, PriceState)>,
 }
 
 fn hex32(v: &serde_json::Value, what: &str) -> Result<[u8; 32]> {
@@ -116,21 +121,64 @@ fn read_manifest(path: &str) -> Result<Manifest> {
         .ok_or_else(|| anyhow!("manifest: no genesis KachatGap output"))?;
     let genesis_txid = genesis["txid"].as_str().ok_or_else(|| anyhow!("manifest: no genesis.txid"))?;
     let grace_ms = raw["params"]["graceMs"].as_i64().unwrap_or(0);
+    let templates = Templates::from_manifest(&raw).ok_or_else(|| anyhow!("manifest: incomplete artifacts"))?;
+    let version = if templates.is_v3() { 3 } else { 2 };
+
+    // Verify both geneses against the templates (as the app's manifest check does): the
+    // genesis gap, and v3's K price shards, must each be exactly their deployed scripts.
+    let gap_out_spk = gap0["scriptPublicKey"].as_str().unwrap_or("");
+    let genesis_gap = GapState { lo: hex32(&gap0["state"]["lo"], "genesis gap lo")?, hi: hex32(&gap0["state"]["hi"], "genesis gap hi")? };
+    if !gap_out_spk.is_empty() && hex::encode(templates.gap_spk(&genesis_gap)) != gap_out_spk {
+        bail!("manifest: the genesis gap does not hash to its deployed script");
+    }
+    let mut price_shards = Vec::new();
+    let mut price_covenant_id = None;
+    if templates.is_v3() {
+        if raw["registryVersion"].as_u64() != Some(3) {
+            bail!("manifest: has a price template but registryVersion is not 3");
+        }
+        let pg = &raw["priceGenesis"];
+        let txid = hex32(&pg["txid"], "priceGenesis.txid")?;
+        for o in pg["authorizedOutputs"].as_array().ok_or_else(|| anyhow!("manifest: no priceGenesis.authorizedOutputs"))? {
+            let st = &o["state"];
+            let prices: Vec<i64> = st["prices"].as_array().map(|a| a.iter().filter_map(|p| p.as_i64()).collect()).unwrap_or_default();
+            let shard = PriceState {
+                shard: st["shard"].as_i64().ok_or_else(|| anyhow!("manifest: shard without a number"))?,
+                authority: hex32(&st["authority"], "shard authority")?,
+                prices: prices.try_into().map_err(|_| anyhow!("manifest: a shard without 5 prices"))?,
+            };
+            if hex::encode(templates.price_spk(&shard)) != o["scriptPublicKey"].as_str().unwrap_or("") {
+                bail!("manifest: price shard {} does not hash to its deployed script", shard.shard);
+            }
+            price_shards.push(((txid, o["index"].as_u64().unwrap_or(0) as u32), shard));
+        }
+        let expected = raw["params"]["priceShards"].as_u64().unwrap_or(8) as usize;
+        if price_shards.len() != expected {
+            bail!("manifest: {} price shards, expected {expected}", price_shards.len());
+        }
+        price_covenant_id = raw["priceCovenantId"].as_str().map(str::to_lowercase);
+    }
     Ok(Manifest {
         registry: registry.to_lowercase(),
         prefix,
         genesis_outpoint: (hex32(&genesis["txid"], "genesis.txid")?, gap0["index"].as_u64().unwrap_or(0) as u32),
-        genesis_gap: GapState {
-            lo: hex32(&gap0["state"]["lo"], "genesis gap lo")?,
-            hi: hex32(&gap0["state"]["hi"], "genesis gap hi")?,
+        genesis_gap,
+        // v3: the price genesis comes first, and an authority price change may follow it
+        // before the registry genesis, so scanning starts from the earlier of the two.
+        scan_from: if templates.is_v3() && raw["priceGenesis"]["scanFrom"].is_string() {
+            hex32(&raw["priceGenesis"]["scanFrom"], "priceGenesis.scanFrom")?
+        } else {
+            hex32(&genesis["scanFrom"], "genesis.scanFrom")?
         },
-        scan_from: hex32(&genesis["scanFrom"], "genesis.scanFrom")?,
         genesis_txid: genesis_txid.to_lowercase(),
         network,
         grace_ms,
         // Registry v2: renewing opens this long before expiry (10 days).
         renew_window_ms: raw["params"]["renewWindowMs"].as_i64().unwrap_or(864_000_000),
-        templates: Templates::from_manifest(&raw).ok_or_else(|| anyhow!("manifest: incomplete artifacts"))?,
+        templates,
+        version,
+        price_covenant_id,
+        price_shards,
     })
 }
 
@@ -154,20 +202,12 @@ fn spk_address(prefix: Prefix, spk: &[u8]) -> Option<String> {
     Some(Address::new(prefix, version, payload).to_string())
 }
 
-fn tracked_spk(t: &Templates, tracked: &Tracked) -> Vec<u8> {
-    match tracked {
-        Tracked::Gap(g) => t.gap.spk(&g.encode()),
-        Tracked::Name(n) => t.name.spk(&n.encode()),
-        Tracked::Offer(o) => t.offer.spk(&o.encode()),
-    }
-}
-
 /// §4.2: every live row must still be an unspent output on the node. Returns the outpoints
 /// the node does not have.
 async fn self_test(node: &Node, m: &Manifest, reg: &kachat_names::ingest::Registry) -> Result<HashSet<Outpoint>> {
     let mut by_address: HashMap<String, Vec<Outpoint>> = HashMap::new();
     for (op, tracked) in &reg.utxos {
-        let spk = tracked_spk(&m.templates, tracked);
+        let spk = m.templates.tracked_spk(tracked);
         let addr = spk_address(m.prefix, &spk).ok_or_else(|| anyhow!("unaddressable registry script"))?;
         by_address.entry(addr).or_default().push(*op);
     }
@@ -233,7 +273,14 @@ async fn main() {
 async fn run(args: Args) -> Result<()> {
     let manifest = args.manifest.as_deref().ok_or_else(|| anyhow!("KACHAT_NAMES_MANIFEST is not set"))?;
     let m = read_manifest(manifest)?;
-    info!("[names] registry {} on {} (scanFrom {})", m.registry, m.network, hex::encode(m.scan_from));
+    info!(
+        "[names] registry v{} {} on {} (scanFrom {}){}",
+        m.version,
+        m.registry,
+        m.network,
+        hex::encode(m.scan_from),
+        m.price_covenant_id.as_deref().map(|p| format!(", price covenant {p}, {} shards", m.price_shards.len())).unwrap_or_default()
+    );
     if args.probe {
         return probe(&args, &m).await;
     }
@@ -251,7 +298,19 @@ async fn run(args: Args) -> Result<()> {
     // A different registry (new genesis / other network) starts from scratch.
     if store::stored_registry(&pool).await?.as_deref() != Some(m.registry.as_str()) {
         info!("[names] fresh registry tables for {}", m.registry);
-        store::reset(&pool, &m.registry, &m.network, &m.genesis_txid, m.grace_ms).await?;
+        store::reset(
+            &pool,
+            &store::RegistryInfo {
+                registry: &m.registry,
+                network: &m.network,
+                genesis_txid: &m.genesis_txid,
+                grace_ms: m.grace_ms,
+                price_covenant_id: m.price_covenant_id.as_deref(),
+                version: m.version,
+                period_ms: m.templates.period_ms,
+            },
+        )
+        .await?;
     }
     let (registry, mut meta, mut status) = store::load(&pool).await?;
     let mut follower = Follower::new(args.journal_keep);
@@ -265,6 +324,11 @@ async fn run(args: Args) -> Result<()> {
             follower.seed(m.scan_from, m.genesis_outpoint, m.genesis_gap);
             // The genesis gap's value is in the manifest; its creation time isn't known here.
             meta.insert(m.genesis_outpoint, UtxoMeta { value: 0, created_at: 0, created_daa: 0 });
+            // Registry v3: the price genesis (sent first) seeds the K shards.
+            follower.seed_shards(&m.price_shards);
+            for (op, _) in &m.price_shards {
+                meta.insert(*op, UtxoMeta { value: 0, created_at: 0, created_daa: 0 });
+            }
             info!("[names] seeded genesis gap at {}:{}", hex::encode(m.genesis_outpoint.0), m.genesis_outpoint.1);
         }
     }
@@ -451,6 +515,7 @@ async fn probe(args: &Args, m: &Manifest) -> Result<()> {
     info!("[names] [probe] connected to {}", args.node_url);
     let mut follower = Follower::new(args.journal_keep);
     follower.seed(m.scan_from, m.genesis_outpoint, m.genesis_gap);
+    follower.seed_shards(&m.price_shards);
     let mut names_by_key: HashMap<[u8; 32], String> = HashMap::new();
     let (mut blocks, mut txs, mut indexed_daa) = (0usize, 0usize, 0u64);
     let mut window = Window::default();
@@ -509,7 +574,7 @@ async fn probe(args: &Args, m: &Manifest) -> Result<()> {
     let (gaps, offers) = follower.registry.utxos.values().fold((0, 0), |(g, o), t| match t {
         Tracked::Gap(_) => (g + 1, o),
         Tracked::Offer(_) => (g, o + 1),
-        Tracked::Name(_) => (g, o),
+        Tracked::Name(_) | Tracked::Shard(_) => (g, o),
     });
     info!(
         "[names] [probe] caught up at DAA {indexed_daa} after {blocks} batch(es), {txs} accepted txs: {} names {:?}, {gaps} gaps, {offers} offers, {} profiles",
@@ -561,6 +626,28 @@ mod tests {
         let p2sh = hex::decode("aa2091e1c42572eec31a4bdfab6f4fe298fe51cb0934ac6f2cdb87e1052082744cc987").unwrap();
         assert!(spk_address(Prefix::Testnet, &p2sh).unwrap().starts_with("kaspatest:p"));
         assert_eq!(spk_address(Prefix::Testnet, &[0x51]), None);
+    }
+
+    #[test]
+    fn reads_the_v3_vectors_manifest() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../KaChat/KaChatTests/KachatNamesVectors.json");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: no v3 vectors");
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // The dry run has no chain, so no scan blocks: give it two.
+        let mut manifest = v["manifest"].clone();
+        manifest["genesis"]["scanFrom"] = serde_json::json!("22".repeat(32));
+        manifest["priceGenesis"]["scanFrom"] = serde_json::json!("11".repeat(32));
+        let dir = std::env::temp_dir().join("kachat-names-v3-manifest.json");
+        std::fs::write(&dir, manifest.to_string()).unwrap();
+        let m = read_manifest(dir.to_str().unwrap()).expect("the v3 manifest reads and both geneses verify");
+        assert_eq!(m.version, 3);
+        assert_eq!(m.price_shards.len(), 8);
+        assert_eq!(m.templates.period_ms, 600_000);
+        assert_eq!(m.price_covenant_id.as_deref(), v["manifest"]["priceCovenantId"].as_str());
+        assert_eq!(hex::encode(m.scan_from), "11".repeat(32), "v3 scans from the price genesis");
     }
 
     #[test]

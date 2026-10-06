@@ -6,6 +6,16 @@
 > in kachat-domains (branch `v3`), and v2's will be archived in `manifests/v2/`. When it lands:
 > re-point `KACHAT_NAMES_MANIFEST_TESTNET` at it and drop the v2 follower state.
 
+> **Indexer: implemented (2026-10-06), dormant until the genesis.** One follower serves v2
+> and v3; everything version-specific comes from the manifest (`registryVersion: 3`, the
+> `KachatPrice` artifact, both covenant ids, `periodMs`, per-contract `dispatchTags`). It
+> replays all 38 v3 vector transactions and the frozen 32 v2 ones
+> (`kachat-names/testdata/vectors-v2.json`) exactly. v3 outputs are matched on their covenant
+> binding (authorizing input + covenant id), so a look-alike output is never tracked. A v3
+> manifest is verified at start (the genesis gap and all K shards must hash to their deployed
+> scripts) and scanning starts at `priceGenesis.scanFrom`. Switching over = point
+> `KACHAT_NAMES_MANIFEST_TESTNET` at the v3 manifest: a new registry id resets the tables.
+
 v3 adds four things. Contracts are immutable, so this is a **new registry**; v2's test names are
 left behind, as v1's were.
 

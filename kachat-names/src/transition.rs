@@ -4,7 +4,8 @@
 //! The follower pairs each with a **P2SH verify** against the actual output
 //! (`p2sh(prefix ‖ computed ‖ suffix) == output.spk`): a wrong computation simply fails
 //! to verify and is skipped, so these can never write a bad state — they only decide what
-//! the follower looks for. `YEAR` is 365 days.
+//! the follower looks for. A period is the manifest's `periodMs` (registry v3); v1/v2
+//! manifests have none and use [`YEAR_MS`] (365 days).
 
 use crate::{GapState, NameState, OfferState};
 
@@ -16,6 +17,8 @@ pub enum Contract {
     Gap,
     Name,
     Offer,
+    /// Registry v3: a price shard under the price covenant.
+    Price,
 }
 
 /// A contract entry, identified by its 4-byte dispatch tag (§B3).
@@ -35,15 +38,49 @@ pub enum Entry {
     OfferAccept,
     OfferWithdraw,
     OfferRefund,
+    /// Registry v3: the seller sends the offer back to the buyer.
+    OfferDecline,
+    /// Registry v3 price shard: read by a register/extend/renew; continues unchanged.
+    PriceUse,
+    /// Registry v3: shard 0 rewrites every shard (authority-signed).
+    PriceUpdate,
+    /// Registry v3: shards 1..K-1 in a price change.
+    PriceFollow,
 }
 
 impl Entry {
+    /// The entry a manifest `dispatchTags` key names, for the contract that holds it.
+    pub fn from_manifest_name(contract: Contract, name: &str) -> Option<Entry> {
+        use Entry::*;
+        Some(match (contract, name) {
+            (Contract::Gap, "register") => GapRegister,
+            (Contract::Gap, "merge") => GapMerge,
+            (Contract::Gap, "absorbed") => GapAbsorbed,
+            (Contract::Name, "transfer") => NameTransfer,
+            (Contract::Name, "list") => NameList,
+            (Contract::Name, "buy") => NameBuy,
+            (Contract::Name, "renew") => NameRenew,
+            (Contract::Name, "extend") => NameExtend,
+            (Contract::Name, "release") => NameRelease,
+            (Contract::Name, "reclaim") => NameReclaim,
+            (Contract::Offer, "accept") => OfferAccept,
+            (Contract::Offer, "withdraw") => OfferWithdraw,
+            (Contract::Offer, "refund") => OfferRefund,
+            (Contract::Offer, "decline") => OfferDecline,
+            (Contract::Price, "use") => PriceUse,
+            (Contract::Price, "update") => PriceUpdate,
+            (Contract::Price, "follow") => PriceFollow,
+            _ => None?,
+        })
+    }
+
     pub fn contract(self) -> Contract {
         use Entry::*;
         match self {
             GapRegister | GapMerge | GapAbsorbed => Contract::Gap,
             NameTransfer | NameList | NameBuy | NameRenew | NameExtend | NameRelease | NameReclaim => Contract::Name,
-            OfferAccept | OfferWithdraw | OfferRefund => Contract::Offer,
+            OfferAccept | OfferWithdraw | OfferRefund | OfferDecline => Contract::Offer,
+            PriceUse | PriceUpdate | PriceFollow => Contract::Price,
         }
     }
 
@@ -58,11 +95,13 @@ impl Entry {
                 | Entry::OfferAccept
                 | Entry::OfferWithdraw
                 | Entry::OfferRefund
+                | Entry::OfferDecline
         )
     }
 }
 
-/// Map a dispatch tag to its entry. Tags are pinned in the manifest + spec (§B3).
+/// Map a registry **v2** dispatch tag to its entry (the fallback for a manifest without
+/// `dispatchTags`). v3 tags are per contract and come from the manifest (`Templates::entry`).
 pub fn entry_for_tag(tag: &[u8; 4]) -> Option<Entry> {
     Some(match tag {
         [0x86, 0x67, 0xaf, 0x5e] => Entry::GapRegister,
@@ -94,6 +133,18 @@ pub fn register(
     now_ms: i64,
     years: i64,
 ) -> (GapState, GapState, NameState) {
+    register_with_period(gap, name, owner_key, now_ms, years, YEAR_MS)
+}
+
+/// [`register`] with the manifest's period (registry v3: `periodMs`).
+pub fn register_with_period(
+    gap: &GapState,
+    name: &[u8],
+    owner_key: [u8; 32],
+    now_ms: i64,
+    years: i64,
+    period_ms: i64,
+) -> (GapState, GapState, NameState) {
     let key = crate::name_key(name);
     let left = GapState { lo: gap.lo, hi: key };
     let right = GapState { lo: key, hi: gap.hi };
@@ -103,7 +154,7 @@ pub fn register(
         owner: owner_key,
         price: 0,
         period_start: now_ms,
-        expires_at: now_ms + years * YEAR_MS,
+        expires_at: now_ms + years * period_ms,
     };
     (left, right, nm)
 }
@@ -126,12 +177,22 @@ pub fn name_buy(name: &NameState, new_owner: [u8; 32]) -> NameState {
 /// name `renew(years)` (v2): a new paid period starting at the OLD expiry (even in grace):
 /// `periodStart = old expiresAt`, `expiresAt = old expiresAt + years·YEAR`.
 pub fn name_renew(name: &NameState, years: i64) -> NameState {
-    NameState { period_start: name.expires_at, expires_at: name.expires_at + years * YEAR_MS, ..*name }
+    name_renew_with_period(name, years, YEAR_MS)
+}
+
+/// [`name_renew`] with the manifest's period.
+pub fn name_renew_with_period(name: &NameState, years: i64, period_ms: i64) -> NameState {
+    NameState { period_start: name.expires_at, expires_at: name.expires_at + years * period_ms, ..*name }
 }
 
 /// name `extend(years)` (v2): more years on the current period; `periodStart` unchanged.
 pub fn name_extend(name: &NameState, years: i64) -> NameState {
-    NameState { expires_at: name.expires_at + years * YEAR_MS, ..*name }
+    name_extend_with_period(name, years, YEAR_MS)
+}
+
+/// [`name_extend`] with the manifest's period.
+pub fn name_extend_with_period(name: &NameState, years: i64, period_ms: i64) -> NameState {
+    NameState { expires_at: name.expires_at + years * period_ms, ..*name }
 }
 
 /// offer `accept` moves the name to the offer's buyer (price 0); the offer is gone.

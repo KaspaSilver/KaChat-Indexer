@@ -63,7 +63,7 @@ fn state_roundtrip() {
     assert_eq!(dec, name);
     assert_eq!(dec.name_str(), "alice");
 
-    let offer = OfferState { key: name_key(b"alice"), buyer: [9u8; 32], refund_after: 600_100_000 };
+    let offer = OfferState { key: name_key(b"alice"), buyer: [9u8; 32], seller: None, refund_after: 600_100_000 };
     assert_eq!(OfferState::decode(&offer.encode()), Some(offer));
 }
 
@@ -238,6 +238,16 @@ fn matches_generated_vectors() {
     assert_eq!(hex::encode(offer.key), st["offer"]["key"].as_str().unwrap());
     assert_eq!(hex::encode(offer.buyer), st["offer"]["buyer"].as_str().unwrap());
     assert_eq!(offer.refund_after, st["offer"]["refundAfter"].as_i64().unwrap());
+    // Registry v3: the offer names its seller (108 B).
+    if let Some(seller) = st["offer"]["seller"].as_str() {
+        assert_eq!(offer.seller.map(hex::encode).as_deref(), Some(seller), "offer seller (v3)");
+    }
+    assert_eq!(hex::encode(offer.encode()), st["offer"]["state"].as_str().unwrap(), "offer re-encodes");
+    // Registry v3: a price shard state round-trips.
+    if let Some(price) = st.get("price").filter(|p| !p.is_null()) {
+        let p = PriceState::decode(&h(price["state"].as_str().unwrap())).expect("price state decodes");
+        assert_eq!(hex::encode(p.encode()), price["state"].as_str().unwrap(), "price re-encodes");
+    }
 
     eprintln!("vectors cross-check passed");
 }

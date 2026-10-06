@@ -31,6 +31,9 @@ pub struct NamesManifest {
     pub network: Option<String>,
     #[serde(rename = "registryCovenantId", default)]
     pub registry_covenant_id: Option<String>,
+    /// Registry v3: the price covenant (docs/KACHAT_NAMES_REGISTRY_V3.md).
+    #[serde(rename = "priceCovenantId", default)]
+    pub price_covenant_id: Option<String>,
     /// The genesis block of the registry. The live manifest nests the tx id + scan
     /// start here (`genesis.txid`, `genesis.scanFrom`).
     #[serde(default)]
@@ -145,7 +148,10 @@ pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl Int
         Some(r) => crate::names_api::follower_status(&state.scheduled_pool, r).await,
         None => None,
     };
-    let synced = follower.as_ref().is_some_and(|f| f.synced);
+    let manifest_price = n.manifest.as_ref().and_then(|m| m.price_covenant_id.clone());
+    let synced = follower.as_ref().is_some_and(|f| {
+        f.synced && crate::names_api::same_price_covenant(manifest_price.as_deref(), f.price_covenant_id.as_deref())
+    });
     let indexed_daa = follower.as_ref().map(|f| f.indexed_daa).unwrap_or(0);
     (
         StatusCode::OK,
@@ -153,6 +159,10 @@ pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl Int
             "network": n.manifest.as_ref().and_then(|m| m.network.clone()),
             "registryCovenantId": if synced { manifest_registry.clone() } else { None },
             "manifestRegistryCovenantId": manifest_registry,
+            // Registry v3: reported only once synced, exactly like registryCovenantId (the
+            // app uses this indexer only when both match its manifest).
+            "priceCovenantId": if synced { manifest_price.clone() } else { None },
+            "manifestPriceCovenantId": manifest_price,
             "genesisTxId": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.txid.clone()),
             "scanFrom": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.scan_from.clone()),
             "indexedDaa": indexed_daa,

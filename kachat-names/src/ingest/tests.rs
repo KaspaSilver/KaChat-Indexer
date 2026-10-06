@@ -7,7 +7,7 @@ fn templates() -> Templates {
     // Arbitrary but self-consistent prefix/suffix (the applier only needs them to build
     // and match P2SH); real deployments load them from the manifest.
     let t = |len| ContractTemplate { prefix: vec![0x6b], suffix: vec![0xaa, 0xbb, 0xcc], state_offset: 1, state_len: len };
-    Templates { gap: t(66), name: t(126), offer: t(75) }
+    Templates::new(t(66), t(126), t(75))
 }
 
 /// Minimal LE sign-magnitude script number (how int args travel).
@@ -63,7 +63,7 @@ fn sig_script(args: &[Vec<u8>], tag: [u8; 4], redeem: &[u8]) -> Vec<u8> {
 }
 
 fn out(spk: Vec<u8>, value: u64) -> TxOutput {
-    TxOutput { script_public_key: spk, value }
+    TxOutput { script_public_key: spk, value, covenant: None }
 }
 
 const BOND: u64 = 100_000_000;
@@ -204,7 +204,7 @@ fn offer_marker_tracks_the_offer() {
     let mut reg = Registry::new();
     let key = name_key(b"alice");
     let buyer = [8u8; 32];
-    let offer = OfferState { key, buyer, refund_after: 600_100_000 };
+    let offer = OfferState { key, buyer, seller: None, refund_after: 600_100_000 };
     let payload = format!("kchat:1:offer:{}:{}:{}", hex::encode(key), hex::encode(buyer), offer.refund_after);
 
     let tx = Tx {
@@ -344,7 +344,7 @@ fn undo_restores_a_replaced_profile() {
     let t = templates();
     let mut reg = Registry::new();
     let addr = vec![0xab, 0xcd];
-    let out_self = TxOutput { script_public_key: addr.clone(), value: 1 };
+    let out_self = TxOutput { script_public_key: addr.clone(), value: 1, covenant: None };
     let self_input = TxInput { spent_script: addr.clone(), previous_outpoint: ([0x77; 32], 0), signature_script: vec![] };
     let mk = |id: [u8; 8], daa: u64, block: [u8; 32], handle: &str| Tx {
         id: { let mut x = [0u8; 32]; x[..8].copy_from_slice(&id); x },
@@ -377,7 +377,7 @@ fn a_profile_paid_to_someone_else_is_ignored() {
     let tx = Tx {
         id: [0x99; 32],
         inputs: vec![TxInput { spent_script: attacker, previous_outpoint: ([0x55; 32], 0), signature_script: vec![] }],
-        outputs: vec![TxOutput { script_public_key: victim.clone(), value: 1 }],
+        outputs: vec![TxOutput { script_public_key: victim.clone(), value: 1, covenant: None }],
         payload: b"kchat:1:profile:{\"v\":1,\"linktree\":\"https://linktr.ee/evil\"}".to_vec(),
         accepting_block: [0xe0; 32],
         accepting_daa: 1,
@@ -403,7 +403,7 @@ fn prune_journal_keeps_recent() {
         let tx = Tx {
             id: { let mut x = [0u8; 32]; x[0] = i as u8; x },
             inputs: vec![TxInput { spent_script: addr.clone(), previous_outpoint: ([0x77; 32], 0), signature_script: vec![] }],
-            outputs: vec![TxOutput { script_public_key: addr.clone(), value: 1 }],
+            outputs: vec![TxOutput { script_public_key: addr.clone(), value: 1, covenant: None }],
             payload: b"kchat:1:profile:{\"v\":1,\"social\":\"https://x.com/a\"}".to_vec(),
             accepting_block: { let mut b = [0u8; 32]; b[0] = i as u8; b },
             accepting_daa: i,

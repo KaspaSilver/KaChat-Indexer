@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use kachat_names::ingest::{Event, Outpoint, Registry, Tracked};
-use kachat_names::{GapState, NameState, OfferState};
+use kachat_names::{GapState, NameState, OfferState, PriceState};
 use sqlx::{PgPool, Row};
 
 /// What the engine doesn't keep about a tracked UTXO but the API serves: its value and when
@@ -63,6 +63,15 @@ pub async fn create_schema(pool: &PgPool) -> Result<()> {
         )"#,
         // Registry v2 added periodStart; tables created before it get the column here.
         "ALTER TABLE names_utxos ADD COLUMN IF NOT EXISTS period_start BIGINT",
+        // Registry v3 (docs/KACHAT_NAMES_REGISTRY_V3.md): offers name their seller, and price
+        // shards are tracked rows (kind 'shard': shard, authority, prices "p1,..,p5").
+        "ALTER TABLE names_utxos ADD COLUMN IF NOT EXISTS seller BYTEA",
+        "ALTER TABLE names_utxos ADD COLUMN IF NOT EXISTS shard BIGINT",
+        "ALTER TABLE names_utxos ADD COLUMN IF NOT EXISTS authority BYTEA",
+        "ALTER TABLE names_utxos ADD COLUMN IF NOT EXISTS prices TEXT",
+        "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS price_covenant_id TEXT",
+        "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS registry_version INTEGER",
+        "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS period_ms BIGINT",
         "CREATE INDEX IF NOT EXISTS names_utxos_key ON names_utxos (key)",
         "CREATE INDEX IF NOT EXISTS names_utxos_owner ON names_utxos (owner)",
         "CREATE INDEX IF NOT EXISTS names_utxos_buyer ON names_utxos (buyer)",
@@ -113,20 +122,37 @@ pub async fn stored_registry(pool: &PgPool) -> Result<Option<String>> {
         .await?)
 }
 
+/// What a reset records about the registry the tables follow.
+pub struct RegistryInfo<'a> {
+    pub registry: &'a str,
+    pub network: &'a str,
+    pub genesis_txid: &'a str,
+    pub grace_ms: i64,
+    /// Registry v3: the price covenant id.
+    pub price_covenant_id: Option<&'a str>,
+    pub version: i32,
+    pub period_ms: i64,
+}
+
 /// Wipe everything and record which registry the tables now follow.
-pub async fn reset(pool: &PgPool, registry: &str, network: &str, genesis_txid: &str, grace_ms: i64) -> Result<()> {
+pub async fn reset(pool: &PgPool, info: &RegistryInfo<'_>) -> Result<()> {
     let mut tx = pool.begin().await?;
     // names_profiles is not ours: the profiles follower owns it (docs/KACHAT_PROFILES.md).
     for t in ["names_utxos", "names_history", "names_reminders", "names_state"] {
         sqlx::query(&format!("DELETE FROM {t}")).execute(&mut *tx).await?;
     }
     sqlx::query(
-        "INSERT INTO names_state (id, registry_covenant_id, network, genesis_txid, grace_ms) VALUES (1, $1, $2, $3, $4)",
+        r#"INSERT INTO names_state (id, registry_covenant_id, network, genesis_txid, grace_ms, price_covenant_id,
+               registry_version, period_ms)
+           VALUES (1, $1, $2, $3, $4, $5, $6, $7)"#,
     )
-    .bind(registry)
-    .bind(network)
-    .bind(genesis_txid)
-    .bind(grace_ms)
+    .bind(info.registry)
+    .bind(info.network)
+    .bind(info.genesis_txid)
+    .bind(info.grace_ms)
+    .bind(info.price_covenant_id)
+    .bind(info.version)
+    .bind(info.period_ms)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -160,8 +186,23 @@ pub async fn load(pool: &PgPool) -> Result<(Registry, HashMap<Outpoint, UtxoMeta
             "offer" => Tracked::Offer(OfferState {
                 key: b32(r.get("key")).unwrap_or_default(),
                 buyer: b32(r.get("buyer")).unwrap_or_default(),
+                seller: b32(r.get("seller")),
                 refund_after: r.get::<Option<i64>, _>("refund_after").unwrap_or(0),
             }),
+            "shard" => {
+                let prices: Vec<i64> = r
+                    .get::<Option<String>, _>("prices")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|p| p.parse().ok())
+                    .collect();
+                let Ok(prices) = <[i64; 5]>::try_from(prices) else { continue };
+                Tracked::Shard(PriceState {
+                    shard: r.get::<Option<i64>, _>("shard").unwrap_or(0),
+                    authority: b32(r.get("authority")).unwrap_or_default(),
+                    prices,
+                })
+            }
             _ => continue,
         };
         reg.utxos.insert(op, tracked);
@@ -206,55 +247,67 @@ pub async fn persist(
         sqlx::query("DELETE FROM names_utxos").execute(&mut *tx).await?;
         for (op, tracked) in &reg.utxos {
             let m = meta.get(op).copied().unwrap_or(UtxoMeta { value: 0, created_at: 0, created_daa: 0 });
+            // One row per tracked UTXO; the columns a kind does not use stay NULL.
+            let (mut lo, mut hi, mut key, mut name, mut owner) = (None, None, None, None, None);
+            let (mut price, mut period_start, mut expires_at, mut buyer, mut refund_after) = (None, None, None, None, None);
+            let (mut seller, mut shard, mut authority, mut prices) = (None, None, None, None);
+            let kind = match tracked {
+                Tracked::Gap(g) => {
+                    lo = Some(g.lo.to_vec());
+                    hi = Some(g.hi.to_vec());
+                    "gap"
+                }
+                Tracked::Name(n) => {
+                    key = Some(n.key.to_vec());
+                    name = Some(n.name_str());
+                    owner = Some(n.owner.to_vec());
+                    price = Some(n.price);
+                    period_start = Some(n.period_start);
+                    expires_at = Some(n.expires_at);
+                    "name"
+                }
+                Tracked::Offer(o) => {
+                    key = Some(o.key.to_vec());
+                    buyer = Some(o.buyer.to_vec());
+                    refund_after = Some(o.refund_after);
+                    seller = o.seller.map(|k| k.to_vec());
+                    "offer"
+                }
+                Tracked::Shard(p) => {
+                    shard = Some(p.shard);
+                    authority = Some(p.authority.to_vec());
+                    prices = Some(p.prices.iter().map(i64::to_string).collect::<Vec<_>>().join(","));
+                    "shard"
+                }
+            };
             let q = sqlx::query(
                 r#"INSERT INTO names_utxos (txid, idx, kind, value, lo, hi, key, name, owner, price, period_start,
-                       expires_at, buyer, refund_after, created_at, created_daa, refuted)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"#,
+                       expires_at, buyer, refund_after, created_at, created_daa, refuted, seller, shard, authority, prices)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)"#,
             )
             .bind(op.0.to_vec())
-            .bind(op.1 as i32);
-            let q = match tracked {
-                Tracked::Gap(g) => q
-                    .bind("gap")
-                    .bind(m.value as i64)
-                    .bind(Some(g.lo.to_vec()))
-                    .bind(Some(g.hi.to_vec()))
-                    .bind(None::<Vec<u8>>)
-                    .bind(None::<String>)
-                    .bind(None::<Vec<u8>>)
-                    .bind(None::<i64>)
-                    .bind(None::<i64>)
-                    .bind(None::<i64>)
-                    .bind(None::<Vec<u8>>)
-                    .bind(None::<i64>),
-                Tracked::Name(n) => q
-                    .bind("name")
-                    .bind(m.value as i64)
-                    .bind(None::<Vec<u8>>)
-                    .bind(None::<Vec<u8>>)
-                    .bind(Some(n.key.to_vec()))
-                    .bind(Some(n.name_str()))
-                    .bind(Some(n.owner.to_vec()))
-                    .bind(Some(n.price))
-                    .bind(Some(n.period_start))
-                    .bind(Some(n.expires_at))
-                    .bind(None::<Vec<u8>>)
-                    .bind(None::<i64>),
-                Tracked::Offer(o) => q
-                    .bind("offer")
-                    .bind(m.value as i64)
-                    .bind(None::<Vec<u8>>)
-                    .bind(None::<Vec<u8>>)
-                    .bind(Some(o.key.to_vec()))
-                    .bind(None::<String>)
-                    .bind(None::<Vec<u8>>)
-                    .bind(None::<i64>)
-                    .bind(None::<i64>)
-                    .bind(None::<i64>)
-                    .bind(Some(o.buyer.to_vec()))
-                    .bind(Some(o.refund_after)),
-            };
-            q.bind(m.created_at).bind(m.created_daa as i64).bind(refuted.contains(op)).execute(&mut *tx).await?;
+            .bind(op.1 as i32)
+            .bind(kind)
+            .bind(m.value as i64)
+            .bind(lo)
+            .bind(hi)
+            .bind(key)
+            .bind(name)
+            .bind(owner)
+            .bind(price)
+            .bind(period_start)
+            .bind(expires_at)
+            .bind(buyer)
+            .bind(refund_after);
+            q.bind(m.created_at)
+                .bind(m.created_daa as i64)
+                .bind(refuted.contains(op))
+                .bind(seller)
+                .bind(shard)
+                .bind(authority)
+                .bind(prices)
+                .execute(&mut *tx)
+                .await?;
         }
     }
     for block in removed_blocks {

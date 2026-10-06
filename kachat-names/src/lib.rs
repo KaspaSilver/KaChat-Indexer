@@ -248,12 +248,26 @@ pub struct NameState {
     pub expires_at: i64,
 }
 
-/// `0x20 key[32] 0x20 buyer[32] 0x08 refundAfter[8]` (75 B).
+/// Registry v2: `0x20 key[32] 0x20 buyer[32] 0x08 refundAfter[8]` (75 B).
+/// Registry v3 adds the seller the offer was made to:
+/// `0x20 key[32] 0x20 buyer[32] 0x20 seller[32] 0x08 refundAfter[8]` (108 B).
+/// `seller: None` is a v2 offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OfferState {
     pub key: [u8; 32],
     pub buyer: [u8; 32],
+    pub seller: Option<[u8; 32]>,
     pub refund_after: i64,
+}
+
+/// Registry v3 price shard (docs/KACHAT_NAMES_REGISTRY_V3.md §1), 87 B:
+/// `0x08 shard[8] 0x20 authority[32] 0x08 p1..p5[8 each]`. Prices are sompi per period for
+/// names of 1, 2, 3, 4 and 5+ bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriceState {
+    pub shard: i64,
+    pub authority: [u8; 32],
+    pub prices: [i64; 5],
 }
 
 fn take32(b: &[u8], at: usize) -> Option<[u8; 32]> {
@@ -313,17 +327,64 @@ impl NameState {
 
 impl OfferState {
     pub fn encode(&self) -> Vec<u8> {
-        [&[0x20u8][..], &self.key, &[0x20], &self.buyer, &[0x08], &num8_encode(self.refund_after)].concat()
+        match &self.seller {
+            None => [&[0x20u8][..], &self.key, &[0x20], &self.buyer, &[0x08], &num8_encode(self.refund_after)].concat(),
+            Some(seller) => [
+                &[0x20u8][..], &self.key, &[0x20], &self.buyer, &[0x20], seller, &[0x08], &num8_encode(self.refund_after),
+            ]
+            .concat(),
+        }
+    }
+    /// A 75-byte (v2) or 108-byte (v3) offer state.
+    pub fn decode(state: &[u8]) -> Option<Self> {
+        match state.len() {
+            75 if state[0] == 0x20 && state[33] == 0x20 && state[66] == 0x08 => Some(Self {
+                key: take32(state, 1)?,
+                buyer: take32(state, 34)?,
+                seller: None,
+                refund_after: num8_decode(&take8(state, 67)?),
+            }),
+            108 if state[0] == 0x20 && state[33] == 0x20 && state[66] == 0x20 && state[99] == 0x08 => Some(Self {
+                key: take32(state, 1)?,
+                buyer: take32(state, 34)?,
+                seller: Some(take32(state, 67)?),
+                refund_after: num8_decode(&take8(state, 100)?),
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl PriceState {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(87);
+        out.push(0x08);
+        out.extend_from_slice(&num8_encode(self.shard));
+        out.push(0x20);
+        out.extend_from_slice(&self.authority);
+        for p in self.prices {
+            out.push(0x08);
+            out.extend_from_slice(&num8_encode(p));
+        }
+        out
     }
     pub fn decode(state: &[u8]) -> Option<Self> {
-        if state.len() != 75 || state[0] != 0x20 || state[33] != 0x20 || state[66] != 0x08 {
+        if state.len() != 87 || state[0] != 0x08 || state[9] != 0x20 {
             return None;
         }
-        Some(Self {
-            key: take32(state, 1)?,
-            buyer: take32(state, 34)?,
-            refund_after: num8_decode(&take8(state, 67)?),
-        })
+        let mut prices = [0i64; 5];
+        for (t, p) in prices.iter_mut().enumerate() {
+            let at = 42 + t * 9;
+            if state[at] != 0x08 {
+                return None;
+            }
+            *p = num8_decode(&take8(state, at + 1)?);
+        }
+        Some(Self { shard: num8_decode(&take8(state, 1)?), authority: take32(state, 10)?, prices })
+    }
+    /// The price per period for a name of `len` bytes: tier `min(max(len,1),5) - 1`.
+    pub fn price_for_len(&self, len: usize) -> i64 {
+        self.prices[len.clamp(1, 5) - 1]
     }
 }
 

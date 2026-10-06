@@ -44,6 +44,14 @@ impl Follower {
         self.checkpoint = Some(scan_from);
     }
 
+    /// Registry v3: seed the K price shards from the price genesis (sent before the
+    /// registry genesis, so the scan start covers both).
+    pub fn seed_shards(&mut self, shards: &[(crate::ingest::Outpoint, crate::PriceState)]) {
+        for (op, shard) in shards {
+            self.registry.seed_shard(*op, *shard);
+        }
+    }
+
     /// Pull one batch and apply it. Reorg-safe order: undo removed blocks first, then apply
     /// the newly-accepted txs, then advance the checkpoint and prune. Returns the batch (so
     /// the caller can persist what it touched) and the registry events it produced.
@@ -91,7 +99,7 @@ mod tests {
     fn templates() -> Templates {
         use crate::ingest::ContractTemplate;
         let t = |len| ContractTemplate { prefix: vec![0x6b], suffix: vec![0xaa, 0xbb, 0xcc], state_offset: 1, state_len: len };
-        Templates { gap: t(66), name: t(126), offer: t(75) }
+        Templates::new(t(66), t(126), t(75))
     }
 
     fn scriptnum(v: i64) -> Vec<u8> {
@@ -159,9 +167,9 @@ mod tests {
                 ),
             }],
             outputs: vec![
-                TxOutput { script_public_key: t.gap.spk(&left.encode()), value: 100_000_000 },
-                TxOutput { script_public_key: t.gap.spk(&right.encode()), value: 100_000_000 },
-                TxOutput { script_public_key: t.name.spk(&nm.encode()), value: 100_000_000 },
+                TxOutput { script_public_key: t.gap.spk(&left.encode()), value: 100_000_000, covenant: None },
+                TxOutput { script_public_key: t.gap.spk(&right.encode()), value: 100_000_000, covenant: None },
+                TxOutput { script_public_key: t.name.spk(&nm.encode()), value: 100_000_000, covenant: None },
             ],
             payload: vec![],
             accepting_block: block,
@@ -211,7 +219,7 @@ mod tests {
         Tx {
             id: [id; 32],
             inputs: vec![TxInput { previous_outpoint: ([id ^ 0xff; 32], 0), signature_script: vec![], spent_script: from.to_vec() }],
-            outputs: vec![TxOutput { script_public_key: to.to_vec(), value: 1 }],
+            outputs: vec![TxOutput { script_public_key: to.to_vec(), value: 1, covenant: None }],
             payload: format!("kchat:1:profile:{json}").into_bytes(),
             accepting_block: block,
             accepting_daa: daa,
