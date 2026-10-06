@@ -285,3 +285,20 @@ record's (`prices`, `price_authority`). In `names_api.rs` that is `events_page` 
 
 The app tries `/names/activity` first and falls back to `/market/activity` when it is missing,
 so either order of deploys is fine.
+
+## 10. `.kachat` in `GET /stats` (2026-10-06)
+
+The app's KaChat Stats screen has five new categories. Their keys are in KaChat
+`STATS_INDEXER.md`; every value is `{ total, last24h, last7d }`, counted from the names
+follower's events (`names_history`), one per transaction, never the price record's:
+
+| Key | Ops |
+|---|---|
+| `kachatRegistrations` | `register` |
+| `kachatRenewals` | `extend`, `renew` |
+| `kachatSales` | `sale`, `offer_accepted` |
+| `kachatOffers` | `offer` |
+| `kachatActivity` | `list`, `delist`, `transfer`, `release`, `reclaim`, `offer_decline`, `offer_withdraw`, `offer_refund` |
+
+Report them only where the names module is on (a manifest is loaded). On mainnet that is when
+names launch; until then leave the keys out, and the app hides the rows.
