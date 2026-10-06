@@ -235,3 +235,38 @@ misread.
    file, so it is a good reference for the expected states and events.
 5. **Switch over:** follow the v3 manifest once the owner sends the two geneses (price first,
    then registry). Stop following v2.
+
+## 8. Name pushes for v3 (2026-10-06)
+
+`kachat-names-follower/src/pushes.rs`. The iOS app (KaChat `KaChatNotificationService`) already
+renders every event below in the phone's language. The server's English text is only a fallback.
+
+### 8.1 Bug: the reminder schedule assumes days
+
+`due_reminder` fires `name_expiring` at `expiresAt − 3 days` and `− 1 day`, and
+`name_renewal_open` at `expiresAt − renewWindowMs`. On testnet-10 (`periodMs` = `renewWindowMs` =
+`graceMs` = 10 min) a name lives 10–20 minutes. The 1-day reminder is therefore due the moment it
+is registered ("expires in 1 day"), and the renewal-open push never wins.
+
+Make the schedule follow the manifest's clock:
+- Send `name_expiring` (3 days / 1 day) only when it falls **after** the renewal window opens,
+  i.e. `3·DAY < renewWindowMs` (mainnet: 10 days). On a short clock send just
+  `name_renewal_open` and `name_grace`.
+- If you want an "expiring" reminder there too, send it at `expiresAt − renewWindowMs/2` with
+  `"days": 0`. The app shows "Renew it soon to keep it." for `days` 0 or absent.
+
+### 8.2 New events
+
+Same envelope as today (`type: "name_event"`, `event`, `name`, optional `amount` in sompi as a
+string, optional `days`), to the address named:
+
+| `event` | To | When | App shows |
+|---|---|---|---|
+| `name_lapsed` | the owner | `now >= expiresAt + graceMs` and the name is still unreclaimed (once per expiry, dedup kind `lapsed`) | "alice.kachat has lapsed: anyone can claim it now…" |
+| `name_offer_declined` | the buyer | an offer spent through `decline` (op `offer_decline`) | "Offer on alice.kachat declined: the KAS is back with you." |
+| `name_offer_refunded` | the buyer | an offer spent through `refund` after it expired (op `offer_refund`) | "Offer on alice.kachat expired: the KAS is back with you." |
+
+`offer_withdraw` is the buyer's own action, so don't push it.
+
+The app also builds these rows itself, for the Profile bell, from `/names/...` whenever it
+refreshes. So a missed push still shows in the bell; the push is what reaches a locked phone.
