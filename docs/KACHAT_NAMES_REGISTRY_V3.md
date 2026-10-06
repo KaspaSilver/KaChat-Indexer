@@ -16,6 +16,9 @@
 > scripts) and scanning starts at `priceGenesis.scanFrom`. Switching over = point
 > `KACHAT_NAMES_MANIFEST_TESTNET` at the v3 manifest: a new registry id resets the tables.
 
+> **2026-10-06:** the testnet follower is stuck on a start block the node has pruned. The plan for
+> the v3 launch and the follower fixes it needs are in `docs/KACHAT_NAMES_PRUNED_START.md`.
+
 v3 adds four things. Contracts are immutable, so this is a **new registry**; v2's test names are
 left behind, as v1's were.
 
