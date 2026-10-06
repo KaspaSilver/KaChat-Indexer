@@ -73,6 +73,11 @@ impl PushApi {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        if internal_secret.is_none() {
+            // kachat-audits IDX-002: fail closed. Without a secret nobody can call
+            // /internal/push/* (broadcast/KaPosts/name pushes and tx relay).
+            warn!("[Push] INTERNAL_PUSH_SECRET is not set: /internal/push/* refuses every request");
+        }
         Self {
             registry,
             auth_mode,
@@ -319,15 +324,37 @@ pub struct InternalKaPostsPush {
 }
 
 impl PushApi {
+    /// kachat-audits IDX-002: fails closed (no secret configured = nobody is
+    /// authorized) and compares in constant time.
     fn internal_authorized(&self, headers: &HeaderMap) -> bool {
-        match &self.internal_secret {
-            None => true, // no secret configured -> allow (same-box only by deployment)
-            Some(secret) => headers
-                .get("x-internal-secret")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v == secret)
-                .unwrap_or(false),
-        }
+        let Some(secret) = &self.internal_secret else {
+            return false;
+        };
+        headers
+            .get("x-internal-secret")
+            .map(|v| secret_matches(v.as_bytes(), secret.as_bytes()))
+            .unwrap_or(false)
+    }
+}
+
+/// Constant-time equality of a presented secret and the configured one. Both are
+/// hashed first, so the comparison also does not leak the secret's length.
+fn secret_matches(presented: &[u8], secret: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    let (a, b) = (Sha256::digest(presented), Sha256::digest(secret));
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod internal_secret_tests {
+    use super::secret_matches;
+
+    #[test]
+    fn matches_only_the_exact_secret() {
+        assert!(secret_matches(b"s3cret-value", b"s3cret-value"));
+        assert!(!secret_matches(b"s3cret-valuE", b"s3cret-value"));
+        assert!(!secret_matches(b"s3cret", b"s3cret-value"));
+        assert!(!secret_matches(b"", b"s3cret-value"));
     }
 }
 

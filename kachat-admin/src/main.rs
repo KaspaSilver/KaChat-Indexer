@@ -23,7 +23,6 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, postgres::PgPoolOptions, PgPool};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
@@ -41,7 +40,9 @@ struct Args {
     db_password: String,
     #[arg(long, default_value_t = 4)]
     db_max_connections: u32,
-    #[arg(long, default_value = "0.0.0.0:3081")]
+    /// Loopback by default (kachat-audits IDX-003). Kaspa Quick Start overrides it so
+    /// its panel can reach the API over the stack's private network; it never publishes it.
+    #[arg(long, default_value = "127.0.0.1:3081")]
     bind_address: String,
     /// URL of the vendored kasia (chat) indexer's metrics endpoint, proxied to the Chat tab.
     #[arg(long, default_value = "http://127.0.0.1:8600/metrics")]
@@ -183,13 +184,65 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/chat/purge", post(post_chat_purge))
         .route("/api/translate-status", get(get_translate_status))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
-        .layer(CorsLayer::permissive())
+        // No CORS layer (kachat-audits IDX-003): the dashboard is same-origin or
+        // proxied server-side by the panel, so other web origins get no access.
+        .layer(axum::middleware::from_fn(refuse_cross_site))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind_address).await?;
     info!("kachat-admin dashboard listening on http://{}", args.bind_address);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Refuses state-changing requests a browser sent from another site (kachat-audits
+/// IDX-003): an `Origin` whose host is not this request's `Host`, or
+/// `Sec-Fetch-Site: cross-site`. A plain HTML form POST from any web page used to be
+/// enough to purge the chat store. Server-side callers (the panel's proxy, curl)
+/// send no Origin and are unaffected.
+async fn refuse_cross_site(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::http::{Method, StatusCode};
+    use axum::response::IntoResponse;
+    if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) && is_cross_site(req.headers()) {
+        return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
+    }
+    next.run(req).await
+}
+
+fn is_cross_site(headers: &axum::http::HeaderMap) -> bool {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if get("sec-fetch-site") == Some("cross-site") {
+        return true;
+    }
+    match get("origin") {
+        None => false,
+        Some(origin) => {
+            let origin_host = origin.split_once("://").map(|(_, rest)| rest).unwrap_or(origin);
+            Some(origin_host.trim_end_matches('/')) != get("host")
+        }
+    }
+}
+
+#[cfg(test)]
+mod cross_site_tests {
+    use super::is_cross_site;
+    use axum::http::HeaderMap;
+
+    fn h(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(*k, v.parse().unwrap());
+        }
+        m
+    }
+
+    #[test]
+    fn refuses_other_origins_and_allows_same_origin_or_none() {
+        assert!(is_cross_site(&h(&[("origin", "http://evil.example"), ("host", "localhost:3081")])));
+        assert!(is_cross_site(&h(&[("sec-fetch-site", "cross-site"), ("host", "localhost:3081")])));
+        assert!(!is_cross_site(&h(&[("origin", "http://localhost:3081"), ("host", "localhost:3081")])));
+        assert!(!is_cross_site(&h(&[("host", "kachat-app:3081")])), "server-side proxy sends no Origin");
+    }
 }
 
 // ---------------------------------------------------------------------------
