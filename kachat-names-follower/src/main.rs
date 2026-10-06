@@ -223,6 +223,25 @@ async fn self_test(node: &Node, m: &Manifest, reg: &kachat_names::ingest::Regist
     Ok(reg.utxos.keys().filter(|op| !on_node.contains(*op)).copied().collect())
 }
 
+/// Whether a stored registry id is the manifest's (case and whitespace don't count).
+fn same_registry(stored: Option<&str>, manifest: &str) -> bool {
+    stored.is_some_and(|s| s.trim().eq_ignore_ascii_case(manifest.trim()))
+}
+
+/// A fetch failed: is it because `from` is a block the node no longer has, below its pruning
+/// point? Then it will never come back. Anything else (a timeout, a busy node) is retried.
+async fn start_block_pruned(node: &Node, from: [u8; 32], err: &anyhow::Error) -> bool {
+    if !format!("{err:#}").contains("cannot find header") {
+        return false;
+    }
+    // The node no longer knows the header at all: pruned, provided it has a pruning point
+    // (an archival node keeps everything and would have found it).
+    match node.client.get_block(kaspa_rpc_core::model::RpcHash::from_bytes(from), false).await {
+        Ok(_) => false,
+        Err(_) => node.client.get_block_dag_info().await.is_ok_and(|i| i.pruning_point_hash.as_bytes() != from),
+    }
+}
+
 /// Batch-size control: uncapped normally; after a timeout, cap to a blue-score window,
 /// halving on every further failure and doubling back to uncapped on success.
 #[derive(Default)]
@@ -296,8 +315,15 @@ async fn run(args: Args) -> Result<()> {
     store::create_schema(&pool).await?;
 
     // A different registry (new genesis / other network) starts from scratch.
-    if store::stored_registry(&pool).await?.as_deref() != Some(m.registry.as_str()) {
-        info!("[names] fresh registry tables for {}", m.registry);
+    // Reset only for a genuinely different registry (KACHAT_NAMES_PRUNED_START.md §1):
+    // compared case- and whitespace-insensitively, and both ids logged when it happens.
+    let stored = store::stored_registry(&pool).await?;
+    if !same_registry(stored.as_deref(), &m.registry) {
+        info!(
+            "[names] fresh registry tables: stored {}, manifest {}",
+            stored.as_deref().unwrap_or("(none)"),
+            m.registry
+        );
         store::reset(
             &pool,
             &store::RegistryInfo {
@@ -348,6 +374,7 @@ async fn run(args: Args) -> Result<()> {
     let push_secret = (!args.push_secret.is_empty()).then_some(args.push_secret.as_str());
     let mut last_reminder_scan = Instant::now() - Duration::from_secs(60);
     let mut last_heartbeat = Instant::now() - Duration::from_secs(60);
+    let mut last_fatal_log = Instant::now() - Duration::from_secs(60);
 
     loop {
         let from = follower.checkpoint.unwrap_or(m.scan_from);
@@ -357,12 +384,35 @@ async fn run(args: Args) -> Result<()> {
                 b
             }
             Err(e) => {
+                // A start block the node has pruned never comes back (KACHAT_NAMES_PRUNED_START.md
+                // §2): say so, once a minute, as an error, and in /names/status, instead of
+                // shrinking the batch and retrying forever as if just started.
+                if start_block_pruned(&node, from, &e).await {
+                    let first = status.fatal_reason.is_none();
+                    status.fatal_reason = Some("start_block_pruned".into());
+                    status.start_block = Some(from);
+                    status.synced = false;
+                    store::save_status(&pool, &status).await?;
+                    if first || last_fatal_log.elapsed() >= Duration::from_secs(60) {
+                        last_fatal_log = Instant::now();
+                        tracing::error!(
+                            "[names] start block {} is below the node's pruning point; this node can't replay the registry from it (see docs/KACHAT_NAMES_PRUNED_START.md)",
+                            hex::encode(from)
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
                 window.failed();
                 warn!("[names] fetch failed ({e:#}); next batch capped to {:?} blue score", window.0);
                 tokio::time::sleep(Duration::from_millis(args.poll_ms * 5)).await;
                 continue;
             }
         };
+        if status.fatal_reason.take().is_some() {
+            status.start_block = None;
+            info!("[names] the start block is reachable again; following");
+        }
         let fetched_blocks = batch.tip.is_some();
         let removed = batch.removed_blocks.clone();
         let accepted_ids: Vec<_> = batch.accepted.iter().map(|t| t.id).collect();
@@ -597,6 +647,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registry_ids_compare_loosely() {
+        assert!(same_registry(Some("90F56BD1 "), "90f56bd1"));
+        assert!(!same_registry(None, "90f56bd1"));
+        assert!(!same_registry(Some("82f4315c"), "90f56bd1"));
+    }
+
+    #[test]
     fn window_shrinks_on_failure_and_recovers() {
         let mut w = Window::default();
         assert_eq!(w.0, None);
@@ -658,14 +715,20 @@ mod tests {
             return;
         }
         let m = read_manifest(path).unwrap();
-        // Registry v2 (docs/KACHAT_NAMES_REGISTRY_V2.md); v1 9444187f… is retired.
-        assert_eq!(m.registry, "82f4315c8f7b3e0e76fc2f77466fe7651d2c1fac4e0b5810d4da878a9cfa0f89");
+        // Registry v3, deployed 2026-10-06 (kachat-domains 7b27aa9); v2 82f4315c… is retired.
+        assert_eq!(m.registry, "90f56bd1babeda8e901639eaffacd9dba211c32d3f4f2587916f419140ee6d24");
+        assert_eq!(m.version, 3);
+        assert_eq!(m.price_covenant_id.as_deref(), Some("4d7685c06d5e3d37d8670fd68f7ac19b9d558398f3af268b310e9ad673f93338"));
+        assert_eq!(m.price_shards.len(), 8, "the 8 genesis shards verify against their deployed scripts");
+        assert_eq!(m.templates.period_ms, 600_000, "a 10-minute period on testnet");
         assert_eq!(m.network, "testnet-10");
         assert_eq!(hex::encode(m.genesis_outpoint.0), m.genesis_txid);
         assert_eq!(m.genesis_gap.lo, [0u8; 32]);
         assert_eq!(m.genesis_gap.hi, [0xffu8; 32]);
         // The genesis gap state hashes to the deployed genesis output script.
         let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        // v3 scans from the price genesis, which was sent first.
+        assert_eq!(hex::encode(m.scan_from), raw["priceGenesis"]["scanFrom"].as_str().unwrap());
         let spk = raw["genesis"]["authorizedOutputs"][0]["scriptPublicKey"].as_str().unwrap();
         assert_eq!(hex::encode(m.templates.gap.spk(&m.genesis_gap.encode())), spk);
     }

@@ -169,6 +169,10 @@ pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl Int
             "synced": synced,
             "on": n.is_on(),
             "manifestPath": n.path,
+            // KACHAT_NAMES_PRUNED_START.md §2: e.g. "start_block_pruned" when the node no
+            // longer has the block the follower must start from (it never recovers by itself).
+            "error": follower.as_ref().and_then(|f| f.fatal_reason.clone()),
+            "startBlock": follower.as_ref().and_then(|f| f.start_block.as_ref().map(hex::encode)),
         })),
     )
 }
