@@ -270,3 +270,18 @@ string, optional `days`), to the address named:
 
 The app also builds these rows itself, for the Profile bell, from `/names/...` whenever it
 refreshes. So a missed push still shows in the bell; the push is what reaches a locked phone.
+
+## 9. `GET /names/activity`: every registry event (2026-10-06)
+
+The app's .kachat Activity tab now shows everything that happens in the registry, not only the
+market: registrations, extensions, renewals, listings, sales, offers (made, accepted, declined,
+withdrawn, refunded), transfers, releases and reclaims. `/market/activity` only serves
+`sale, list, offer, offer_accepted, offer_decline`.
+
+Add `GET /names/activity` with the same shape and paging as `/market/activity`
+(`{"events": [...], "next": cursor}`, newest first), over **every op except** the price
+record's (`prices`, `price_authority`). In `names_api.rs` that is `events_page` with
+`op NOT IN ('prices', 'price_authority')` and a route next to `/market/activity`.
+
+The app tries `/names/activity` first and falls back to `/market/activity` when it is missing,
+so either order of deploys is fine.
