@@ -238,6 +238,10 @@ misread.
 
 ## 8. Name pushes for v3 (2026-10-06)
 
+> **Done (2026-10-06):** the schedule follows the manifest's clock (short clock: renewal_open,
+> then `name_expiring` `days: 0` halfway through the window, grace, lapsed), and
+> `name_lapsed` / `name_offer_declined` / `name_offer_refunded` are sent.
+
 `kachat-names-follower/src/pushes.rs`. The iOS app (KaChat `KaChatNotificationService`) already
 renders every event below in the phone's language. The server's English text is only a fallback.
 
@@ -273,6 +277,8 @@ refreshes. So a missed push still shows in the bell; the push is what reaches a 
 
 ## 9. `GET /names/activity`: every registry event (2026-10-06)
 
+> **Done (2026-10-06).**
+
 The app's .kachat Activity tab now shows everything that happens in the registry, not only the
 market: registrations, extensions, renewals, listings, sales, offers (made, accepted, declined,
 withdrawn, refunded), transfers, releases and reclaims. `/market/activity` only serves
@@ -287,6 +293,8 @@ The app tries `/names/activity` first and falls back to `/market/activity` when 
 so either order of deploys is fine.
 
 ## 10. `.kachat` in `GET /stats` (2026-10-06)
+
+> **Done (2026-10-06):** the five categories, counted per distinct tx, only with a manifest loaded.
 
 The app's KaChat Stats screen has five new categories. Their keys are in KaChat
 `STATS_INDEXER.md`; every value is `{ total, last24h, last7d }`, counted from the names

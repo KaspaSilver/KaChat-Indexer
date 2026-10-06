@@ -114,27 +114,69 @@ pub fn event_pushes(
                     });
                 }
             }
+            // Registry v3: an offer sent back by the seller, or refunded after it expired.
+            // The buyer gets the KAS back. (A withdraw is the buyer's own action: no push.)
+            "offer_decline" | "offer_refund" => {
+                let Some(buyer) = e.to else { continue };
+                let amount = tx_inputs
+                    .get(&e.tx_id)
+                    .into_iter()
+                    .flatten()
+                    .find(|op| matches!(before.get(op), Some(Tracked::Offer(o)) if o.key == e.key))
+                    .and_then(|op| values.get(op))
+                    .map(|v| *v as i64);
+                let (event, kind) =
+                    if e.op == "offer_decline" { ("name_offer_declined", "declined") } else { ("name_offer_refunded", "refunded") };
+                out.push(NamePush {
+                    to_key: buyer,
+                    event,
+                    name,
+                    tx_id: tx.clone(),
+                    amount,
+                    days: None,
+                    dedup: format!("{tx}:{kind}"),
+                });
+            }
             _ => {}
         }
     }
     out
 }
 
+/// How long after a name lapses a `name_lapsed` push is still worth sending (a follower that
+/// syncs long afterwards does not announce old news).
+const LAPSED_NEWS_MS: i64 = 7 * DAY_MS;
+
 /// A reminder that is due now for a live name: (event, days, dedup kind).
-/// Registry v2 schedule: `name_renewal_open` when renewing opens (`expiresAt − renewWindow`),
-/// `name_expiring` 3 days and 1 day before, `name_grace` at `expiresAt`. Each has a window that
-/// ends where the next begins, so a follower that was down sends only the current one; a
-/// renewal moves `expiresAt`, which starts a fresh schedule (the dedup is per expiry).
+///
+/// The schedule follows the manifest's clock (KACHAT_NAMES_REGISTRY_V3.md §8.1). Each step has
+/// a window that ends where the next begins, so a follower that was down sends only the current
+/// one; a renewal moves `expiresAt`, which starts a fresh schedule (the dedup is per expiry).
+/// - **Long clock** (the renewal window is longer than 3 days; mainnet: 10 days):
+///   `name_renewal_open` when renewing opens, `name_expiring` 3 days and 1 day before.
+/// - **Short clock** (testnet-10: 10-minute periods): `name_renewal_open` when renewing opens,
+///   then `name_expiring` with `days: 0` halfway through the window ("renew it soon").
+/// - Then `name_grace` at `expiresAt`, and `name_lapsed` once the grace period is over and the
+///   name is still unreclaimed.
 pub fn due_reminder(n: &NameState, now: i64, renew_window_ms: i64, grace_ms: i64) -> Option<(&'static str, Option<u32>, &'static str)> {
     let e = n.expires_at;
     if now >= e + grace_ms {
-        None // lapsed: reclaimable, nothing left to remind
+        // Still a live (unreclaimed) name: anyone can claim it now.
+        (now < e + grace_ms + LAPSED_NEWS_MS).then_some(("name_lapsed", None, "lapsed"))
     } else if now >= e {
         Some(("name_grace", None, "grace"))
-    } else if now >= e - DAY_MS {
-        Some(("name_expiring", Some(1), "expiring1"))
-    } else if now >= e - 3 * DAY_MS {
-        Some(("name_expiring", Some(3), "expiring3"))
+    } else if renew_window_ms > 3 * DAY_MS {
+        if now >= e - DAY_MS {
+            Some(("name_expiring", Some(1), "expiring1"))
+        } else if now >= e - 3 * DAY_MS {
+            Some(("name_expiring", Some(3), "expiring3"))
+        } else if now >= e - renew_window_ms {
+            Some(("name_renewal_open", None, "renewal_open"))
+        } else {
+            None
+        }
+    } else if now >= e - renew_window_ms / 2 {
+        Some(("name_expiring", Some(0), "expiring0"))
     } else if now >= e - renew_window_ms {
         Some(("name_renewal_open", None, "renewal_open"))
     } else {
@@ -157,11 +199,14 @@ pub fn text(event: &str, name: &str, amount: Option<i64>, days: Option<u32>) -> 
         "name_sold" => (format!("{name}.kachat sold"), "Your name was sold.".into()),
         "name_offer_accepted" => (format!("{name}.kachat is yours"), "Your offer was accepted.".into()),
         "name_renewal_open" => (format!("{name}.kachat can be renewed"), "Renewal is open until it expires.".into()),
-        "name_expiring" => (
-            format!("{name}.kachat expires in {} day{}", days.unwrap_or(1), if days == Some(1) { "" } else { "s" }),
-            "Renew it to keep it.".into(),
-        ),
+        "name_expiring" => match days {
+            Some(0) | None => (format!("{name}.kachat expires soon"), "Renew it soon to keep it.".into()),
+            Some(d) => (format!("{name}.kachat expires in {d} day{}", if d == 1 { "" } else { "s" }), "Renew it to keep it.".into()),
+        },
         "name_grace" => (format!("{name}.kachat has expired"), "Renew it during the grace period to keep it.".into()),
+        "name_lapsed" => (format!("{name}.kachat has lapsed"), "Anyone can claim it now.".into()),
+        "name_offer_declined" => (format!("Offer on {name}.kachat declined"), "The KAS is back with you.".into()),
+        "name_offer_refunded" => (format!("Offer on {name}.kachat expired"), "The KAS is back with you.".into()),
         _ => (format!("{name}.kachat"), String::new()),
     }
 }
@@ -273,7 +318,46 @@ mod tests {
         assert_eq!(at(exp - 3 * DAY_MS), Some("expiring3"));
         assert_eq!(at(exp - DAY_MS), Some("expiring1"));
         assert_eq!(at(exp), Some("grace"));
-        assert_eq!(at(exp + grace), None, "lapsed: nothing to remind");
+        assert_eq!(at(exp + grace), Some("lapsed"), "lapsed and still unreclaimed");
+        assert_eq!(at(exp + grace + 8 * DAY_MS), None, "old news is not pushed");
         assert_eq!(text("name_expiring", "alice", None, Some(3)).0, "alice.kachat expires in 3 days");
+    }
+
+    #[test]
+    fn reminder_schedule_follows_the_short_testnet_clock() {
+        // testnet-10 v3: periodMs = renewWindowMs = graceMs = 10 minutes.
+        let ten = 600_000;
+        let exp = NOW;
+        let at = |t: i64| due_reminder(&name([1; 32], [2; 32], 0, exp), t, ten, ten).map(|r| (r.0, r.1));
+        // Registered for one period: nothing due until the window opens (no "1 day" push).
+        assert_eq!(at(exp - ten - 1), None);
+        assert_eq!(at(exp - ten), Some(("name_renewal_open", None)));
+        assert_eq!(at(exp - ten / 2), Some(("name_expiring", Some(0))));
+        assert_eq!(at(exp), Some(("name_grace", None)));
+        assert_eq!(at(exp + ten), Some(("name_lapsed", None)));
+        assert_eq!(text("name_expiring", "alice", None, Some(0)).1, "Renew it soon to keep it.");
+    }
+
+    #[test]
+    fn decline_and_refund_tell_the_buyer_withdraw_does_not() {
+        let (key, buyer, seller) = ([1u8; 32], [3u8; 32], [2u8; 32]);
+        let offer_op = ([9u8; 32], 0);
+        let before: HashMap<_, _> =
+            [(offer_op, Tracked::Offer(OfferState { key, buyer, seller: Some(seller), refund_after: 10 }))].into();
+        let values: HashMap<_, _> = [(offer_op, 400_000_000u64)].into();
+        let names: HashMap<_, _> = [(key, "alice".to_string())].into();
+        let inputs: HashMap<_, _> = [([7u8; 32], vec![offer_op])].into();
+        let mk = |op| {
+            let mut e = ev(op, key, 7);
+            e.to = Some(buyer);
+            e.from = Some(seller);
+            e
+        };
+        for (op, event) in [("offer_decline", "name_offer_declined"), ("offer_refund", "name_offer_refunded")] {
+            let p = event_pushes(&[mk(op)], &before, &HashMap::new(), &values, &names, &inputs);
+            assert_eq!(p.len(), 1, "{op}");
+            assert_eq!((p[0].event, p[0].to_key, p[0].amount), (event, buyer, Some(400_000_000)));
+        }
+        assert!(event_pushes(&[mk("offer_withdraw")], &before, &HashMap::new(), &values, &names, &inputs).is_empty());
     }
 }

@@ -422,6 +422,7 @@ impl WebServer {
             .route("/offers/by-buyer/:address", get(crate::names_api::offers_by_buyer))
             .route("/market/listings", get(crate::names_api::listings))
             .route("/market/activity", get(crate::names_api::market_activity))
+            .route("/names/activity", get(crate::names_api::names_activity))
             .route("/profiles/stats", get(crate::names_api::profile_stats))
             .route("/profiles/history", get(crate::names_api::profile_history))
             .route("/profiles/:address", get(crate::names_api::profile))
@@ -904,6 +905,18 @@ fn stats_now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// The `.kachat` Stats categories and the history ops each counts (KaChat STATS_INDEXER.md).
+const KACHAT_STATS_CATEGORIES: [(&str, &[&str]); 5] = [
+    ("kachatRegistrations", &["register"]),
+    ("kachatRenewals", &["extend", "renew"]),
+    ("kachatSales", &["sale", "offer_accepted"]),
+    ("kachatOffers", &["offer"]),
+    (
+        "kachatActivity",
+        &["list", "delist", "transfer", "release", "reclaim", "offer_decline", "offer_withdraw", "offer_refund"],
+    ),
+];
+
 /// Run a `count(*) / FILTER(>d1) / FILTER(>d7)` query, returning (total, last24h, last7d).
 async fn stats_count3(pool: &sqlx::PgPool, sql: &str, d1: i64, d7: i64) -> (i64, i64, i64) {
     use sqlx::Row;
@@ -968,6 +981,20 @@ async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
     // chessGames: games started per the leaderboard reducer (reuses the cached chess snapshot).
     let (_, _, games_started) = chess_snapshot(app_state).await;
     categories.insert("chessGames".to_string(), serde_json::json!({ "total": games_started }));
+
+    // .kachat (KACHAT_NAMES_REGISTRY_V3.md §10): counted from the names follower's history, one
+    // per transaction, never the price record's. Only where the names module is on.
+    if app_state.names.is_on() {
+        for (key, ops) in KACHAT_STATS_CATEGORIES {
+            let list = ops.iter().map(|o| format!("'{o}'")).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT count(DISTINCT tx_id) t, count(DISTINCT tx_id) FILTER (WHERE at > $1) d1, \
+                 count(DISTINCT tx_id) FILTER (WHERE at > $2) d7 FROM names_history WHERE op IN ({list})"
+            );
+            let (k, v) = cat(key, stats_count3(pool, &sql, d1, d7).await);
+            categories.insert(k, v);
+        }
+    }
 
     // indexedSince = earliest kchat:1: content we hold (honest "counting since").
     let indexed_since: Option<i64> = {

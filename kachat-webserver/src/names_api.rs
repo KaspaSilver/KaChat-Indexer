@@ -522,6 +522,17 @@ pub async fn prices(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// `GET /names/activity?cursor=` — every registry event, newest first, same shape and paging as
+/// `/market/activity`, except the price record's (`prices`, `price_authority`)
+/// (KACHAT_NAMES_REGISTRY_V3.md §9).
+pub async fn names_activity(State(state): State<Arc<AppState>>, Query(q): Query<PageQuery>) -> Response {
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    events_page(&c, "op NOT IN ('prices', 'price_authority')", None, &q).await
+}
+
 /// A stored record as served: re-checked against the per-field allowlist, so a link that
 /// is not allowed in its field is dropped and the rest kept (`v: 1` preserved).
 fn clean_profile(raw: &str) -> Value {
