@@ -414,6 +414,7 @@ impl WebServer {
             .route("/names/manifest", get(crate::names::handle_names_manifest))
             .route("/names/prices", get(crate::names_api::prices))
             .route("/names/expiring", get(crate::names_api::expiring))
+            .route("/names/grace", get(crate::names_api::grace))
             .route("/names/by-owner/:address", get(crate::names_api::by_owner))
             .route("/names/gap/:key", get(crate::names_api::gap_lookup))
             .route("/names/:name", get(crate::names_api::name_lookup))

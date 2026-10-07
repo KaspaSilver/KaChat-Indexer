@@ -6,6 +6,8 @@ The app's .kachat marketplace has a new **Expired** tab. It lists names that hav
 are still in their grace period, with a live countdown to the moment each is released (becomes
 claimable). It's for people waiting to grab a name they want.
 
+> **Implemented (2026-10-07):** `names_api::grace`, routed at `/names/grace`.
+
 ## What's missing
 
 `GET /names/expiring` returns **lapsed** names (`expires_at + grace <= now`): those are the
