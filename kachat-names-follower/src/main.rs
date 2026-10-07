@@ -813,13 +813,15 @@ mod tests {
             return;
         }
         let m = read_manifest(path).unwrap();
-        // Registry v4, deployed 2026-10-07 (kachat-domains e774c86); v3 90f56bd1… is retired.
-        assert_eq!(m.registry, "bff185546af1940ec70d74143e23b5f018fdb864bd02e15ca9b4c8d8ede40e2f");
+        // Registry v4 on the testnet day clock, redeployed 2026-10-07 (kachat-domains d53d7bf);
+        // the 10-minute v4 bff18554… and v3 90f56bd1… are retired.
+        assert_eq!(m.registry, "e6b7244831004e1db928458bce570347317b50ff124c010d342d73a6c2017f0d");
         assert_eq!(m.version, 4);
         assert_eq!(m.price_covenant_id, None, "v4 has no price record");
         assert!(m.price_shards.is_empty());
-        assert_eq!(m.templates.period_ms, 600_000, "a 10-minute period on testnet");
-        assert_eq!(m.grace_ms, 1_800_000, "v4 testnet grace is 30 minutes");
+        assert_eq!(m.templates.period_ms, 86_400_000, "a 24-hour period on the testnet day clock");
+        assert_eq!(m.grace_ms, 21_600_000, "6 hours of grace");
+        assert_eq!(m.renew_window_ms, 7_200_000, "renewal opens 2 hours before expiry");
         assert_eq!(m.network, "testnet-10");
         assert_eq!(hex::encode(m.genesis_outpoint.0), m.genesis_txid);
         assert_eq!(m.genesis_gap.lo, [0u8; 32]);

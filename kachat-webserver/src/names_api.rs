@@ -644,8 +644,11 @@ pub async fn profile(State(state): State<Arc<AppState>>, Path(address): Path<Str
     }
 }
 
-/// Part C identity: active names (oldest first), the profile, and the label —
-/// `primaryName` while owned and active, else the oldest active name, else null.
+/// Part C identity: held names (active or in grace, oldest first), the profile, and the
+/// label — `primaryName` while held, else the oldest held name, else null. A name keeps
+/// resolving to and labelling its owner through its grace period, and stops only once it
+/// lapses and is back on the market (docs/KACHAT_NAMES_GRACE_RESOLVES.md; the app's walker
+/// `heldNames`).
 async fn identity_for(c: &Ctx, address: &str) -> Result<Value, sqlx::Error> {
     let mut names: Vec<String> = Vec::new();
     if let Some(key) = address_key(address) {
@@ -657,7 +660,7 @@ async fn identity_for(c: &Ctx, address: &str) -> Result<Value, sqlx::Error> {
         .await?;
         names = rows
             .iter()
-            .filter(|r| name_status(r.get::<Option<i64>, _>("expires_at").unwrap_or(0), c.grace_ms, c.now) == NameStatus::Active)
+            .filter(|r| name_status(r.get::<Option<i64>, _>("expires_at").unwrap_or(0), c.grace_ms, c.now) != NameStatus::Lapsed)
             .filter_map(|r| r.get::<Option<String>, _>("name"))
             .collect();
     }
