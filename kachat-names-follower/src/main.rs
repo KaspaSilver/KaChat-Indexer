@@ -7,6 +7,7 @@
 //! every served UTXO still unspent on the node — the app switches to this indexer on that
 //! signal, so nothing it serves may be refutable by the chain.
 
+mod bootstrap;
 mod node;
 mod profiles;
 mod pushes;
@@ -54,6 +55,10 @@ struct Args {
     /// self-test result, then exit. No database.
     #[arg(long)]
     probe: bool,
+    /// Rebuild the registry from the REST API (no node history, no database), print every
+    /// live name and the walk's report, then exit. Checks §3 of KACHAT_NAMES_PRUNED_START.md.
+    #[arg(long)]
+    bootstrap_probe: bool,
     #[arg(long, env = "DB_HOST", default_value = "localhost")]
     db_host: String,
     #[arg(long, env = "DB_PORT", default_value_t = 5432)]
@@ -82,6 +87,11 @@ struct Args {
     push_url: String,
     #[arg(long, env = "INTERNAL_PUSH_SECRET", default_value = "")]
     push_secret: String,
+    /// When the start block is below the node's pruning point, rebuild the registry from the
+    /// Kaspa REST API (`auto`, the default) or only report it (`off`).
+    /// KACHAT_NAMES_REST_URL overrides the API base (docs/KACHAT_NAMES_PRUNED_START.md §3).
+    #[arg(long, env = "KACHAT_NAMES_REST_BOOTSTRAP", default_value = "auto")]
+    rest_bootstrap: String,
 }
 
 /// Static facts read from the manifest.
@@ -300,6 +310,41 @@ async fn run(args: Args) -> Result<()> {
     if args.probe {
         return probe(&args, &m).await;
     }
+    if args.bootstrap_probe {
+        let node = Node::connect(&args.node_url, &m.network).await?;
+        let base = bootstrap::rest_base(&m.network);
+        info!("[names] [bootstrap-probe] connected to {}; REST {base}", args.node_url);
+        let mut follower = Follower::new(args.journal_keep);
+        follower.seed(m.scan_from, m.genesis_outpoint, m.genesis_gap);
+        follower.seed_shards(&m.price_shards);
+        let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
+        let report = bootstrap::walk(&node, &http, &base, m.prefix, &m.templates, &mut follower.registry).await?;
+        for e in &report.events {
+            info!("[names] [bootstrap-probe] {:<14} key {}… tx {}", e.op, &hex::encode(e.key)[..12], hex::encode(e.tx_id));
+        }
+        let names: Vec<String> = follower.registry.names().map(|(_, n)| n.name_str()).collect();
+        info!(
+            "[names] [bootstrap-probe] {} round(s), {} tx(s), {} live rows, unresolved {}; names {:?}",
+            report.rounds,
+            report.applied.len(),
+            follower.registry.utxos.len(),
+            report.unresolved,
+            names
+        );
+        let missing = self_test(&node, &m, &follower.registry).await?;
+        info!("[names] [bootstrap-probe] self-test: {} live row(s) not on the node", missing.len());
+        for op in &missing {
+            let kind = match follower.registry.utxos.get(op) {
+                Some(Tracked::Gap(_)) => "gap",
+                Some(Tracked::Name(_)) => "name",
+                Some(Tracked::Offer(_)) => "offer",
+                Some(Tracked::Shard(p)) => if p.shard == 0 { "shard 0" } else { "shard" },
+                None => "?",
+            };
+            info!("[names] [bootstrap-probe]   {kind} {}:{}", hex::encode(op.0), op.1);
+        }
+        return Ok(());
+    }
 
     let pool = PgPoolOptions::new()
         .max_connections(4)
@@ -372,10 +417,14 @@ async fn run(args: Args) -> Result<()> {
     let mut last_reminder_scan = Instant::now() - Duration::from_secs(60);
     let mut last_heartbeat = Instant::now() - Duration::from_secs(60);
     let mut last_fatal_log = Instant::now() - Duration::from_secs(60);
+    // REST bootstrap (§3): when it last ran, and the transactions it applied (the node's
+    // chain after the checkpoint may carry them again; they are skipped, not re-applied).
+    let mut last_bootstrap: Option<Instant> = None;
+    let mut bootstrapped_txids: HashSet<[u8; 32]> = HashSet::new();
 
     loop {
         let from = follower.checkpoint.unwrap_or(m.scan_from);
-        let (batch, last_daa) = match node.next_batch(from, args.min_confirmations, window.0).await {
+        let (mut batch, last_daa) = match node.next_batch(from, args.min_confirmations, window.0).await {
             Ok(b) => {
                 window.succeeded();
                 b
@@ -384,7 +433,57 @@ async fn run(args: Args) -> Result<()> {
                 // A start block the node has pruned never comes back (KACHAT_NAMES_PRUNED_START.md
                 // §2): say so, once a minute, as an error, and in /names/status, instead of
                 // shrinking the batch and retrying forever as if just started.
-                if start_block_pruned(&node, from, &e).await {
+                let pruned = start_block_pruned(&node, from, &e).await;
+                // §3: rebuild from the REST API instead, then follow the node from its sink.
+                // Tried at most every 10 minutes (the API may be down, or not caught up).
+                if pruned
+                    && args.rest_bootstrap != "off"
+                    && last_bootstrap.is_none_or(|t| t.elapsed() >= Duration::from_secs(600))
+                {
+                    last_bootstrap = Some(Instant::now());
+                    let base = bootstrap::rest_base(&m.network);
+                    info!("[names] start block {} is pruned: rebuilding the registry from {base}", hex::encode(from));
+                    let sink = node.client.get_sink().await.map_err(|e| anyhow!("getSink: {e}"))?.sink;
+                    let sink_daa = node.virtual_daa().await.unwrap_or(0);
+                    match bootstrap::walk(&node, &http, &base, m.prefix, &m.templates, &mut follower.registry).await {
+                        Ok(report) => {
+                            for tx in &report.applied {
+                                for (i, o) in tx.outputs.iter().enumerate() {
+                                    let op = (tx.id, i as u32);
+                                    if follower.registry.utxos.contains_key(&op) {
+                                        meta.insert(op, UtxoMeta { value: o.value, created_at: tx.block_time, created_daa: tx.accepting_daa });
+                                    }
+                                }
+                            }
+                            for (_, n) in follower.registry.names() {
+                                names_by_key.insert(n.key, n.name_str());
+                            }
+                            let named: Vec<_> = report.events.iter().map(|e| (e.clone(), names_by_key.get(&e.key).cloned())).collect();
+                            follower.checkpoint = Some(sink.as_bytes());
+                            bootstrapped_txids = report.applied.iter().map(|t| t.id).collect();
+                            status.checkpoint = follower.checkpoint;
+                            status.fatal_reason = None;
+                            status.start_block = None;
+                            status.synced = false;
+                            status.bootstrapped_at = sink_daa as i64;
+                            store::persist(&pool, &follower.registry, &meta, &refuted, &[], &named, true, &status).await?;
+                            dirty = false;
+                            info!(
+                                "[names] bootstrap done: {} transaction(s) in {} round(s), {} live rows; following the node from its sink {}",
+                                report.applied.len(),
+                                report.rounds,
+                                follower.registry.utxos.len(),
+                                hex::encode(sink.as_bytes())
+                            );
+                            if report.unresolved > 0 {
+                                warn!("[names] bootstrap: {} spent output(s) not yet in the REST API; the node will carry them", report.unresolved);
+                            }
+                            continue;
+                        }
+                        Err(err) => warn!("[names] bootstrap failed ({err:#}); retrying in 10 minutes"),
+                    }
+                }
+                if pruned {
                     let first = status.fatal_reason.is_none();
                     status.fatal_reason = Some("start_block_pruned".into());
                     status.start_block = Some(from);
@@ -409,6 +508,10 @@ async fn run(args: Args) -> Result<()> {
         if status.fatal_reason.take().is_some() {
             status.start_block = None;
             info!("[names] the start block is reachable again; following");
+        }
+        // Transactions the REST bootstrap already applied are not applied again.
+        if !bootstrapped_txids.is_empty() {
+            batch.accepted.retain(|t| !bootstrapped_txids.contains(&t.id));
         }
         let fetched_blocks = batch.tip.is_some();
         let removed = batch.removed_blocks.clone();

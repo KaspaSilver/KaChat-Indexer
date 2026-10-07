@@ -34,6 +34,9 @@ pub struct Status {
     pub fatal_reason: Option<String>,
     /// The block it cannot start from.
     pub start_block: Option<[u8; 32]>,
+    /// The virtual DAA at which the registry was rebuilt from the REST API (0 = never).
+    /// Offers created before it may be missing until they are spent (PRUNED_START.md §3).
+    pub bootstrapped_at: i64,
 }
 
 pub async fn create_schema(pool: &PgPool) -> Result<()> {
@@ -79,6 +82,7 @@ pub async fn create_schema(pool: &PgPool) -> Result<()> {
         // KACHAT_NAMES_PRUNED_START.md §2: a follower that cannot reach its start block says so.
         "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS fatal_reason TEXT",
         "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS start_block BYTEA",
+        "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS bootstrapped_at BIGINT NOT NULL DEFAULT 0",
         "CREATE INDEX IF NOT EXISTS names_utxos_key ON names_utxos (key)",
         "CREATE INDEX IF NOT EXISTS names_utxos_owner ON names_utxos (owner)",
         "CREATE INDEX IF NOT EXISTS names_utxos_buyer ON names_utxos (buyer)",
@@ -232,6 +236,7 @@ pub async fn load(pool: &PgPool) -> Result<(Registry, HashMap<Outpoint, UtxoMeta
             self_test_at: r.get("self_test_at"),
             fatal_reason: None,
             start_block: None,
+            bootstrapped_at: r.try_get::<i64, _>("bootstrapped_at").unwrap_or(0),
         },
         None => Status::default(),
     };
@@ -349,7 +354,7 @@ pub async fn persist(
 async fn write_status(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, s: &Status) -> Result<()> {
     sqlx::query(
         r#"UPDATE names_state SET checkpoint = $1, indexed_daa = $2, virtual_daa = $3, synced = $4,
-               self_test_ok = $5, self_test_at = $6, fatal_reason = $7, start_block = $8,
+               self_test_ok = $5, self_test_at = $6, fatal_reason = $7, start_block = $8, bootstrapped_at = $9,
                updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT
            WHERE id = 1"#,
     )
@@ -361,6 +366,7 @@ async fn write_status(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, s: &Status
     .bind(s.self_test_at)
     .bind(&s.fatal_reason)
     .bind(s.start_block.map(|b| b.to_vec()))
+    .bind(s.bootstrapped_at)
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -50,6 +50,15 @@ node's pruning point (`getBlockDagInfo`: `pruning_point_hash`, plus the DAA scor
 
 ## 3. Recover without the old blocks: a REST bootstrap
 
+> **Implemented (2026-10-07):** `kachat-names-follower/src/bootstrap.rs`. When §2's condition
+> holds (and `KACHAT_NAMES_REST_BOOTSTRAP` is not `off`), the follower walks the registry from the
+> manifest seeds through `getUtxosByAddresses` + `GET {rest}/addresses/{p2sh}/full-transactions`
+> (`KACHAT_NAMES_REST_URL`, default api.kaspa.org / api-tn10.kaspa.org), applies each spend with the
+> engine once every registry/price-covenant input of it is tracked, checkpoints at the node's sink
+> and continues over the node; transactions it already applied are skipped there. `/names/status`
+> reports `bootstrappedAt` (DAA). `--bootstrap-probe` runs the walk without a database: on the
+> retired v3 testnet registry it replays all 14 transactions and the self-test finds no mismatch.
+
 The app already rebuilds the whole registry without any node history. Its chain walker,
 `KaChat/Services/KachatNames/KachatNamesRegistryState.swift` `walk(...)`, does this:
 

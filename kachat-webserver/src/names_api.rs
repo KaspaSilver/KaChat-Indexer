@@ -41,11 +41,13 @@ pub struct FollowerStatus {
     /// Why it cannot progress (`start_block_pruned`), and the block it cannot start from.
     pub fatal_reason: Option<String>,
     pub start_block: Option<Vec<u8>>,
+    /// The DAA at which the registry was rebuilt from the REST API (0 = never).
+    pub bootstrapped_at: i64,
 }
 
 pub async fn follower_status(pool: &PgPool, registry: &str) -> Option<FollowerStatus> {
     let row = sqlx::query(
-        "SELECT registry_covenant_id, network, indexed_daa, synced, grace_ms, updated_at, price_covenant_id, fatal_reason, start_block FROM names_state WHERE id = 1",
+        "SELECT registry_covenant_id, network, indexed_daa, synced, grace_ms, updated_at, price_covenant_id, fatal_reason, start_block, bootstrapped_at FROM names_state WHERE id = 1",
     )
     .fetch_optional(pool)
     .await
@@ -63,6 +65,7 @@ pub async fn follower_status(pool: &PgPool, registry: &str) -> Option<FollowerSt
         price_covenant_id: row.get("price_covenant_id"),
         fatal_reason: row.get("fatal_reason"),
         start_block: row.get("start_block"),
+        bootstrapped_at: row.try_get::<i64, _>("bootstrapped_at").unwrap_or(0),
     })
 }
 
