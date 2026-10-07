@@ -490,6 +490,17 @@ pub async fn prices(State(state): State<Arc<AppState>>) -> Response {
         Err(e) => return e,
     };
     if state.names.manifest.as_ref().and_then(|m| m.price_covenant_id.as_ref()).is_none() {
+        // Registry v4: fixed prices, baked into the contracts and given in the manifest
+        // (docs/KACHAT_NAMES_REGISTRY_V4.md §5): sompi per period, tiers 1..5+.
+        if let Some(prices) = state.names.raw.as_ref().and_then(|r| r.get("params")).and_then(|p| p.get("prices")) {
+            let table = |which: &str| -> Option<Vec<String>> {
+                let t = prices.get(which)?;
+                ["len1", "len2", "len3", "len4", "len5plus"].iter().map(|k| t.get(*k)?.as_i64().map(|v| v.to_string())).collect()
+            };
+            if let (Some(register), Some(renew)) = (table("register"), table("renew")) {
+                return Json(json!({ "register": register, "renew": renew })).into_response();
+            }
+        }
         return err(StatusCode::NOT_FOUND, "no_price_record", "this registry has no price record (v2)");
     }
     let rows = match sqlx::query("SELECT * FROM names_utxos WHERE kind = 'shard' AND NOT refuted ORDER BY shard ASC")

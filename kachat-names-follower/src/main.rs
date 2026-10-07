@@ -96,7 +96,7 @@ struct Manifest {
     grace_ms: i64,
     renew_window_ms: i64,
     templates: Templates,
-    /// 2 or 3 (docs/KACHAT_NAMES_REGISTRY_V3.md).
+    /// 2, 3 or 4 (docs/KACHAT_NAMES_REGISTRY_V3.md, _V4.md).
     version: i32,
     /// Registry v3: the price covenant id and the K genesis shards.
     price_covenant_id: Option<String>,
@@ -122,7 +122,7 @@ fn read_manifest(path: &str) -> Result<Manifest> {
     let genesis_txid = genesis["txid"].as_str().ok_or_else(|| anyhow!("manifest: no genesis.txid"))?;
     let grace_ms = raw["params"]["graceMs"].as_i64().unwrap_or(0);
     let templates = Templates::from_manifest(&raw).ok_or_else(|| anyhow!("manifest: incomplete artifacts"))?;
-    let version = if templates.is_v3() { 3 } else { 2 };
+    let version = templates.version as i32;
 
     // Verify both geneses against the templates (as the app's manifest check does): the
     // genesis gap, and v3's K price shards, must each be exactly their deployed scripts.
@@ -133,10 +133,7 @@ fn read_manifest(path: &str) -> Result<Manifest> {
     }
     let mut price_shards = Vec::new();
     let mut price_covenant_id = None;
-    if templates.is_v3() {
-        if raw["registryVersion"].as_u64() != Some(3) {
-            bail!("manifest: has a price template but registryVersion is not 3");
-        }
+    if templates.has_price_record() {
         let pg = &raw["priceGenesis"];
         let txid = hex32(&pg["txid"], "priceGenesis.txid")?;
         for o in pg["authorizedOutputs"].as_array().ok_or_else(|| anyhow!("manifest: no priceGenesis.authorizedOutputs"))? {
@@ -165,7 +162,7 @@ fn read_manifest(path: &str) -> Result<Manifest> {
         genesis_gap,
         // v3: the price genesis comes first, and an authority price change may follow it
         // before the registry genesis, so scanning starts from the earlier of the two.
-        scan_from: if templates.is_v3() && raw["priceGenesis"]["scanFrom"].is_string() {
+        scan_from: if templates.has_price_record() && raw["priceGenesis"]["scanFrom"].is_string() {
             hex32(&raw["priceGenesis"]["scanFrom"], "priceGenesis.scanFrom")?
         } else {
             hex32(&genesis["scanFrom"], "genesis.scanFrom")?
@@ -687,11 +684,9 @@ mod tests {
 
     #[test]
     fn reads_the_v3_vectors_manifest() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../KaChat/KaChatTests/KachatNamesVectors.json");
-        let Ok(text) = std::fs::read_to_string(path) else {
-            eprintln!("skipping: no v3 vectors");
-            return;
-        };
+        // Frozen v3 vectors (KaChat 0ed15e9^): the current app file is v4.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../kachat-names/testdata/vectors-v3.json");
+        let text = std::fs::read_to_string(path).expect("kachat-names/testdata/vectors-v3.json");
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         // The dry run has no chain, so no scan blocks: give it two.
         let mut manifest = v["manifest"].clone();
@@ -715,20 +710,19 @@ mod tests {
             return;
         }
         let m = read_manifest(path).unwrap();
-        // Registry v3, deployed 2026-10-06 (kachat-domains 7b27aa9); v2 82f4315c… is retired.
-        assert_eq!(m.registry, "90f56bd1babeda8e901639eaffacd9dba211c32d3f4f2587916f419140ee6d24");
-        assert_eq!(m.version, 3);
-        assert_eq!(m.price_covenant_id.as_deref(), Some("4d7685c06d5e3d37d8670fd68f7ac19b9d558398f3af268b310e9ad673f93338"));
-        assert_eq!(m.price_shards.len(), 8, "the 8 genesis shards verify against their deployed scripts");
+        // Registry v4, deployed 2026-10-07 (kachat-domains e774c86); v3 90f56bd1… is retired.
+        assert_eq!(m.registry, "bff185546af1940ec70d74143e23b5f018fdb864bd02e15ca9b4c8d8ede40e2f");
+        assert_eq!(m.version, 4);
+        assert_eq!(m.price_covenant_id, None, "v4 has no price record");
+        assert!(m.price_shards.is_empty());
         assert_eq!(m.templates.period_ms, 600_000, "a 10-minute period on testnet");
+        assert_eq!(m.grace_ms, 1_800_000, "v4 testnet grace is 30 minutes");
         assert_eq!(m.network, "testnet-10");
         assert_eq!(hex::encode(m.genesis_outpoint.0), m.genesis_txid);
         assert_eq!(m.genesis_gap.lo, [0u8; 32]);
         assert_eq!(m.genesis_gap.hi, [0xffu8; 32]);
-        // The genesis gap state hashes to the deployed genesis output script.
         let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        // v3 scans from the price genesis, which was sent first.
-        assert_eq!(hex::encode(m.scan_from), raw["priceGenesis"]["scanFrom"].as_str().unwrap());
+        assert_eq!(hex::encode(m.scan_from), raw["genesis"]["scanFrom"].as_str().unwrap());
         let spk = raw["genesis"]["authorizedOutputs"][0]["scriptPublicKey"].as_str().unwrap();
         assert_eq!(hex::encode(m.templates.gap.spk(&m.genesis_gap.encode())), spk);
     }

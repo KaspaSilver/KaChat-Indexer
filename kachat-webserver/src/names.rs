@@ -160,9 +160,11 @@ pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl Int
             "registryCovenantId": if synced { manifest_registry.clone() } else { None },
             "manifestRegistryCovenantId": manifest_registry,
             // Registry v3: reported only once synced, exactly like registryCovenantId (the
-            // app uses this indexer only when both match its manifest).
+            // app uses this indexer only when both match its manifest). v4 has no price record,
+            // so these stay null and the app matches on registryCovenantId alone.
             "priceCovenantId": if synced { manifest_price.clone() } else { None },
             "manifestPriceCovenantId": manifest_price,
+            "registryVersion": n.raw.as_ref().and_then(|r| r.get("registryVersion").cloned()),
             "genesisTxId": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.txid.clone()),
             "scanFrom": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.scan_from.clone()),
             "indexedDaa": indexed_daa,

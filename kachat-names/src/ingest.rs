@@ -62,10 +62,14 @@ impl ContractTemplate {
 /// The contract templates and rules for one registry (built from the manifest).
 ///
 /// Registry v2 manifests give the gap/name/offer templates; v3 adds the price template, the
-/// two covenant ids, `periodMs` and per-contract dispatch tags (docs/KACHAT_NAMES_REGISTRY_V3.md).
-/// Everything version-specific is decided from these, so one applier serves both.
+/// two covenant ids, `periodMs` and per-contract dispatch tags (docs/KACHAT_NAMES_REGISTRY_V3.md);
+/// v4 is v3 without the price record (fixed prices baked into the contracts, one covenant id,
+/// docs/KACHAT_NAMES_REGISTRY_V4.md). Everything version-specific is decided from these, so one
+/// applier serves all three.
 #[derive(Debug, Clone)]
 pub struct Templates {
+    /// The manifest's `registryVersion` (2 when absent).
+    pub version: u32,
     pub gap: ContractTemplate,
     pub name: ContractTemplate,
     pub offer: ContractTemplate,
@@ -84,7 +88,17 @@ pub struct Templates {
 impl Templates {
     /// Registry v2 templates with the pinned tags and a one-year period (tests, old manifests).
     pub fn new(gap: ContractTemplate, name: ContractTemplate, offer: ContractTemplate) -> Self {
-        Self { gap, name, offer, price: None, tags: Vec::new(), period_ms: transition::YEAR_MS, registry_id: None, price_id: None }
+        Self {
+            version: 2,
+            gap,
+            name,
+            offer,
+            price: None,
+            tags: Vec::new(),
+            period_ms: transition::YEAR_MS,
+            registry_id: None,
+            price_id: None,
+        }
     }
 
     /// Build the templates from a names manifest's `artifacts` (`KachatGap`, `KachatName`,
@@ -107,11 +121,19 @@ impl Templates {
             .and_then(|v| v.as_u64())
             .unwrap_or(2);
         let id = |key: &str| manifest.get(key).and_then(|v| v.as_str()).and_then(|s| decode32(s).ok());
+        if version > 4 {
+            return None; // a registry this follower does not know: refuse, never guess
+        }
+        t.version = version as u32;
         if version >= 3 {
-            t.price = Some(one("KachatPrice")?);
+            // v3 and v4: covenant-bound registry outputs and a manifest period.
             t.registry_id = Some(id("registryCovenantId")?);
-            t.price_id = Some(id("priceCovenantId")?);
             t.period_ms = manifest.get("params")?.get("periodMs")?.as_i64()?;
+        }
+        if version == 3 {
+            // Only v3 has the price record (v4 bakes fixed prices into the contracts).
+            t.price = Some(one("KachatPrice")?);
+            t.price_id = Some(id("priceCovenantId")?);
         }
         // Tags only mean something per contract (v3 reuses none of v2's register/renew/
         // extend/accept tags), so they are matched against the contract being spent.
@@ -137,8 +159,13 @@ impl Templates {
         Some(t)
     }
 
-    /// Registry v3 (price record, seller-bound offers, covenant-checked outputs).
-    pub fn is_v3(&self) -> bool {
+    /// Registry v3 or later: seller-bound offers, covenant-checked outputs, a manifest period.
+    pub fn is_covenant_registry(&self) -> bool {
+        self.version >= 3
+    }
+
+    /// Registry v3 only: the price record (shards under their own covenant).
+    pub fn has_price_record(&self) -> bool {
         self.price.is_some()
     }
 

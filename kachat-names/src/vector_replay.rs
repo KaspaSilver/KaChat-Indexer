@@ -7,8 +7,9 @@
 //! - **v3**, the current one: shipped in the iOS repo as `KaChatTests/KachatNamesVectors.json`
 //!   (looked up at `$KACHAT_NAMES_VECTORS`, else next to this repo in the "Everything KaChat"
 //!   layout). Skipped when absent.
-//! - **v2**, frozen in `testdata/vectors-v2.json` (KaChat `e1e3455^`), so the follower keeps
-//!   following the live v2 testnet registry correctly until the v3 genesis.
+//! - **v2** and **v3**, frozen in `testdata/vectors-v2.json` (KaChat `e1e3455^`) and
+//!   `testdata/vectors-v3.json` (KaChat `0ed15e9^`), so every registry generation the follower
+//!   supports stays exactly right. The current file is registry v4 (KaChat `d82dfb2`).
 
 use std::collections::HashSet;
 
@@ -34,6 +35,8 @@ fn vector_sets() -> Vec<(&'static str, Value)> {
     }
     let v2 = load(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vectors-v2.json")).expect("testdata/vectors-v2.json");
     out.push(("v2 (testdata)", v2));
+    let v3 = load(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vectors-v3.json")).expect("testdata/vectors-v3.json");
+    out.push(("v3 (testdata)", v3));
     out
 }
 

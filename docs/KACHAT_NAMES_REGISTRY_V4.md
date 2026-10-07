@@ -15,6 +15,13 @@
 > indexer reports this registry id in `/names/status`, the app on KaChat branch `kachat-names-v4`
 > ignores it and walks the chain itself.
 
+> **Indexer: implemented (2026-10-07).** The follower takes `registryVersion` from the manifest:
+> v4 tracks the registry covenant only (no shards), with the v4 tags and periods from the
+> manifest. It replays the 35 v4 vector transactions exactly, plus the frozen v3 (38) and v2 (32)
+> sets in `kachat-names/testdata/`, and reads + verifies the live testnet-10 v4 manifest.
+> `/names/status` adds `registryVersion` (price ids stay null); `/names/prices` serves the two
+> fixed tables. Kaspa-Quick-Start bundles the v4 manifest.
+
 v4 is **v3 minus the price record**, with fixed prices baked into the contracts. Contracts are
 immutable, so this is a **new registry**; v3's test names are left behind, as v1's and v2's were.
 v4 is the design meant for mainnet.
