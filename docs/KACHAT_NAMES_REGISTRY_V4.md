@@ -1,10 +1,19 @@
 # `.kachat` names - registry v4 (2026-10-07)
 
-> **Not live yet.** The v4 testnet-10 genesis has not been sent. Until it is, keep following v3.
-> The registry id below is from the **dry-run** test vectors and will change at the real genesis.
-> The real manifest will be `manifests/kachat-names-testnet-10.json` in kachat-domains (branch
-> `v4`), and v3's will be archived next to it. When it lands: re-point
-> `KACHAT_NAMES_MANIFEST_TESTNET` at it; the new registry id resets the follower tables.
+> **LIVE on testnet-10 since 2026-10-07 ~11:58 UTC. Switch today.**
+> - genesis tx `b1f28a5f3ff917dc567fa038c80dc50539d42fa6f088bb2e008d5dad82f685a1`, accepted at
+>   DAA ~590415608; scan from block `2a15f3a5ca37501bf133f19742440645e9fd2e99580ea0f761843042ce90eba0`
+>   (the manifest's `genesis.scanFrom`);
+> - registry covenant id `bff185546af1940ec70d74143e23b5f018fdb864bd02e15ca9b4c8d8ede40e2f`;
+> - offer template hash `226def4b7fea21b21957c55fd47331b1d2f510fa2a63f8e7543bafaed4898e7d`;
+> - manifest: kachat-domains `manifests/kachat-names-testnet-10.json` (branch `v4`, `e774c86`);
+>   v3's is archived in `manifests/v3/`.
+>
+> Re-point `KACHAT_NAMES_MANIFEST_TESTNET` at the v4 manifest and restart the follower **the same
+> day**, while the scan-from block is still inside the node's pruning window
+> (`docs/KACHAT_NAMES_PRUNED_START.md`). The new registry id resets the tables. Until the
+> indexer reports this registry id in `/names/status`, the app on KaChat branch `kachat-names-v4`
+> ignores it and walks the chain itself.
 
 v4 is **v3 minus the price record**, with fixed prices baked into the contracts. Contracts are
 immutable, so this is a **new registry**; v3's test names are left behind, as v1's and v2's were.
@@ -15,7 +24,7 @@ The source of truth is KaspaSilver/kachat-domains, branch `v4`:
 - `contracts/*.sil`;
 - `tools/kachat-names-cli`.
 
-The iOS app is ported on KaChat branch `kachat-names-v4` (`0ed15e9`, `c8f1086`). Its chain
+The iOS app is ported on KaChat branch `kachat-names-v4` (`0ed15e9`, `c8f1086`, `d82dfb2`). Its chain
 walker, `KaChat/Services/KachatNames/KachatNamesRegistryState.swift`, is the reference for what
 this follower must produce.
 
@@ -48,7 +57,7 @@ template.
 |---|---|---|---|
 | KachatGap | 4057 B | 66 / 3990 | `85cf57f8d300331c2acc5191794065d60fafdd29cac90e3b82e3e1ba1c3876f0` (bakes only params: fixed before the genesis) |
 | KachatName | 3090 B | 126 / 2963 | `394204b612f345787412156521c0aabbd36bba30311f008302964d4c4ece685a` (bakes only params) |
-| KachatOffer | 1114 B | 108 / 1005 | depends on the registry id (dry run: `6f043410…f52a`) |
+| KachatOffer | 1114 B | 108 / 1005 | `226def4b7fea21b21957c55fd47331b1d2f510fa2a63f8e7543bafaed4898e7d` (bakes the registry id) |
 
 Three tags changed, because three entries lost their trailing `priceIdx` argument. Load the tags
 from the manifest per contract, as for v3.
@@ -122,6 +131,6 @@ Everything else (transfer, list, buy, offers, release, reclaim) is exactly as in
    withdraw), release and reclaim. The other 14 are edge cases on their own records. No step
    carries a `shard` record any more. Point `vector_replay.rs` at them. The app's walker passes all
    of `scripts/test_kachat_names_registry.swift` on this file.
-6. **Switch over:** follow the v4 manifest once the owner sends the genesis, the same day (the
-   start block must still be inside the node's pruning window, see
+6. **Switch over (now):** follow the v4 manifest; the genesis was sent 2026-10-07. Do it the same
+   day (the start block must still be inside the node's pruning window, see
    `docs/KACHAT_NAMES_PRUNED_START.md` §4). Stop following v3.
