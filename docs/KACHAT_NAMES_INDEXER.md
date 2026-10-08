@@ -278,7 +278,6 @@ never changes it.
     | Discord server invite | `https://discord.gg/<code>` | avatar, banner, bio |
     | Telegram | `https://t.me/<handle>` | avatar, bio |
     | Twitch | `https://www.twitch.tv/<handle>` | avatar, bio |
-    | Kick | `https://kick.com/<handle>` | avatar, bio |
     | GitHub | `https://github.com/<handle>` | avatar, bio |
     | Facebook | `https://www.facebook.com/<handle>` | avatar |
     | Instagram | `https://www.instagram.com/<handle>/` | avatar |
