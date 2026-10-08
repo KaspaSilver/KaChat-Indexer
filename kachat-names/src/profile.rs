@@ -19,7 +19,6 @@ const YOUTUBE: &str = "https://www.youtube.com/";
 const DISCORD: &str = "https://discord.gg/";
 const TELEGRAM: &str = "https://t.me/";
 const TWITCH: &str = "https://www.twitch.tv/";
-const KICK: &str = "https://kick.com/";
 const GITHUB: &str = "https://github.com/";
 const FACEBOOK: &str = "https://www.facebook.com/";
 const INSTAGRAM: &str = "https://www.instagram.com/";
@@ -27,9 +26,11 @@ const TIKTOK: &str = "https://www.tiktok.com/";
 const LINKEDIN: &str = "https://www.linkedin.com/";
 
 // Which platforms each field accepts (§C table).
-const AVATAR_HOSTS: &[&str] = &[X, YOUTUBE, DISCORD, TELEGRAM, TWITCH, KICK, GITHUB, FACEBOOK, INSTAGRAM, TIKTOK, LINKEDIN];
+// Kick was removed as a source on 2026-10-08 (docs/KACHAT_PROFILES_NO_KICK.md): a kick.com
+// link is dropped like any other link not allowed in its field.
+const AVATAR_HOSTS: &[&str] = &[X, YOUTUBE, DISCORD, TELEGRAM, TWITCH, GITHUB, FACEBOOK, INSTAGRAM, TIKTOK, LINKEDIN];
 const BANNER_HOSTS: &[&str] = &[X, YOUTUBE, DISCORD];
-const BIO_HOSTS: &[&str] = &[X, YOUTUBE, DISCORD, TELEGRAM, TWITCH, KICK, GITHUB];
+const BIO_HOSTS: &[&str] = &[X, YOUTUBE, DISCORD, TELEGRAM, TWITCH, GITHUB];
 
 const LINKTREE_PREFIX: &str = "https://linktr.ee/";
 
@@ -97,7 +98,6 @@ pub fn platform_of(url: &str) -> Option<&'static str> {
         (DISCORD, "discord"),
         (TELEGRAM, "telegram"),
         (TWITCH, "twitch"),
-        (KICK, "kick"),
         (GITHUB, "github"),
         (FACEBOOK, "facebook"),
         (INSTAGRAM, "instagram"),
@@ -136,7 +136,7 @@ mod tests {
         assert_eq!(p.avatar.as_deref(), Some("https://www.tiktok.com/@a")); // ok for avatar
         assert_eq!(p.banner, None); // instagram not allowed as banner
         assert_eq!(p.bio, None); // facebook not allowed as bio
-        // Telegram/Twitch/Kick/GitHub: bio+avatar yes, banner no.
+        // Telegram/Twitch/GitHub: bio+avatar yes, banner no.
         let p2 = parse_profile(r#"{"v":1,"banner":"https://github.com/a","bio":"https://github.com/a","avatar":"https://github.com/a"}"#).unwrap();
         assert_eq!(p2.banner, None);
         assert_eq!(p2.bio.as_deref(), Some("https://github.com/a"));
@@ -159,6 +159,14 @@ mod tests {
         assert!(parse_profile(r#"{"v":2,"avatar":"https://x.com/a"}"#).is_none());
         let big = format!("{{\"v\":1,\"avatar\":\"https://x.com/{}\"}}", "a".repeat(2100));
         assert!(parse_profile(&big).is_none());
+    }
+
+    #[test]
+    fn kick_is_no_longer_a_source() {
+        let p = parse_profile(r#"{"v":1,"avatar":"https://kick.com/a","bio":"https://kick.com/a","linktree":"https://linktr.ee/a"}"#).unwrap();
+        assert_eq!(p.avatar, None, "kick avatar dropped");
+        assert_eq!(p.bio, None, "kick bio dropped");
+        assert_eq!(p.linktree.as_deref(), Some("https://linktr.ee/a"), "the rest of the record stays");
     }
 
     #[test]

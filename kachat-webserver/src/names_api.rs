@@ -383,6 +383,27 @@ pub async fn expiring(State(state): State<Arc<AppState>>, Query(q): Query<PageQu
     }
 }
 
+/// `GET /names/all?cursor=` — every registered name UTXO, whatever its status (active, grace
+/// and lapsed alike: a lapsed name is on chain until someone reclaims it), ordered by key so
+/// pages are stable. For kachat-domains' `verify --live` completeness proof
+/// (docs/KACHAT_NAMES_ALL.md). Same shape and paging as `/names/expiring`.
+pub async fn all(State(state): State<Arc<AppState>>, Query(q): Query<PageQuery>) -> Response {
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let (len, off) = (page_len(&q), cursor(&q.cursor));
+    let sql = format!("{NAME_SELECT} ORDER BY u.key ASC LIMIT $1 OFFSET $2");
+    match sqlx::query(&sql).bind(len + 1).bind(off).fetch_all(&c.pool).await {
+        Ok(rows) => {
+            let more = rows.len() as i64 > len;
+            let names: Vec<Value> = rows.iter().take(len as usize).map(|r| name_json(&c, r)).collect();
+            Json(json!({ "names": names, "next": more.then(|| (off + len).to_string()) })).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
 /// `GET /names/grace?cursor=` — names that have expired and are still in their grace period
 /// (`expires_at <= now < expires_at + grace`), soonest release first, for the app's Expired tab
 /// (docs/KACHAT_NAMES_GRACE.md). Same shape and paging as `/names/expiring`.
