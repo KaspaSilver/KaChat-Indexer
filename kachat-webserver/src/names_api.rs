@@ -158,8 +158,8 @@ fn outpoint(r: &PgRow) -> Value {
 /// Name rows plus their registration/update times from history.
 const NAME_SELECT: &str = r#"
     SELECT u.*,
-      (SELECT h.at FROM names_history h WHERE h.key = u.key AND h.op = 'register' ORDER BY h.id DESC LIMIT 1) AS reg_at,
-      (SELECT h.tx_id FROM names_history h WHERE h.key = u.key AND h.op = 'register' ORDER BY h.id DESC LIMIT 1) AS reg_tx,
+      (SELECT h.at FROM names_history h WHERE h.key = u.key AND h.op IN ('register', 'import') ORDER BY h.id DESC LIMIT 1) AS reg_at,
+      (SELECT h.tx_id FROM names_history h WHERE h.key = u.key AND h.op IN ('register', 'import') ORDER BY h.id DESC LIMIT 1) AS reg_tx,
       (SELECT max(h.at) FROM names_history h WHERE h.key = u.key) AS upd_at
     FROM names_utxos u
     WHERE u.kind = 'name' AND NOT u.refuted"#;

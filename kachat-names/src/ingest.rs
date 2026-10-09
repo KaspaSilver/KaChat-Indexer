@@ -121,12 +121,12 @@ impl Templates {
             .and_then(|v| v.as_u64())
             .unwrap_or(2);
         let id = |key: &str| manifest.get(key).and_then(|v| v.as_str()).and_then(|s| decode32(s).ok());
-        if version > 4 {
+        if version > 5 {
             return None; // a registry this follower does not know: refuse, never guess
         }
         t.version = version as u32;
         if version >= 3 {
-            // v3 and v4: covenant-bound registry outputs and a manifest period.
+            // v3 and later: covenant-bound registry outputs and a manifest period.
             t.registry_id = Some(id("registryCovenantId")?);
             t.period_ms = manifest.get("params")?.get("periodMs")?.as_i64()?;
         }
@@ -463,6 +463,8 @@ impl Registry {
             }
         } else if has(Entry::GapRegister) {
             self.apply_register(templates, tx, spends, used, events);
+        } else if has(Entry::GapImport) {
+            self.apply_import(templates, tx, spends, used, events);
         } else {
             // Per-name continuations (transfer / list / buy / renew / extend) + offer accept.
             for (auth, _, tracked, entry, sig) in spends {
@@ -678,6 +680,46 @@ impl Registry {
             let mut e = self.event("register", nm.key, tx);
             e.to = Some(nm.owner);
             e.years = Some(years);
+            events.push(e);
+        }
+    }
+
+    /// Registry v5 `import`: outputs exactly as `register` (gap lo, gap hi, name), with the
+    /// owner and dates from the arguments. Nothing to verify here: the gap script already
+    /// checked the snapshot proof and the sponsor's or owner's signature.
+    fn apply_import(
+        &mut self,
+        templates: &Templates,
+        tx: &Tx,
+        spends: &[(usize, Outpoint, Tracked, Entry, crate::SigScript)],
+        used: &mut Vec<usize>,
+        events: &mut Vec<Event>,
+    ) {
+        let Some((auth, _, Tracked::Gap(gap), _, sig)) = spends.iter().find(|s| s.3 == Entry::GapImport).cloned() else {
+            return;
+        };
+        // import(name, owner, periodStart, expiresAt, index, proof, bySponsor, authSig, namePrefix, nameSuffix)
+        let name = sig.args.first().and_then(|a| a.data()).map(|d| d.to_vec());
+        let owner: Option<[u8; 32]> = sig.args.get(1).and_then(|a| a.data()).and_then(|d| d.try_into().ok());
+        let period_start = sig.args.get(2).and_then(|a| a.as_i64());
+        let expires_at = sig.args.get(3).and_then(|a| a.as_i64());
+        let (Some(name), Some(owner), Some(period_start), Some(expires_at)) = (name, owner, period_start, expires_at) else {
+            return;
+        };
+        if !crate::is_valid_name(&name) {
+            return;
+        }
+        let (left, right, nm) = transition::import_name(&gap, &name, owner, period_start, expires_at);
+        let bind = Self::reg_bind(templates, auth);
+        for g in [left, right] {
+            if let Some(i) = Self::find_output(tx, &templates.gap_spk(&g), used, bind) {
+                self.utxos.insert((tx.id, i as u32), Tracked::Gap(g));
+            }
+        }
+        if let Some(i) = Self::find_output(tx, &templates.name_spk(&nm), used, bind) {
+            self.utxos.insert((tx.id, i as u32), Tracked::Name(nm));
+            let mut e = self.event("import", nm.key, tx);
+            e.to = Some(nm.owner);
             events.push(e);
         }
     }

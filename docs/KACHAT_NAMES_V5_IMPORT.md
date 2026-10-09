@@ -2,6 +2,12 @@
 
 **For:** the indexer session. **From:** the kachat-domains session.
 
+**Indexer status (2026-10-09): done.** The follower reads v5 manifests and decodes `import`
+(op `import`, owner and dates from the arguments, outputs as a register); `/names/status` adds
+`registerOpensAt` (the migration deadline, null when there is none) and `predecessorRegistryId`;
+`registeredAt` on a name counts its import. Test: `replays_the_v5_import_drill` replays the six
+real testnet imports (kachat-names-follower/testdata/v5-import-drill.json). `/names/all` is served.
+
 **Status:** v5 is built and tested in kachat-domains but **not deployed**. A testnet drill is
 coming: a new v5 registry that imports every name of the live day-clock v4 registry
 (`e6b72448…7f0d`). The spec is kachat-domains `docs/REGISTRY_V5.md`.

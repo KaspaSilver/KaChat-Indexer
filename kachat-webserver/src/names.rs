@@ -172,6 +172,15 @@ pub async fn handle_names_status(
             "priceCovenantId": if synced { manifest_price.clone() } else { None },
             "manifestPriceCovenantId": manifest_price,
             "registryVersion": n.raw.as_ref().and_then(|r| r.get("registryVersion").cloned()),
+            // Registry v5 (KACHAT_NAMES_V5_IMPORT.md): a migrated registry refuses `register`
+            // until its import deadline, so the app can say when registration opens. Null for a
+            // registry with no predecessor (deadline 0) and for v2-v4.
+            "registerOpensAt": n.raw.as_ref()
+                .and_then(|r| r.pointer("/params/migration/deadlineMs"))
+                .and_then(|v| v.as_i64())
+                .filter(|d| *d > 0),
+            "predecessorRegistryId": n.raw.as_ref()
+                .and_then(|r| r.pointer("/params/migration/predecessorRegistryId").cloned()),
             "genesisTxId": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.txid.clone()),
             "scanFrom": n.manifest.as_ref().and_then(|m| m.genesis.as_ref()).and_then(|g| g.scan_from.clone()),
             "indexedDaa": indexed_daa,

@@ -25,6 +25,9 @@ pub enum Contract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
     GapRegister,
+    /// Registry v5: a name carried over from the predecessor registry's snapshot (the
+    /// contract checks the Merkle proof and the signature; decoded like a register).
+    GapImport,
     GapMerge,
     GapAbsorbed,
     NameTransfer,
@@ -54,6 +57,7 @@ impl Entry {
         use Entry::*;
         Some(match (contract, name) {
             (Contract::Gap, "register") => GapRegister,
+            (Contract::Gap, "import") => GapImport,
             (Contract::Gap, "merge") => GapMerge,
             (Contract::Gap, "absorbed") => GapAbsorbed,
             (Contract::Name, "transfer") => NameTransfer,
@@ -77,7 +81,7 @@ impl Entry {
     pub fn contract(self) -> Contract {
         use Entry::*;
         match self {
-            GapRegister | GapMerge | GapAbsorbed => Contract::Gap,
+            GapRegister | GapImport | GapMerge | GapAbsorbed => Contract::Gap,
             NameTransfer | NameList | NameBuy | NameRenew | NameExtend | NameRelease | NameReclaim => Contract::Name,
             OfferAccept | OfferWithdraw | OfferRefund | OfferDecline => Contract::Offer,
             PriceUse | PriceUpdate | PriceFollow => Contract::Price,
@@ -156,6 +160,22 @@ pub fn register_with_period(
         period_start: now_ms,
         expires_at: now_ms + years * period_ms,
     };
+    (left, right, nm)
+}
+
+/// Registry v5 gap `import(name, owner, periodStart, expiresAt, ...)`: the same split as a
+/// register, with the name's owner and paid period taken from the snapshot (its arguments).
+pub fn import_name(
+    gap: &GapState,
+    name: &[u8],
+    owner_key: [u8; 32],
+    period_start: i64,
+    expires_at: i64,
+) -> (GapState, GapState, NameState) {
+    let key = crate::name_key(name);
+    let left = GapState { lo: gap.lo, hi: key };
+    let right = GapState { lo: key, hi: gap.hi };
+    let nm = NameState { key, name: crate::pad_name(name), owner: owner_key, price: 0, period_start, expires_at };
     (left, right, nm)
 }
 

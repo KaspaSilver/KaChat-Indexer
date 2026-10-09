@@ -885,6 +885,44 @@ mod tests {
         assert_eq!(hex::encode(m.scan_from), "11".repeat(32), "v3 scans from the price genesis");
     }
 
+    /// Registry v5 (KACHAT_NAMES_V5_IMPORT.md): the testnet migration drill, frozen. Seeded with
+    /// the genesis gap, the six real `import` transactions (as api-tn10 serves them) must leave
+    /// exactly the snapshot's names -- each owner and paid period as the snapshot recorded it,
+    /// price 0 -- and the 7 gaps around them, every one at its real output.
+    #[test]
+    fn replays_the_v5_import_drill() {
+        let drill: serde_json::Value = serde_json::from_str(include_str!("../testdata/v5-import-drill.json")).unwrap();
+        let path = std::env::temp_dir().join("kachat-names-v5-drill-manifest.json");
+        std::fs::write(&path, drill["manifest"].to_string()).unwrap();
+        let m = read_manifest(path.to_str().unwrap()).unwrap();
+        assert_eq!(m.version, 5);
+
+        let mut reg = kachat_names::ingest::Registry::new();
+        reg.utxos.insert(m.genesis_outpoint, Tracked::Gap(m.genesis_gap));
+        let mut ops = Vec::new();
+        for j in drill["transactions"].as_array().unwrap() {
+            let rest = bootstrap::parse_rest_tx(j).expect("an accepted import tx");
+            for e in reg.apply(&m.templates, &rest.tx) {
+                ops.push(e.op);
+            }
+        }
+        assert_eq!(ops, vec!["import"; 6]);
+
+        let entries = drill["snapshot"]["entries"].as_array().unwrap();
+        let names: HashMap<String, kachat_names::NameState> = reg.names().map(|(_, n)| (n.name_str(), *n)).collect();
+        assert_eq!(names.len(), entries.len());
+        for e in entries {
+            let n = names[e["name"].as_str().unwrap()];
+            assert_eq!(hex::encode(n.owner), e["owner"].as_str().unwrap());
+            assert_eq!(n.period_start, e["periodStart"].as_i64().unwrap());
+            assert_eq!(n.expires_at, e["expiresAt"].as_i64().unwrap());
+            assert_eq!(n.price, 0, "imported names start unlisted");
+        }
+        let gaps = reg.utxos.values().filter(|t| matches!(t, Tracked::Gap(_))).count();
+        assert_eq!(gaps, 7, "6 names split the genesis gap into 7");
+        assert!(!reg.utxos.contains_key(&m.genesis_outpoint), "the genesis gap is spent");
+    }
+
     #[test]
     fn reads_the_live_testnet_manifest() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kachat-domains/manifests/kachat-names-testnet-10.json");
@@ -893,11 +931,11 @@ mod tests {
             return;
         }
         let m = read_manifest(path).unwrap();
-        // Registry v4 on the testnet day clock, redeployed 2026-10-07 (kachat-domains d53d7bf);
-        // the 10-minute v4 bff18554… and v3 90f56bd1… are retired.
-        assert_eq!(m.registry, "e6b7244831004e1db928458bce570347317b50ff124c010d342d73a6c2017f0d");
-        assert_eq!(m.version, 4);
-        assert_eq!(m.price_covenant_id, None, "v4 has no price record");
+        // Registry v5 on the testnet day clock (kachat-domains 0903875, 2026-10-09): it imported
+        // the v4 day-clock registry e6b72448…; v4 bff18554…/e6b72448… and v3 90f56bd1… are retired.
+        assert_eq!(m.registry, "fdc403f5ef76ea7c71dcb5305d09daf7ab7fd68dc1d274a314fc8ca9111e571d");
+        assert_eq!(m.version, 5);
+        assert_eq!(m.price_covenant_id, None, "v5, like v4, has no price record");
         assert!(m.price_shards.is_empty());
         assert_eq!(m.templates.period_ms, 86_400_000, "a 24-hour period on the testnet day clock");
         assert_eq!(m.grace_ms, 21_600_000, "6 hours of grace");
