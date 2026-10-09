@@ -9,8 +9,9 @@
 //!   layout). Skipped when absent.
 //! - **frozen copies:** `testdata/vectors-v2.json` (KaChat `e1e3455^`), `vectors-v3.json`
 //!   (KaChat `0ed15e9^`), `vectors-v4.json` (KaChat `d82dfb2`) and `vectors-v5.json`
-//!   (kachat-domains `ba8abe8`, `vectors/KachatNamesVectors-v5.json` on the audited templates: the
-//!   migration `import`).
+//!   (kachat-domains `a99afeb`, `vectors/KachatNamesVectors-v5.json` on the audited templates: the
+//!   migration `import`), and `vectors-mainnet.json` (kachat-domains `a99afeb`: .kachat mainnet
+//!   v1, the v4 contracts on the mainnet params and registry 348bd2c8…).
 
 use std::collections::HashSet;
 
@@ -42,6 +43,8 @@ fn vector_sets() -> Vec<(&'static str, Value)> {
     out.push(("v4 (testdata)", v4));
     let v5 = load(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vectors-v5.json")).expect("testdata/vectors-v5.json");
     out.push(("v5 (testdata)", v5));
+    let main = load(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vectors-mainnet.json")).expect("testdata/vectors-mainnet.json");
+    out.push(("mainnet v1 (testdata)", main));
     out
 }
 
