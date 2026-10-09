@@ -102,6 +102,20 @@ fn with_internal_secret(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder 
     }
 }
 
+/// kachat-audits IDX-024: what to tell the panel when the chat indexer answered but refused
+/// (401 without the secret) or failed (500). 4xx pass through; 5xx become 500, not 502,
+/// because the panel reads 502 as "the indexer is not answering yet". The message carries
+/// the upstream status and the start of its body.
+fn upstream_failure(status: reqwest::StatusCode, body: &str) -> (StatusCode, String) {
+    let code = if status.is_server_error() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)
+    };
+    let snippet: String = body.trim().chars().take(200).collect();
+    (code, format!("chat indexer answered {}: {}", status.as_u16(), snippet))
+}
+
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
@@ -253,6 +267,25 @@ mod cross_site_tests {
         assert!(is_cross_site(&h(&[("sec-fetch-site", "cross-site"), ("host", "localhost:3081")])));
         assert!(!is_cross_site(&h(&[("origin", "http://localhost:3081"), ("host", "localhost:3081")])));
         assert!(!is_cross_site(&h(&[("host", "kachat-app:3081")])), "server-side proxy sends no Origin");
+    }
+}
+
+#[cfg(test)]
+mod upstream_failure_tests {
+    use super::upstream_failure;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn keeps_4xx_maps_5xx_to_500_and_names_the_status() {
+        let (code, msg) = upstream_failure(reqwest::StatusCode::UNAUTHORIZED, "unauthorized");
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert_eq!(msg, "chat indexer answered 401: unauthorized");
+        let (code, msg) = upstream_failure(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "{\"error\":\"import failed\"}",
+        );
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "502 would read as 'not answering' in the panel");
+        assert!(msg.contains("500") && msg.contains("import failed"));
     }
 }
 
@@ -876,6 +909,12 @@ async fn post_chat_import(
     resp.forwarded = to_import.len();
     for chunk in to_import.chunks(200) {
         match with_internal_secret(client.post(&state.chat_import_url)).json(&chunk).send().await {
+            Ok(r) if !r.status().is_success() => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                resp.error = Some(upstream_failure(status, &body).1);
+                break;
+            }
             Ok(r) => {
                 let dto: ImportResultDto = r.json().await.unwrap_or_default();
                 resp.imported += dto.imported;
@@ -941,7 +980,12 @@ async fn post_chat_import_file(
         .await
     {
         Ok(r) => {
+            let status = r.status();
             let txt = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                // Plain text: the panel shows this body as the error.
+                return upstream_failure(status, &txt).into_response();
+            }
             (StatusCode::OK, txt).into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("import failed: {e}")).into_response(),
@@ -1433,7 +1477,14 @@ async fn post_chat_purge(State(state): State<AppState>) -> axum::response::Respo
     };
     match with_internal_secret(client.post(&state.chat_purge_url)).send().await {
         Ok(r) => {
+            let status = r.status();
             let txt = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                // JSON `error`: the panel's kachat() helper reads `data.error`.
+                let (code, msg) = upstream_failure(status, &txt);
+                error!("chat store purge failed: {msg}");
+                return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+            }
             info!("kachat-admin triggered chat store purge");
             (StatusCode::OK, txt).into_response()
         }

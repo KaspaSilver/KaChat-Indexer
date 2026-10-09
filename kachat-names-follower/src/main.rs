@@ -717,15 +717,7 @@ async fn run(args: Args) -> Result<()> {
                 .collect();
             for (n, (event, days, kind)) in due {
                 if store::claim_reminder(&pool, &n.key, n.expires_at, kind, now).await? {
-                    let p = pushes::NamePush {
-                        to_key: n.owner,
-                        event,
-                        name: n.name_str(),
-                        tx_id: String::new(),
-                        amount: None,
-                        days,
-                        dedup: format!("{}:{}:{kind}", hex::encode(n.key), n.expires_at),
-                    };
+                    let p = pushes::NamePush::reminder(&n, event, days, kind);
                     send_push(&http, &args.push_url, push_secret, m.prefix, &p).await;
                 }
             }

@@ -4,9 +4,10 @@
 //! relayed to the chat indexer's `/internal/push/submit-tx` (the only service on a node-compatible
 //! wRPC version). See the KaPosts handoff §5.10.
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::{
@@ -14,6 +15,10 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use kaspa_addresses::{Address, Prefix, Version};
+use kaspa_rpc_core::api::rpc::RpcApi;
+use kaspa_wrpc_client::client::{ConnectOptions, ConnectStrategy};
+use kaspa_wrpc_client::{KaspaRpcClient, WrpcEncoding};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -22,15 +27,20 @@ use crate::web_server::AppState;
 
 /// Farthest ahead a post may be scheduled (§5.10): 30 days.
 const MAX_SCHEDULE_AHEAD_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// Farthest ahead for a key that has never posted on KaPosts (kachat-audits IDX-019): 48 h, so
+/// a fresh key cannot park a row for a month.
+const MAX_SCHEDULE_AHEAD_NEW_KEY_MS: i64 = 48 * 60 * 60 * 1000;
 /// How many due posts to submit per scheduler tick.
 const TICK_BATCH: i64 = 50;
 /// Largest transaction accepted, as JSON. A post is at most a few KB of payload; this is the
 /// KaPosts budget with room for many inputs.
 const MAX_TRANSACTION_JSON: usize = 100 * 1024;
-/// Posts one key may have waiting (`scheduled`) at once.
-const MAX_SCHEDULED_PER_PUBKEY: i64 = 50;
-/// Posts waiting across everyone; past this new schedules are refused until some go out.
-const MAX_SCHEDULED_TOTAL: i64 = 20_000;
+/// Posts one key may have waiting (`scheduled`) at once. There is no global cap (IDX-019): every
+/// waiting row is backed by its own unspent coin of the key's address (checked at submission,
+/// and no two waiting rows may spend the same coin), so rows cost real funds to hold.
+const MAX_SCHEDULED_PER_PUBKEY: usize = 50;
+/// Longest a single node call may take before the request answers 503 / the tick moves on.
+const NODE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Finished rows (`submitted`, `failed`, `cancelled`) are kept this long for the owner's list.
 const KEEP_FINISHED_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -215,6 +225,131 @@ fn transaction_id(transaction: &serde_json::Value) -> Option<String> {
     Some(tx.id().to_string())
 }
 
+// ------------------------------------------------------------------ node (IDX-019) ---
+
+static NODE: OnceLock<Option<KaspaRpcClient>> = OnceLock::new();
+
+/// The node's wRPC Borsh endpoint (`KASPA_NODE_WBORSH_URL`, as the processor and chat indexer).
+fn node_url() -> String {
+    std::env::var("KASPA_NODE_WBORSH_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ws://127.0.0.1:17110".to_string())
+}
+
+/// The node client, created on first use and connected in the background (retrying forever).
+/// Must be called inside the tokio runtime.
+fn node() -> Option<&'static KaspaRpcClient> {
+    NODE.get_or_init(|| {
+        let url = node_url();
+        let client = match KaspaRpcClient::new(WrpcEncoding::Borsh, Some(&url), None, None, None) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("[scheduled] bad node URL {url}: {e}; /schedule-post answers 503");
+                return None;
+            }
+        };
+        let connecting = client.clone();
+        tokio::spawn(async move {
+            let options = ConnectOptions {
+                block_async_connect: false,
+                connect_timeout: Some(Duration::from_secs(15)),
+                strategy: ConnectStrategy::Retry,
+                ..Default::default()
+            };
+            match connecting.connect(Some(options)).await {
+                Ok(_) => tracing::info!("[scheduled] node wRPC at {url}"),
+                Err(e) => tracing::warn!("[scheduled] connecting to node {url}: {e}"),
+            }
+        });
+        Some(client)
+    })
+    .as_ref()
+}
+
+/// Address prefix from `NETWORK` (`mainnet` | `testnet-10` | …), as the processor and names
+/// follower read it; unset means mainnet.
+fn network_prefix() -> Prefix {
+    prefix_for(&std::env::var("NETWORK").unwrap_or_default())
+}
+
+fn prefix_for(network: &str) -> Prefix {
+    let n = network.trim().to_ascii_lowercase();
+    if n.starts_with("testnet") {
+        Prefix::Testnet
+    } else if n.starts_with("devnet") {
+        Prefix::Devnet
+    } else if n.starts_with("simnet") {
+        Prefix::Simnet
+    } else {
+        Prefix::Mainnet
+    }
+}
+
+/// The schnorr P2PK address of a 66-hex compressed or 64-hex x-only pubkey: the wallet address
+/// whose coins a KaChat self-send spends.
+fn pubkey_address(prefix: Prefix, pubkey_hex: &str) -> Option<Address> {
+    let pk = hex::decode(pubkey_hex.trim()).ok()?;
+    let xonly = match pk.len() {
+        33 if pk[0] == 2 || pk[0] == 3 => &pk[1..],
+        32 => &pk[..],
+        _ => return None,
+    };
+    Some(Address::new(prefix, Version::PubKey, xonly))
+}
+
+/// A coin: (previous transaction id, lowercase hex; output index).
+type Outpoint = (String, u32);
+
+/// The outpoints a stored transaction spends; `None` if it does not decode.
+fn tx_outpoints(transaction: &serde_json::Value) -> Option<Vec<Outpoint>> {
+    let tx: TxJson = serde_json::from_value(inner_tx(transaction)).ok()?;
+    Some(
+        tx.inputs
+            .into_iter()
+            .map(|i| (i.previous_outpoint.transaction_id.trim().to_lowercase(), i.previous_outpoint.index))
+            .collect(),
+    )
+}
+
+/// The first input that is not in `unspent` (spent, never existed, or someone else's coin).
+fn first_missing<'a>(inputs: &'a [Outpoint], unspent: &HashSet<Outpoint>) -> Option<&'a Outpoint> {
+    inputs.iter().find(|o| !unspent.contains(*o))
+}
+
+/// The first input of `inputs` that another waiting row already spends, with that row's txId.
+fn first_reserved<'a>(inputs: &'a [Outpoint], others: &[(String, Vec<Outpoint>)]) -> Option<(&'a Outpoint, String)> {
+    inputs.iter().find_map(|o| others.iter().find(|(_, theirs)| theirs.contains(o)).map(|(tid, _)| (o, tid.clone())))
+}
+
+/// The unspent coins of `address`, per the node's UTXO index. `Err` when the node is not
+/// configured, not connected (yet), slow, or fails: callers must not treat that as "spent".
+async fn unspent_outpoints(address: &Address) -> Result<HashSet<Outpoint>, String> {
+    let node = node().ok_or("no node client")?;
+    if !node.is_connected() {
+        return Err("node not connected".to_string());
+    }
+    let entries = tokio::time::timeout(NODE_CALL_TIMEOUT, node.get_utxos_by_addresses(vec![address.clone()]))
+        .await
+        .map_err(|_| "getUtxosByAddresses timed out".to_string())?
+        .map_err(|e| format!("getUtxosByAddresses: {e}"))?;
+    Ok(entries
+        .into_iter()
+        .map(|e| (e.outpoint.transaction_id.to_string().to_lowercase(), e.outpoint.index))
+        .collect())
+}
+
+fn node_unavailable() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            error: "cannot check the transaction's coins right now; try again later".to_string(),
+            code: "NODE_UNAVAILABLE".to_string(),
+        }),
+    )
+}
+
 fn too_many(msg: &str) -> (StatusCode, Json<ApiError>) {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -301,7 +436,8 @@ pub async fn handle_schedule_post(
         return Err(bad_request("invalid schedule signature"));
     }
 
-    // 2) notBefore must be in the future and within 30 days.
+    // 2) notBefore must be in the future and within 30 days (48 h for a key with no KaPosts
+    //    history, checked below once the key is known to be well-formed).
     let now = now_ms();
     if req.not_before <= now || req.not_before > now + MAX_SCHEDULE_AHEAD_MS {
         return Err(bad_request("notBefore must be within (now, now+30d]"));
@@ -333,27 +469,66 @@ pub async fn handle_schedule_post(
     let tx_id_bytes = hex::decode(&tx_id).map_err(|_| bad_request("txId is not hex"))?;
     let pubkey_bytes = hex::decode(&pubkey).map_err(|_| bad_request("pubkey is not hex"))?;
     let preview = payload_preview(&payload);
+    let address = pubkey_address(network_prefix(), &pubkey).ok_or_else(|| bad_request("pubkey is not a public key"))?;
+    let inputs = tx_outpoints(&req.transaction).ok_or_else(|| bad_request("transaction does not decode"))?;
+    if inputs.is_empty() {
+        return Err(bad_request("transaction has no inputs"));
+    }
 
-    // 5) Quotas: a key's waiting posts, and everyone's.
-    let row = sqlx::query(
-        "SELECT COUNT(*) FILTER (WHERE pubkey = $1) AS mine, COUNT(*) AS total \
-         FROM k_scheduled_posts WHERE status = 'scheduled'",
+    // 5) A key that has never posted may only schedule 48 h ahead (IDX-019).
+    if req.not_before > now + MAX_SCHEDULE_AHEAD_NEW_KEY_MS {
+        let seen: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM k_contents WHERE sender_pubkey = $1)")
+            .bind(&pubkey_bytes)
+            .fetch_one(&state.scheduled_pool)
+            .await
+            .map_err(storage_error)?;
+        if !seen {
+            return Err(bad_request("a key with no KaPosts yet may schedule at most 48 hours ahead"));
+        }
+    }
+
+    // 6) Quota: a key's waiting posts (a retry of the same txId is not counted), and no coin
+    //    may back two waiting posts.
+    let waiting = sqlx::query(
+        "SELECT encode(tx_id, 'hex') AS tid, transaction_json FROM k_scheduled_posts \
+         WHERE pubkey = $1 AND status = 'scheduled' AND tx_id <> $2",
     )
     .bind(&pubkey_bytes)
-    .fetch_one(&state.scheduled_pool)
+    .bind(&tx_id_bytes)
+    .fetch_all(&state.scheduled_pool)
     .await
     .map_err(storage_error)?;
-    if row.get::<i64, _>("mine") >= MAX_SCHEDULED_PER_PUBKEY {
+    if waiting.len() >= MAX_SCHEDULED_PER_PUBKEY {
         return Err(too_many("too many scheduled posts for this key (50)"));
     }
-    if row.get::<i64, _>("total") >= MAX_SCHEDULED_TOTAL {
+    let others: Vec<(String, Vec<Outpoint>)> = waiting
+        .iter()
+        .filter_map(|r| {
+            let tx: serde_json::Value = serde_json::from_str(r.get::<&str, _>("transaction_json")).ok()?;
+            Some((r.get::<String, _>("tid"), tx_outpoints(&tx)?))
+        })
+        .collect();
+    if let Some(((txid, index), other)) = first_reserved(&inputs, &others) {
         return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::CONFLICT,
             Json(ApiError {
-                error: "the scheduler is full; try again later".to_string(),
-                code: "SCHEDULER_FULL".to_string(),
+                error: format!("input {txid}:{index} already backs scheduled post {other}"),
+                code: "INPUT_RESERVED".to_string(),
             }),
         ));
+    }
+
+    // 7) Every input must be an unspent coin of the key's own address (IDX-019): a waiting
+    //    row then costs real funds. No node, no row: unverified rows are never accepted.
+    let unspent = match unspent_outpoints(&address).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("schedule-post: cannot check coins of {address}: {e}");
+            return Err(node_unavailable());
+        }
+    };
+    if let Some((txid, index)) = first_missing(&inputs, &unspent) {
+        return Err(bad_request(&format!("input {txid}:{index} is not an unspent coin of {address}")));
     }
 
     // Idempotent on txId.
@@ -527,6 +702,8 @@ pub async fn handle_cancel_scheduled_post(
 /// `scheduled` so the next tick retries; a node rejection is terminal (`failed`, no retry) per §5.10.
 pub fn spawn_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
+        // Start connecting to the node now, not on the first /schedule-post.
+        let _ = node();
         // Small initial delay so the API + node connection settle after startup.
         tokio::time::sleep(Duration::from_secs(20)).await;
         loop {
@@ -541,12 +718,17 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
 async fn tick(state: &Arc<AppState>) -> anyhow::Result<()> {
     let now = now_ms();
     prune(state, now).await;
+    // Round-robin per key (IDX-019): every key's first due post, then every key's second, …,
+    // so one key's backlog cannot starve the others.
     let due = sqlx::query(
         r#"
-        SELECT encode(tx_id, 'hex') as tid, transaction_json
-        FROM k_scheduled_posts
-        WHERE status = 'scheduled' AND not_before <= $1
-        ORDER BY not_before ASC
+        SELECT tid, pk, transaction_json FROM (
+            SELECT encode(tx_id, 'hex') AS tid, encode(pubkey, 'hex') AS pk, transaction_json, not_before,
+                   ROW_NUMBER() OVER (PARTITION BY pubkey ORDER BY not_before, created_at) AS turn
+            FROM k_scheduled_posts
+            WHERE status = 'scheduled' AND not_before <= $1
+        ) due
+        ORDER BY turn, not_before
         LIMIT $2
         "#,
     )
@@ -561,9 +743,14 @@ async fn tick(state: &Arc<AppState>) -> anyhow::Result<()> {
     let base = internal_base();
     let secret = internal_secret();
     let submit_url = format!("{base}/submit-tx");
+    let prefix = network_prefix();
+    // Each key's unspent coins, asked once per tick; `None` = node unavailable (relay anyway,
+    // the node is the final judge).
+    let mut coins: HashMap<String, Option<HashSet<Outpoint>>> = HashMap::new();
 
     for row in due {
         let tid: String = row.get("tid");
+        let pk: String = row.get("pk");
         let tx_json_str: String = row.get("transaction_json");
         let transaction: serde_json::Value = match serde_json::from_str(&tx_json_str) {
             Ok(v) => v,
@@ -572,6 +759,28 @@ async fn tick(state: &Arc<AppState>) -> anyhow::Result<()> {
                 continue;
             }
         };
+        // IDX-019: a post whose coins are already spent fails here, without bothering the
+        // node; a failed row no longer counts against its key's quota.
+        let inputs = tx_outpoints(&transaction).unwrap_or_default();
+        if !coins.contains_key(&pk) {
+            let unspent = match pubkey_address(prefix, &pk) {
+                Some(address) => match unspent_outpoints(&address).await {
+                    Ok(u) => Some(u),
+                    Err(e) => {
+                        tracing::warn!("[scheduled] cannot check coins of {address}: {e}; relaying unchecked");
+                        None
+                    }
+                },
+                None => None,
+            };
+            coins.insert(pk.clone(), unspent);
+        }
+        if let Some(Some(unspent)) = coins.get(&pk) {
+            if let Some((txid, index)) = first_missing(&inputs, unspent) {
+                mark_failed(state, &tid, &format!("input {txid}:{index} is already spent")).await;
+                continue;
+            }
+        }
         let body = serde_json::json!({ "transaction": inner_tx(&transaction) });
         let mut rb = state.http.post(&submit_url).json(&body);
         if let Some(s) = &secret {
@@ -588,6 +797,12 @@ async fn tick(state: &Arc<AppState>) -> anyhow::Result<()> {
                 .execute(&state.scheduled_pool)
                 .await;
                 tracing::info!("[scheduled] submitted {tid}");
+                // Its coins are spent now, for this key's later rows in the same tick.
+                if let Some(Some(unspent)) = coins.get_mut(&pk) {
+                    for o in &inputs {
+                        unspent.remove(o);
+                    }
+                }
             }
             Ok(resp) => {
                 // Node rejected it (e.g. inputs already spent) — terminal, no retry (§5.10).
@@ -705,6 +920,47 @@ mod tests {
             "payload": hex::encode(b"kchat:1:post:02aa:aGk="),
         });
         assert_eq!(transaction_id(&body).as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn network_prefix_and_pubkey_address() {
+        assert_eq!(prefix_for("mainnet"), Prefix::Mainnet);
+        assert_eq!(prefix_for(""), Prefix::Mainnet);
+        assert_eq!(prefix_for("testnet-10"), Prefix::Testnet);
+        // One x-only key, given compressed and bare.
+        let xonly = "6de5e929bd243cb85763b3cbd0bec2c1d3d97f9ba11dfde2df58d1003a20c09d";
+        let want = Address::new(Prefix::Testnet, Version::PubKey, &hex::decode(xonly).unwrap());
+        assert_eq!(pubkey_address(Prefix::Testnet, &format!("02{xonly}")), Some(want.clone()));
+        assert_eq!(pubkey_address(Prefix::Testnet, xonly), Some(want));
+        assert!(pubkey_address(Prefix::Mainnet, xonly).unwrap().to_string().starts_with("kaspa:q"));
+        assert_eq!(pubkey_address(Prefix::Mainnet, "04aa"), None);
+        assert_eq!(pubkey_address(Prefix::Mainnet, &format!("04{xonly}")), None);
+    }
+
+    #[test]
+    fn inputs_must_be_unspent_and_not_reserved() {
+        let body = serde_json::json!({ "transaction": {
+            "version": 0,
+            "inputs": [{
+                "previousOutpoint": { "transactionId": "AB".repeat(32), "index": 1 },
+                "signatureScript": "4101", "sequence": 0, "sigOpCount": 1
+            }],
+            "outputs": [{ "amount": 1, "scriptPublicKey": { "version": 0, "scriptPublicKey": "20aaac" } }],
+            "lockTime": 0, "subnetworkId": "0000000000000000000000000000000000000000", "payload": "",
+        }});
+        let inputs = tx_outpoints(&body).unwrap();
+        assert_eq!(inputs, vec![("ab".repeat(32), 1)]);
+        let mut unspent = HashSet::new();
+        assert_eq!(first_missing(&inputs, &unspent), Some(&inputs[0]));
+        unspent.insert(("ab".repeat(32), 0));
+        assert_eq!(first_missing(&inputs, &unspent), Some(&inputs[0]), "same tx, other index");
+        unspent.insert(("ab".repeat(32), 1));
+        assert_eq!(first_missing(&inputs, &unspent), None);
+
+        let others = vec![("t1".to_string(), vec![("cd".repeat(32), 1)])];
+        assert_eq!(first_reserved(&inputs, &others), None);
+        let others = vec![("t2".to_string(), vec![("ab".repeat(32), 1)])];
+        assert_eq!(first_reserved(&inputs, &others).map(|(_, t)| t), Some("t2".to_string()));
     }
 
     #[test]

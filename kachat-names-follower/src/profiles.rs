@@ -18,7 +18,7 @@ use kaspa_addresses::Prefix;
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_rpc_core::model::RpcHash;
 use sqlx::{PgPool, Row};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::node::Node;
 use crate::{Args, Prefetched, Window, spk_address};
@@ -73,6 +73,14 @@ async fn create_schema(pool: &PgPool) -> Result<()> {
         "ALTER TABLE profile_saves ADD COLUMN IF NOT EXISTS profile TEXT",
         r#"UPDATE profile_saves s SET profile = p.profile FROM names_profiles p
            WHERE s.profile IS NULL AND s.tx_id = p.tx_id"#,
+        // IDX-023: the last history gap (checkpoint pruned while the follower was off; the
+        // follower re-anchored at the node's pruning point), and the current fetch error.
+        "ALTER TABLE profiles_state ADD COLUMN IF NOT EXISTS gap_from_daa BIGINT",
+        "ALTER TABLE profiles_state ADD COLUMN IF NOT EXISTS gap_to_daa BIGINT",
+        "ALTER TABLE profiles_state ADD COLUMN IF NOT EXISTS gap_from_block BYTEA",
+        "ALTER TABLE profiles_state ADD COLUMN IF NOT EXISTS gap_to_block BYTEA",
+        "ALTER TABLE profiles_state ADD COLUMN IF NOT EXISTS gap_at BIGINT",
+        "ALTER TABLE profiles_state ADD COLUMN IF NOT EXISTS last_error TEXT",
     ] {
         sqlx::query(stmt).execute(pool).await?;
     }
@@ -109,7 +117,7 @@ async fn load_state(pool: &PgPool, network: &str) -> Result<State> {
 async fn write_state(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, s: &State, scan_from: Option<[u8; 32]>) -> Result<()> {
     sqlx::query(
         r#"UPDATE profiles_state SET checkpoint = $1, indexed_daa = $2, virtual_daa = $3, synced = $4,
-               scan_from = COALESCE(scan_from, $5),
+               scan_from = COALESCE(scan_from, $5), last_error = NULL,
                updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT
            WHERE id = 1"#,
     )
@@ -121,6 +129,93 @@ async fn write_state(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, s: &State, 
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// Heartbeat while fetches fail (IDX-023): the API keeps seeing a live follower (503
+/// "syncing" with the reason) rather than a dead one.
+async fn write_failing(pool: &PgPool, virtual_daa: u64, error: &str) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE profiles_state SET virtual_daa = $1, synced = FALSE, last_error = $2,
+               updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT
+           WHERE id = 1"#,
+    )
+    .bind(virtual_daa as i64)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Record a history gap and the new anchor (IDX-023). The profile tables are kept: they are
+/// still right up to the old checkpoint; only what was saved inside the gap is missed.
+async fn write_gap(pool: &PgPool, s: &State, gap: &Gap) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE profiles_state SET checkpoint = $1, indexed_daa = $2, virtual_daa = $3, synced = FALSE,
+               gap_from_daa = $4, gap_to_daa = $5, gap_from_block = $6, gap_to_block = $7,
+               gap_at = (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT, last_error = NULL,
+               updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT
+           WHERE id = 1"#,
+    )
+    .bind(s.checkpoint.map(|c| c.to_vec()))
+    .bind(s.indexed_daa as i64)
+    .bind(s.virtual_daa as i64)
+    .bind(gap.from_daa as i64)
+    .bind(gap.to_daa as i64)
+    .bind(gap.from_block.to_vec())
+    .bind(gap.to_block.to_vec())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A stretch of chain the follower could not read: from its old checkpoint to the node's
+/// pruning point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gap {
+    from_block: [u8; 32],
+    from_daa: u64,
+    to_block: [u8; 32],
+    to_daa: u64,
+}
+
+/// How many fetch failures in a row, each with the checkpoint found pruned, before
+/// re-anchoring: one odd answer (a node restarting mid-check) must not drop history.
+const PRUNED_CONFIRMATIONS: u32 = 3;
+
+/// The decision (pure, tested): is the checkpoint below the node's pruning point, so the
+/// chain can never be followed from it again? `from_daa` is the checkpoint block's DAA
+/// score if the node still knows it (`None`: header gone). A node that is unreachable never
+/// gets here (the caller needs its pruning point first).
+fn checkpoint_pruned(from: [u8; 32], from_daa: Option<u64>, pruning: [u8; 32], pruning_daa: u64) -> bool {
+    if from == pruning {
+        return false;
+    }
+    match from_daa {
+        // The header is gone: pruned (an archival node keeps every header).
+        None => true,
+        Some(d) => d < pruning_daa,
+    }
+}
+
+/// After a fetch error: `Some(gap)` when the checkpoint is pruned on this node. Any RPC
+/// failure in the check itself answers `None` (retry as a transient error).
+async fn pruned_gap(node: &Node, from: [u8; 32], indexed_daa: u64) -> Option<Gap> {
+    let info = node.client.get_block_dag_info().await.ok()?;
+    let pruning = info.pruning_point_hash;
+    let pruning_daa = node.client.get_block(pruning, false).await.ok()?.header.daa_score;
+    let from_daa = match node.client.get_block(RpcHash::from_bytes(from), false).await {
+        Ok(b) => Some(b.header.daa_score),
+        // Only a "not there" answer (kaspad: "cannot find header|full block") means pruned;
+        // anything else (a dropped connection) is transient.
+        Err(e) if e.to_string().contains("cannot find") => None,
+        Err(_) => return None,
+    };
+    checkpoint_pruned(from, from_daa, pruning.as_bytes(), pruning_daa).then(|| Gap {
+        from_block: from,
+        from_daa: from_daa.unwrap_or(indexed_daa),
+        to_block: pruning.as_bytes(),
+        to_daa: pruning_daa,
+    })
 }
 
 /// Where a first run starts: `KACHAT_PROFILES_SCAN_FROM`, else the names manifest's
@@ -195,6 +290,7 @@ pub async fn run(args: &Args) -> Result<()> {
 
     let mut window = Window::default();
     let mut last_heartbeat = Instant::now() - Duration::from_secs(60);
+    let mut pruned_streak = 0u32;
     loop {
         let from = follower.checkpoint.ok_or_else(|| anyhow!("lost the checkpoint"))?;
         let (batch, last_daa) = match node.next_batch(from, args.min_confirmations, window.0).await {
@@ -205,6 +301,40 @@ pub async fn run(args: &Args) -> Result<()> {
             Err(e) => {
                 window.failed();
                 warn!("[profiles] fetch failed ({e:#}); next batch capped to {:?} blue score", window.0);
+                // IDX-023: a checkpoint below the node's pruning point (follower or node off
+                // for longer than the pruning depth) never comes back: re-anchor there.
+                let gap = pruned_gap(&node, from, state.indexed_daa).await;
+                pruned_streak = if gap.is_some() { pruned_streak + 1 } else { 0 };
+                if pruned_streak >= PRUNED_CONFIRMATIONS
+                    && let Some(gap) = gap
+                {
+                    pruned_streak = 0;
+                    error!(
+                        "[profiles] checkpoint {} (DAA {}) is below the node's pruning point: re-anchoring at {} (DAA {}); profile saves in between are missed",
+                        hex::encode(gap.from_block),
+                        gap.from_daa,
+                        hex::encode(gap.to_block),
+                        gap.to_daa
+                    );
+                    follower.checkpoint = Some(gap.to_block);
+                    state.checkpoint = Some(gap.to_block);
+                    state.indexed_daa = gap.to_daa;
+                    state.virtual_daa = node.virtual_daa().await.unwrap_or(state.virtual_daa);
+                    state.synced = false;
+                    window = Window::default();
+                    write_gap(&pool, &state, &gap).await?;
+                    continue;
+                }
+                state.virtual_daa = node.virtual_daa().await.unwrap_or(state.virtual_daa);
+                state.synced = false;
+                let reason = if pruned_streak > 0 {
+                    format!("checkpoint below the node's pruning point (confirming): {e:#}")
+                } else {
+                    format!("{e:#}")
+                };
+                if let Err(e) = write_failing(&pool, state.virtual_daa, &reason).await {
+                    warn!("[profiles] could not write the heartbeat ({e:#})");
+                }
                 tokio::time::sleep(Duration::from_millis(args.poll_ms * 5)).await;
                 continue;
             }
@@ -306,5 +436,26 @@ pub async fn run(args: &Args) -> Result<()> {
         if follower.checkpoint.is_none() {
             bail!("lost the checkpoint");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: [u8; 32] = [1; 32];
+    const P: [u8; 32] = [2; 32];
+
+    #[test]
+    fn checkpoint_pruned_decision() {
+        // The pruning point itself can always be followed from.
+        assert!(!checkpoint_pruned(P, Some(500), P, 500));
+        assert!(!checkpoint_pruned(P, None, P, 500));
+        // Header gone: pruned.
+        assert!(checkpoint_pruned(A, None, P, 500));
+        // Still known: pruned only below the pruning point.
+        assert!(checkpoint_pruned(A, Some(499), P, 500));
+        assert!(!checkpoint_pruned(A, Some(500), P, 500));
+        assert!(!checkpoint_pruned(A, Some(10_000), P, 500));
     }
 }

@@ -33,3 +33,7 @@ secp256k1 = "0.29"
 # §5.10: recompute a scheduled transaction's id (no tag: unifies with kaspa-wallet-core's rev).
 kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git" }
 base64 = "0.21"
+# kachat-audits IDX-019: /schedule-post checks each input is an unspent coin of the poster's
+# address (getUtxosByAddresses over wRPC). No tag: same rev as the processor and names follower.
+kaspa-wrpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git" }
+kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git" }

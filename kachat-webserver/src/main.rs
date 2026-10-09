@@ -82,7 +82,7 @@ struct Args {
         long,
         env = "WEBSERVER_TRUSTED_PROXIES",
         default_value = config::DEFAULT_TRUSTED_PROXIES,
-        help = "Comma-separated proxy addresses/CIDRs whose X-Real-IP / X-Forwarded-For are honoured (empty: none)"
+        help = "Comma-separated proxy addresses/CIDRs whose forwarded headers are honoured: last X-Forwarded-For hop, else X-Real-IP (empty: none)"
     )]
     trusted_proxies: String,
 }

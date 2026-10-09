@@ -171,6 +171,9 @@ impl KDbClient {
         // Step 1c': safe nickname decode + one-off cleanup of undecodable nicknames (IDX-005).
         self.create_safe_nickname_decode().await?;
 
+        // Step 1c'': decoded search text columns + backfill + trigram indexes (IDX-022).
+        self.create_search_text_columns().await?;
+
         // Step 1d: idempotently ensure the post-translation cache table exists (fork addition).
         self.create_translations_schema().await?;
 
@@ -230,6 +233,27 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        // kachat-audits IDX-020: broadcasts whose sender could not be resolved yet (node down,
+        // tx not accepted yet), retried by bcast_pending.rs. Carries the payload and block hash
+        // so a retry does not depend on the 1 h `transactions` retention. Times in ms.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_bcast_pending (
+                transaction_id BYTEA PRIMARY KEY,
+                payload BYTEA NOT NULL,
+                block_hash BYTEA NOT NULL,
+                block_time BIGINT NOT NULL,
+                first_seen BIGINT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_at BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS bcast_pending_next_at ON kachat_bcast_pending(next_at)")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -453,6 +477,63 @@ impl KDbClient {
         .rows_affected();
         if cleaned > 0 {
             warn!("Blanked {} undecodable K-profile nickname(s)", cleaned);
+        }
+        Ok(())
+    }
+
+    /// kachat-audits IDX-022: `/search` matched `kachat_b64_utf8(<base64>) ILIKE '%q%'`, which
+    /// decodes every row through a PL/pgSQL exception block on every request. The decoded text
+    /// is now stored at ingest (`k_contents.message_text`, `k_broadcasts.nickname_text`; the
+    /// processor validates both as base64 UTF-8 without NUL first) and searched directly.
+    /// Here: add the columns, backfill rows written before this build once (in batches, with
+    /// the safe decode; an undecodable value becomes '' so it is not retried), and add
+    /// `pg_trgm` GIN indexes so a `%q%` ILIKE can use an index. Without permission to create
+    /// the extension the search still works, just as a plain scan of the text columns. The
+    /// partial indexes keep the webserver's NULL fallback (rows not filled yet) cheap.
+    /// Index names must not match the verifier's `idx_k_%` pattern.
+    async fn create_search_text_columns(&self) -> Result<()> {
+        for ddl in [
+            "ALTER TABLE k_contents ADD COLUMN IF NOT EXISTS message_text TEXT",
+            "ALTER TABLE k_broadcasts ADD COLUMN IF NOT EXISTS nickname_text TEXT",
+            "CREATE INDEX IF NOT EXISTS kcontents_message_text_null ON k_contents (id) WHERE message_text IS NULL",
+            "CREATE INDEX IF NOT EXISTS kbroadcasts_nickname_text_null ON k_broadcasts (id) WHERE nickname_text IS NULL",
+        ] {
+            sqlx::query(ddl).execute(&self.pool).await?;
+        }
+
+        for (table, column, source) in [
+            ("k_contents", "message_text", "base64_encoded_message"),
+            ("k_broadcasts", "nickname_text", "base64_encoded_nickname"),
+        ] {
+            let sql = format!(
+                "UPDATE {table} SET {column} = COALESCE(kachat_b64_utf8({source}), '') \
+                 WHERE id IN (SELECT id FROM {table} WHERE {column} IS NULL LIMIT 5000)"
+            );
+            let mut filled = 0u64;
+            loop {
+                let n = sqlx::query(&sql).execute(&self.pool).await?.rows_affected();
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled > 0 {
+                info!("Backfilled {table}.{column} for {filled} row(s)");
+            }
+        }
+
+        match sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trgm").execute(&self.pool).await {
+            Ok(_) => {
+                for ddl in [
+                    "CREATE INDEX IF NOT EXISTS trgm_contents_message_text ON k_contents USING gin (message_text gin_trgm_ops)",
+                    "CREATE INDEX IF NOT EXISTS trgm_broadcasts_nickname_text ON k_broadcasts USING gin (nickname_text gin_trgm_ops)",
+                ] {
+                    if let Err(e) = sqlx::query(ddl).execute(&self.pool).await {
+                        warn!("Search trigram index not created ({e}); /search scans the text columns");
+                    }
+                }
+            }
+            Err(e) => warn!("pg_trgm unavailable ({e}); /search scans the text columns without an index"),
         }
         Ok(())
     }

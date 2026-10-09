@@ -22,8 +22,9 @@ pub struct ServerConfig {
     pub request_timeout: u64,
     pub rate_limit: u32,
     pub libretranslate_url: String,
-    /// Peers whose `X-Real-IP` / `X-Forwarded-For` are believed (the reverse proxy). Anyone
-    /// else is rate-limited by the TCP peer address, whatever headers they send.
+    /// Peers whose forwarded headers are believed (the reverse proxy: last `X-Forwarded-For` hop,
+    /// else `X-Real-IP`). Anyone else is rate-limited by the TCP peer address, whatever
+    /// headers they send.
     pub trusted_proxies: Vec<IpNet>,
 }
 

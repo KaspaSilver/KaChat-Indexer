@@ -419,6 +419,18 @@ impl WebServer {
             {
                 tracing::warn!("could not create kachat_b64_utf8: {e}");
             }
+            // kachat-audits IDX-022: search reads the decoded columns the processor fills at
+            // ingest. Add them here too (idempotent), so a webserver that starts before the
+            // processor never answers /search with an error; rows the processor has not
+            // backfilled yet fall back to the safe decode.
+            for stmt in [
+                "ALTER TABLE k_contents ADD COLUMN IF NOT EXISTS message_text TEXT",
+                "ALTER TABLE k_broadcasts ADD COLUMN IF NOT EXISTS nickname_text TEXT",
+            ] {
+                if let Err(e) = sqlx::query(stmt).execute(&app_state.scheduled_pool).await {
+                    tracing::warn!("could not add a search column ({stmt}): {e}");
+                }
+            }
         }
 
         Self { app_state }
@@ -620,23 +632,29 @@ fn spawn_rate_limit_pruner(state: Arc<AppState>) {
     });
 }
 
-/// Extract the real client IP from proxy headers. Prefers `X-Real-IP`, which our nginx front
-/// sets to the connecting client and clients cannot spoof (nginx overwrites it). Falls back to
-/// the last hop of `X-Forwarded-For` — the entry the immediate trusted proxy appended (the
-/// first hop is client-supplied and spoofable, so it is deliberately not used). Only called
-/// when the TCP peer is a trusted proxy; anyone else could put anything in these headers.
+/// Extract the real client IP from proxy headers. Prefers the LAST hop of `X-Forwarded-For`:
+/// the entry the immediate trusted proxy appended itself (`$proxy_add_x_forwarded_for`), which
+/// the client cannot forge (earlier hops are client-supplied and spoofable, so they are never
+/// used). `X-Real-IP` is consulted only when there is no `X-Forwarded-For` at all: a proxy that
+/// does not set it (Kaspa Quick Start's nginx deliberately does not) passes a client's own
+/// `X-Real-IP` straight through, so it must never outrank XFF (IDX-021). Only called when the
+/// TCP peer is a trusted proxy; anyone else could put anything in these headers.
 fn client_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
-    if let Some(ip) = headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<IpAddr>().ok())
-    {
-        return Some(ip);
+    let xff: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if !xff.is_empty() {
+        // Several XFF header lines are one list in order; the last hop is the proxy's own.
+        return xff
+            .last()
+            .and_then(|s| s.split(',').next_back())
+            .and_then(|s| s.trim().parse::<IpAddr>().ok());
     }
     headers
-        .get("x-forwarded-for")
+        .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next_back())
         .and_then(|s| s.trim().parse::<IpAddr>().ok())
 }
 
@@ -1716,6 +1734,11 @@ async fn handle_get_most_active_users(
     }
 }
 
+/// Rate-limit units one `/search` request costs (kachat-audits IDX-022).
+const SEARCH_RATE_COST: u32 = 5;
+/// Shortest accepted `/search` query, in characters (kachat-audits IDX-022).
+const SEARCH_MIN_QUERY_CHARS: usize = 3;
+
 /// GET /search?q=&type=posts|users (§5.6). Dispatches to post-content or user search; both share
 /// the feed's pagination envelope. Returns a raw JSON value since the two payloads differ in shape.
 async fn handle_search(
@@ -1723,7 +1746,9 @@ async fn handle_search(
     State(app_state): State<Arc<AppState>>,
     Query(params): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    check_rate_limit(&app_state, addr).await?;
+    // kachat-audits IDX-022: a substring search scans far more than a cached GET, so it costs
+    // SEARCH_RATE_COST units of the per-IP limit.
+    check_rate_limit_n(&app_state, addr, SEARCH_RATE_COST).await?;
 
     // Required: non-empty q.
     let query_text = params.q.unwrap_or_default();
@@ -1732,6 +1757,15 @@ async fn handle_search(
         let error = ApiError {
             error: "Missing required parameter: q".to_string(),
             code: "MISSING_PARAMETER".to_string(),
+        };
+        return Err((StatusCode::BAD_REQUEST, Json(error)));
+    }
+    // At least 3 characters: shorter patterns match nearly everything and a trigram index
+    // cannot serve them (IDX-022).
+    if query_text.chars().count() < SEARCH_MIN_QUERY_CHARS {
+        let error = ApiError {
+            error: format!("Parameter q must be at least {SEARCH_MIN_QUERY_CHARS} characters"),
+            code: "QUERY_TOO_SHORT".to_string(),
         };
         return Err((StatusCode::BAD_REQUEST, Json(error)));
     }
@@ -3109,5 +3143,28 @@ mod tests {
         assert_eq!(rate_limit_key(ip("2001:db8:1:2:aaaa::1"), &HeaderMap::new(), &trusted), ip("2001:db8:1:2::"));
         assert_eq!(rate_limit_key(ip("::ffff:9.9.9.9"), &HeaderMap::new(), &trusted), ip("9.9.9.9"));
         assert_eq!(rate_limit_key(ip("127.0.0.1"), &headers("2001:db8::5"), &trusted), ip("2001:db8::"));
+    }
+
+    fn with_xff(mut h: HeaderMap, xff: &str) -> HeaderMap {
+        h.append("x-forwarded-for", xff.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn last_forwarded_hop_beats_a_spoofed_real_ip() {
+        // IDX-021: KQS's nginx does not set X-Real-IP, so a client's own header reaches us; the
+        // hop nginx appended to X-Forwarded-For is the truth.
+        let trusted = crate::config::parse_trusted_proxies(crate::config::DEFAULT_TRUSTED_PROXIES).unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let spoofed = with_xff(headers("1.2.3.4"), "5.6.7.8, 8.8.8.8");
+        assert_eq!(rate_limit_key(ip("172.18.0.3"), &spoofed, &trusted), ip("8.8.8.8"));
+        // Several XFF lines: the last line's last hop.
+        let two = with_xff(with_xff(HeaderMap::new(), "5.6.7.8"), "9.9.9.9");
+        assert_eq!(rate_limit_key(ip("172.18.0.3"), &two, &trusted), ip("9.9.9.9"));
+        // An unparsable last hop does not fall back to X-Real-IP (or a spoofable earlier hop).
+        let junk = with_xff(headers("1.2.3.4"), "5.6.7.8, nope");
+        assert_eq!(rate_limit_key(ip("172.18.0.3"), &junk, &trusted), ip("172.18.0.3"));
+        // Untrusted peer: headers ignored, the peer itself.
+        assert_eq!(rate_limit_key(ip("9.9.9.9"), &spoofed, &trusted), ip("9.9.9.9"));
     }
 }

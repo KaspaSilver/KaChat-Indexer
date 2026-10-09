@@ -239,6 +239,10 @@ pub fn validate_k_profile(
         .decode(base64_nickname)
         .map_err(|_| "nickname is not valid base64")?;
     let nickname = std::str::from_utf8(&nickname).map_err(|_| "nickname is not valid UTF-8")?;
+    // IDX-022: stored decoded as `nickname_text`; Postgres text cannot hold NUL.
+    if nickname.contains('\0') {
+        return Err("nickname contains NUL");
+    }
     if nickname.chars().count() > MAX_K_NICKNAME_CHARS {
         return Err("nickname exceeds max length");
     }
@@ -253,6 +257,8 @@ pub fn validate_k_profile(
     Ok(())
 }
 
+/// kachat-audits IDX-022: the inserts store `convert_from(decode(msg))` as `message_text`, so
+/// this check (strict base64, UTF-8, no NUL / control characters) is what keeps that safe.
 pub fn validate_kachat_message(base64_encoded_message: &str) -> Result<(), &'static str> {
     use base64::{Engine as _, engine::general_purpose};
     let bytes = general_purpose::STANDARD
@@ -533,6 +539,24 @@ pub struct KFollowRecord {
 
 pub struct KProtocolProcessor {
     db_pool: DbPool,
+}
+
+/// How `process_broadcast` was reached (kachat-audits IDX-020).
+#[derive(Clone, Copy)]
+enum BcastMode<'a> {
+    /// From the transaction notification: look the sender up inline for a few seconds, then
+    /// hand an unresolved one to the pending queue (`bcast_pending.rs`).
+    Live,
+    /// From the pending queue, with the block hash it stored: one lookup per call.
+    Retry(&'a [u8]),
+}
+
+/// Result of a pending-queue retry.
+pub enum BcastOutcome {
+    /// Saved, already stored, or rejected for good (forged, off-channel, too long, ...).
+    Done,
+    /// The sender could still not be resolved; try again later.
+    StillUnknown,
 }
 
 impl KProtocolProcessor {
@@ -1116,6 +1140,34 @@ impl KProtocolProcessor {
     /// `ciph_msg:1:bcast:` prefix, i.e. `<channel>:<content>`. Content is stored verbatim
     /// (may be plain text or a reply/audio JSON envelope). Deduped by transaction id.
     async fn process_broadcast(&self, transaction: &Transaction, rest: &str) -> Result<()> {
+        self.process_broadcast_mode(transaction, rest, BcastMode::Live).await.map(|_| ())
+    }
+
+    /// Pending-queue retry of a broadcast whose sender was not resolved yet (kachat-audits
+    /// IDX-020). `block_hash` is the block that holds it, stored when it was queued.
+    pub async fn retry_broadcast(&self, transaction: &Transaction, block_hash: &[u8]) -> Result<BcastOutcome> {
+        let payload = hex::decode(transaction.payload.as_deref().unwrap_or_default())?;
+        let Ok(payload_str) = std::str::from_utf8(&payload) else {
+            return Ok(BcastOutcome::Done);
+        };
+        let Some(rest) = payload_str
+            .strip_prefix("kchat:1:bcast:")
+            .or_else(|| payload_str.strip_prefix("ciph_msg:1:bcast:"))
+        else {
+            return Ok(BcastOutcome::Done);
+        };
+        if !FEATURE_BROADCASTS.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(BcastOutcome::Done);
+        }
+        self.process_broadcast_mode(transaction, rest, BcastMode::Retry(block_hash)).await
+    }
+
+    async fn process_broadcast_mode(
+        &self,
+        transaction: &Transaction,
+        rest: &str,
+        mode: BcastMode<'_>,
+    ) -> Result<BcastOutcome> {
         let transaction_id = &transaction.transaction_id;
 
         // channel = up to the first ':'; content = the remainder verbatim (may contain ':').
@@ -1126,7 +1178,7 @@ impl KProtocolProcessor {
                     "Broadcast {} has no channel/content separator, skipping",
                     transaction_id
                 );
-                return Ok(());
+                return Ok(BcastOutcome::Done);
             }
         };
 
@@ -1138,7 +1190,7 @@ impl KProtocolProcessor {
                 "Broadcast {} on non-tracked channel '{}', skipping",
                 transaction_id, channel
             );
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         }
 
         // Audio broadcasts (base64 voice envelopes) get a much larger cap than text/reply ones.
@@ -1154,7 +1206,7 @@ impl KProtocolProcessor {
                 transaction_id,
                 if is_audio { "audio" } else { "text" }
             );
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         }
 
         // Same text-as-image art gate as KaPosts. Broadcasts are stored verbatim (plain text, JSON
@@ -1165,7 +1217,7 @@ impl KProtocolProcessor {
                 "Broadcast {} is image-like art (drawing glyphs), skipping",
                 transaction_id
             );
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         }
 
         // Sender (kachat-audits XP-012): the address input 0 spends from, accepted only when
@@ -1174,21 +1226,35 @@ impl KProtocolProcessor {
         // held any input/output address of the tx, so anyone could post as anyone).
         //
         // RACE: this worker is woken the instant the *transaction* row lands, usually before
-        // a chain block has accepted the tx, so the first lookups come back Unknown. Retry for
-        // up to ~12 s; a tx still unresolved after that is dropped, never guessed.
+        // a chain block has accepted the tx, so the first lookups come back Unknown. Retry
+        // inline for up to ~12 s while the node is connected. Unknown is never final
+        // (kachat-audits IDX-020): a tx still unresolved goes to the durable pending queue
+        // (bcast_pending.rs), retried with backoff for at least an hour. Never guessed.
         let transaction_id_bytes = hex::decode(transaction_id)?;
-        let block_hash: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT block_hash FROM transactions WHERE transaction_id = $1")
+        let block_hash: Vec<u8> = match mode {
+            BcastMode::Retry(hash) => hash.to_vec(),
+            BcastMode::Live => {
+                let block_hash: Option<Vec<u8>> = sqlx::query_scalar(
+                    "SELECT block_hash FROM transactions WHERE transaction_id = $1",
+                )
                 .bind(&transaction_id_bytes)
                 .fetch_optional(&self.db_pool)
                 .await?
                 .flatten();
-        let Some(block_hash) = block_hash else {
-            info!("Broadcast {} has no block hash, skipping", transaction_id);
-            return Ok(());
+                let Some(block_hash) = block_hash else {
+                    info!("Broadcast {} has no block hash, skipping", transaction_id);
+                    return Ok(BcastOutcome::Done);
+                };
+                block_hash
+            }
         };
         let mut verdict = crate::bcast_sender::Verdict::Unknown;
-        for attempt in 0..12u32 {
+        let attempts = if matches!(mode, BcastMode::Live) { 12u32 } else { 1 };
+        for attempt in 0..attempts {
+            // Disconnected: do not count down the attempts, the queue waits for the node.
+            if !crate::bcast_sender::is_connected() {
+                break;
+            }
             match crate::bcast_sender::resolve(&transaction_id_bytes, &block_hash).await {
                 Ok(crate::bcast_sender::Verdict::Unknown) => {}
                 Ok(v) => {
@@ -1200,7 +1266,9 @@ impl KProtocolProcessor {
                 }
                 Err(_) => {}
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            if attempt + 1 < attempts {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            }
         }
         let sender_address = match verdict {
             crate::bcast_sender::Verdict::Verified(a) => a,
@@ -1209,15 +1277,31 @@ impl KProtocolProcessor {
                     "Broadcast {} dropped: output 0 pays {} but input 0 spends from {}",
                     transaction_id, output, input
                 );
-                return Ok(());
+                return Ok(BcastOutcome::Done);
             }
-            crate::bcast_sender::Verdict::Unknown => {
-                info!(
-                    "Broadcast {} dropped: input 0's address could not be resolved",
-                    transaction_id
-                );
-                return Ok(());
-            }
+            crate::bcast_sender::Verdict::Unknown => match mode {
+                BcastMode::Retry(_) => return Ok(BcastOutcome::StillUnknown),
+                BcastMode::Live if !crate::bcast_sender::configured() => {
+                    crate::bcast_pending::note_final_drop(transaction_id, "no node wRPC URL to resolve input 0");
+                    return Ok(BcastOutcome::Done);
+                }
+                BcastMode::Live => {
+                    let payload = hex::decode(transaction.payload.as_deref().unwrap_or_default())?;
+                    crate::bcast_pending::enqueue(
+                        &self.db_pool,
+                        &transaction_id_bytes,
+                        &payload,
+                        &block_hash,
+                        transaction.block_time.unwrap_or(0),
+                    )
+                    .await?;
+                    info!(
+                        "Broadcast {}: input 0's address not resolved yet, queued for retry",
+                        transaction_id
+                    );
+                    return Ok(BcastOutcome::Done);
+                }
+            },
         };
 
         let block_time = transaction.block_time.unwrap_or(0);
@@ -1247,14 +1331,18 @@ impl KProtocolProcessor {
             // Fire-and-forget push notify (push service filters to bell-on / non-hidden devices).
             // Reaction and edit envelopes are invisible protocol traffic (a reaction renders as a
             // pill; an edit rewrites an earlier bubble in place) — never push either.
-            if !crate::push_notify::is_reaction_content(content)
+            // A retry that lands minutes late (node was down) is history, not news: no push.
+            let stale = matches!(mode, BcastMode::Retry(_))
+                && crate::bcast_pending::now_ms() - block_time > crate::bcast_pending::PUSH_MAX_AGE_MS;
+            if !stale
+                && !crate::push_notify::is_reaction_content(content)
                 && !crate::push_notify::is_edit_content(content)
             {
                 let body = crate::push_notify::broadcast_preview(content);
                 crate::push_notify::notify_broadcast(&channel, &sender_address, body, transaction_id);
             }
         }
-        Ok(())
+        Ok(BcastOutcome::Done)
     }
 
     /// KaPosts push helper: resolve the author (compressed pubkey hex) of an indexed content id.
@@ -1376,8 +1464,8 @@ impl KProtocolProcessor {
                     r#"
                     INSERT INTO k_contents (
                         transaction_id, block_time, sender_pubkey, sender_signature,
-                        base64_encoded_message, content_type, referenced_content_id
-                    ) VALUES ($1, $2, $3, $4, $5, 'post', NULL)
+                        base64_encoded_message, message_text, content_type, referenced_content_id
+                    ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'post', NULL)
                     ON CONFLICT (sender_signature) DO NOTHING
                     "#,
                 )
@@ -1404,8 +1492,8 @@ impl KProtocolProcessor {
                     WITH post_insert AS (
                         INSERT INTO k_contents (
                             transaction_id, block_time, sender_pubkey, sender_signature,
-                            base64_encoded_message, content_type, referenced_content_id
-                        ) VALUES ($1, $2, $3, $4, $5, 'post', NULL)
+                            base64_encoded_message, message_text, content_type, referenced_content_id
+                        ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'post', NULL)
                         ON CONFLICT (sender_signature) DO NOTHING
                         RETURNING transaction_id, block_time, sender_pubkey
                     )
@@ -1464,8 +1552,8 @@ impl KProtocolProcessor {
                     WITH post_insert AS (
                         INSERT INTO k_contents (
                             transaction_id, block_time, sender_pubkey, sender_signature,
-                            base64_encoded_message, content_type, referenced_content_id
-                        ) VALUES ($1, $2, $3, $4, $5, 'post', NULL)
+                            base64_encoded_message, message_text, content_type, referenced_content_id
+                        ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'post', NULL)
                         ON CONFLICT (sender_signature) DO NOTHING
                         RETURNING transaction_id, block_time, sender_pubkey
                     )
@@ -1498,8 +1586,8 @@ impl KProtocolProcessor {
                     WITH post_insert AS (
                         INSERT INTO k_contents (
                             transaction_id, block_time, sender_pubkey, sender_signature,
-                            base64_encoded_message, content_type, referenced_content_id
-                        ) VALUES ($1, $2, $3, $4, $5, 'post', NULL)
+                            base64_encoded_message, message_text, content_type, referenced_content_id
+                        ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'post', NULL)
                         ON CONFLICT (sender_signature) DO NOTHING
                         RETURNING transaction_id, block_time, sender_pubkey
                     ),
@@ -1605,8 +1693,8 @@ impl KProtocolProcessor {
                     r#"
                     INSERT INTO k_contents (
                         transaction_id, block_time, sender_pubkey, sender_signature,
-                        base64_encoded_message, content_type, referenced_content_id
-                    ) VALUES ($1, $2, $3, $4, $5, 'reply', $6)
+                        base64_encoded_message, message_text, content_type, referenced_content_id
+                    ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'reply', $6)
                     ON CONFLICT (sender_signature) DO NOTHING
                     "#,
                 )
@@ -1634,8 +1722,8 @@ impl KProtocolProcessor {
                     WITH reply_insert AS (
                         INSERT INTO k_contents (
                             transaction_id, block_time, sender_pubkey, sender_signature,
-                            base64_encoded_message, content_type, referenced_content_id
-                        ) VALUES ($1, $2, $3, $4, $5, 'reply', $6)
+                            base64_encoded_message, message_text, content_type, referenced_content_id
+                        ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'reply', $6)
                         ON CONFLICT (sender_signature) DO NOTHING
                         RETURNING transaction_id, block_time, sender_pubkey
                     )
@@ -1696,8 +1784,8 @@ impl KProtocolProcessor {
                     WITH reply_insert AS (
                         INSERT INTO k_contents (
                             transaction_id, block_time, sender_pubkey, sender_signature,
-                            base64_encoded_message, content_type, referenced_content_id
-                        ) VALUES ($1, $2, $3, $4, $5, 'reply', $6)
+                            base64_encoded_message, message_text, content_type, referenced_content_id
+                        ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'reply', $6)
                         ON CONFLICT (sender_signature) DO NOTHING
                         RETURNING transaction_id, block_time, sender_pubkey
                     )
@@ -1731,8 +1819,8 @@ impl KProtocolProcessor {
                     WITH reply_insert AS (
                         INSERT INTO k_contents (
                             transaction_id, block_time, sender_pubkey, sender_signature,
-                            base64_encoded_message, content_type, referenced_content_id
-                        ) VALUES ($1, $2, $3, $4, $5, 'reply', $6)
+                            base64_encoded_message, message_text, content_type, referenced_content_id
+                        ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'reply', $6)
                         ON CONFLICT (sender_signature) DO NOTHING
                         RETURNING transaction_id, block_time, sender_pubkey
                     ),
@@ -1861,8 +1949,8 @@ impl KProtocolProcessor {
                 WITH quote_insert AS (
                     INSERT INTO k_contents (
                         transaction_id, block_time, sender_pubkey, sender_signature,
-                        base64_encoded_message, content_type, referenced_content_id
-                    ) VALUES ($1, $2, $3, $4, $5, 'quote', $6)
+                        base64_encoded_message, message_text, content_type, referenced_content_id
+                    ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'quote', $6)
                     ON CONFLICT (sender_signature) DO NOTHING
                     RETURNING transaction_id, block_time, sender_pubkey
                 )
@@ -1899,8 +1987,8 @@ impl KProtocolProcessor {
                 WITH quote_insert AS (
                     INSERT INTO k_contents (
                         transaction_id, block_time, sender_pubkey, sender_signature,
-                        base64_encoded_message, content_type, referenced_content_id
-                    ) VALUES ($1, $2, $3, $4, $5, 'quote', $6)
+                        base64_encoded_message, message_text, content_type, referenced_content_id
+                    ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'quote', $6)
                     ON CONFLICT (sender_signature) DO NOTHING
                     RETURNING transaction_id, block_time, sender_pubkey
                 ),
@@ -2023,8 +2111,9 @@ impl KProtocolProcessor {
             )
             INSERT INTO k_broadcasts (
                 transaction_id, block_time, sender_pubkey, sender_signature,
-                base64_encoded_nickname, base64_encoded_profile_image, base64_encoded_message
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                base64_encoded_nickname, base64_encoded_profile_image, base64_encoded_message,
+                nickname_text
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, convert_from(decode($5, 'base64'), 'UTF8'))
             ON CONFLICT (transaction_id) DO NOTHING
             "#,
         )
@@ -2370,7 +2459,8 @@ impl KProtocolProcessor {
         let applied = sqlx::query(
             r#"
             UPDATE k_contents
-            SET base64_encoded_message = $1, edited_at = $2
+            SET base64_encoded_message = $1, edited_at = $2,
+                message_text = convert_from(decode($1, 'base64'), 'UTF8')
             WHERE transaction_id = $3 AND ($2 > COALESCE(edited_at, block_time))
             "#,
         )
@@ -2621,8 +2711,8 @@ impl KProtocolProcessor {
             r#"
             INSERT INTO k_contents (
                 transaction_id, block_time, sender_pubkey, sender_signature,
-                base64_encoded_message, content_type, referenced_content_id
-            ) VALUES ($1, $2, $3, $4, $5, 'poll', NULL)
+                base64_encoded_message, message_text, content_type, referenced_content_id
+            ) VALUES ($1, $2, $3, $4, $5, convert_from(decode($5, 'base64'), 'UTF8'), 'poll', NULL)
             ON CONFLICT (sender_signature) DO NOTHING
             "#,
         )
@@ -3234,6 +3324,7 @@ mod k_profile_validation_tests {
     fn rejects_what_sql_cannot_decode() {
         assert!(validate_k_profile("%%%%", None, &b64(b"hi")).is_err());
         assert!(validate_k_profile(&b64(&[0xff, 0xfe]), None, &b64(b"hi")).is_err());
+        assert!(validate_k_profile(&b64(b"Al\0ice"), None, &b64(b"hi")).is_err(), "NUL (IDX-022)");
         assert!(validate_k_profile(&b64(b"a"), Some("not base64!"), &b64(b"hi")).is_err());
         assert!(validate_k_profile(&b64(b"a"), None, "%%").is_err());
         let long = "x".repeat(MAX_K_NICKNAME_CHARS + 1);

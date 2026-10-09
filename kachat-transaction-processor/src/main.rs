@@ -1,3 +1,4 @@
+mod bcast_pending;
 mod bcast_sender;
 mod config;
 mod database;
@@ -272,6 +273,11 @@ async fn main() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }
     });
+
+    // Public-chat sender retry queue (kachat-audits IDX-020): broadcasts whose sender could
+    // not be resolved yet are retried here instead of dropped. Detached, loops forever.
+    let pending_pool = database.pool().clone();
+    let _bcast_pending_handle = tokio::spawn(bcast_pending::run(pending_pool));
 
     // Broadcast retention pruner: broadcasts are ephemeral channel chatter, so drop rows older
     // than the retention window (default 3 days). Runs immediately, then hourly. Detached — it

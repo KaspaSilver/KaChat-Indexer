@@ -61,6 +61,17 @@ pub fn init(url: Option<String>) {
     });
 }
 
+/// A node URL was given (even if not connected yet). Without one nothing can ever be
+/// verified, so broadcasts are dropped instead of queued (kachat-audits IDX-020).
+pub fn configured() -> bool {
+    NODE.get().is_some()
+}
+
+/// The wRPC connection is up right now.
+pub fn is_connected() -> bool {
+    NODE.get().is_some_and(|n| n.is_connected())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Self-send shape: the sender is this address (input 0's = output 0's).

@@ -181,11 +181,14 @@ impl PostgresDbManager {
         }
 
         // §5.6: optional case-insensitive substring match on the decoded message text.
+        // kachat-audits IDX-022: `message_text` is decoded at ingest (pg_trgm-indexed when the
+        // extension exists); the per-row safe decode is only a fallback for rows not filled yet.
         let mut content_conditions = String::new();
         if content_search.is_some() {
             bind_count += 1;
             content_conditions = format!(
-                " AND kachat_b64_utf8(c.base64_encoded_message) ILIKE ${} ESCAPE '\\'",
+                " AND (c.message_text ILIKE ${0} ESCAPE '\\' \
+                 OR (c.message_text IS NULL AND kachat_b64_utf8(c.base64_encoded_message) ILIKE ${0} ESCAPE '\\'))",
                 bind_count
             );
         }
@@ -960,11 +963,13 @@ impl DatabaseInterface for PostgresDbManager {
             ));
         }
 
-        // Add search filter for nickname (decode Base64 and search plain text)
+        // Add search filter for nickname (plain text decoded at ingest, IDX-022; the safe
+        // decode only for rows not filled yet)
         if let Some(_) = searched_user_nickname.as_ref() {
             bind_count += 1;
             query.push_str(&format!(
-                " AND kachat_b64_utf8(b.base64_encoded_nickname) ILIKE ${}",
+                " AND (b.nickname_text ILIKE ${0} \
+                 OR (b.nickname_text IS NULL AND kachat_b64_utf8(b.base64_encoded_nickname) ILIKE ${0}))",
                 bind_count
             ));
         }
@@ -1104,7 +1109,9 @@ impl DatabaseInterface for PostgresDbManager {
                 WHERE content_type IN ('post', 'reply', 'quote', 'poll')
                 GROUP BY sender_pubkey
             ) pc ON pc.sender_pubkey = b.sender_pubkey
-            WHERE (kachat_b64_utf8(b.base64_encoded_nickname) ILIKE $2 ESCAPE '\'
+            WHERE (b.nickname_text ILIKE $2 ESCAPE '\'
+                   OR (b.nickname_text IS NULL
+                       AND kachat_b64_utf8(b.base64_encoded_nickname) ILIKE $2 ESCAPE '\')
                    OR encode(b.sender_pubkey, 'hex') ILIKE $3 ESCAPE '\')
             "#,
         );

@@ -736,17 +736,38 @@ pub struct ProfilesStatus {
     pub network: String,
     pub indexed_daa: i64,
     pub synced: bool,
+    /// The follower's current fetch error, while it fails (IDX-023).
+    pub last_error: Option<String>,
+    /// The last history gap (checkpoint pruned, re-anchored at the node's pruning point),
+    /// as `{fromDaa, toDaa, fromBlock, toBlock, at}`, or null.
+    pub gap: Value,
 }
 
 pub async fn profiles_status(pool: &PgPool) -> Option<ProfilesStatus> {
-    let row = sqlx::query("SELECT network, indexed_daa, synced, updated_at FROM profiles_state WHERE id = 1")
+    // The whole row as JSON: the gap/last_error columns are added by the follower, so a
+    // webserver that starts first must not fail on them.
+    let row = sqlx::query("SELECT network, indexed_daa, synced, updated_at, to_jsonb(s) AS j FROM profiles_state s WHERE id = 1")
         .fetch_optional(pool)
         .await
         .ok()??;
+    let j: Value = row.get("j");
+    let gap = match (j["gap_from_daa"].as_i64(), j["gap_to_daa"].as_i64()) {
+        // BYTEA comes out of to_jsonb as "\\x<hex>".
+        (Some(from), Some(to)) => json!({
+            "fromDaa": from,
+            "toDaa": to,
+            "fromBlock": j["gap_from_block"].as_str().map(|h| h.trim_start_matches("\\x")),
+            "toBlock": j["gap_to_block"].as_str().map(|h| h.trim_start_matches("\\x")),
+            "at": j["gap_at"].as_i64(),
+        }),
+        _ => Value::Null,
+    };
     (now_ms() - row.get::<i64, _>("updated_at") <= STALE_MS).then(|| ProfilesStatus {
         network: row.get("network"),
         indexed_daa: row.get("indexed_daa"),
         synced: row.get("synced"),
+        last_error: j["last_error"].as_str().map(str::to_string),
+        gap,
     })
 }
 
@@ -756,7 +777,13 @@ async fn profiles_pool(state: &AppState) -> Result<PgPool, Response> {
     let pool = state.scheduled_pool.clone();
     match profiles_status(&pool).await {
         Some(s) if s.synced => Ok(pool),
-        Some(_) => Err(err(StatusCode::SERVICE_UNAVAILABLE, "syncing", "the profiles follower is catching up")),
+        Some(s) => {
+            let msg = match s.last_error {
+                Some(e) => format!("the profiles follower is catching up (fetch failing: {e})"),
+                None => "the profiles follower is catching up".to_string(),
+            };
+            Err(err(StatusCode::SERVICE_UNAVAILABLE, "syncing", &msg))
+        }
         None => Err(err(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "the profiles follower is not running")),
     }
 }
@@ -999,6 +1026,8 @@ pub async fn profile_stats(
     v["network"] = json!(status.network);
     v["synced"] = json!(status.synced);
     v["indexedDaa"] = json!(status.indexed_daa);
+    v["lastError"] = json!(status.last_error);
+    v["gap"] = status.gap;
     Json(v).into_response()
 }
 

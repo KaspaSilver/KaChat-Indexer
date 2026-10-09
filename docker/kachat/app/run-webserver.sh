@@ -1,9 +1,15 @@
 #!/bin/sh
 # Public REST API (KaPosts + broadcasts) — fronted by nginx-proxy-manager for TLS.
-# Rate limit is per client IP per minute (IPv6 per /64). X-Real-IP / X-Forwarded-For are
-# honoured only from a trusted proxy (WEBSERVER_TRUSTED_PROXIES, default loopback + private
-# ranges), so behind nginx each user counts on their own and a direct caller cannot spoof one.
+# Rate limit is per client IP per minute (IPv6 per /64). Forwarded headers are honoured only
+# from a trusted proxy (WEBSERVER_TRUSTED_PROXIES, default loopback + private ranges): the LAST
+# X-Forwarded-For hop (the one nginx appended) wins; X-Real-IP is used only when there is no
+# X-Forwarded-For, since a client's own X-Real-IP passes through a proxy that does not set it.
+# So behind nginx each user counts on their own and a direct caller cannot spoof one.
 # The DB password comes from DB_PASSWORD in the environment, never the command line.
+# /schedule-post checks each input is an unspent coin of the poster's address on the node
+# (kachat-audits IDX-019): wRPC Borsh at KASPA_NODE_WBORSH_URL, address prefix from NETWORK.
+# Node unreachable = 503 for /schedule-post (rows are never stored unverified).
+export KASPA_NODE_WBORSH_URL="${KASPA_NODE_WBORSH_URL:-ws://${KASPA_NODE_ADDRESS:-127.0.0.1}:${KASPA_NODE_PORT:-17110}}"
 exec /app/kachat-webserver \
   --db-host localhost --db-port "${DB_PORT}" --db-name "${DB_NAME}" \
   --db-user "${DB_USER}" \

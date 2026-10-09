@@ -2361,6 +2361,7 @@ impl PushDispatcher {
                     tx_id: tx_id.clone(),
                     amount: amount.clone(),
                     days,
+                    dedup: dedup.clone(),
                 };
                 let mut data = BTreeMap::new();
                 data.insert("type".to_string(), "name_event".to_string());
@@ -2376,6 +2377,9 @@ impl PushDispatcher {
                     data.insert("days".to_string(), days.to_string());
                 }
                 let collapse: String = dedup.chars().take(64).collect();
+                // XP-017: the per-push key also in the data, so a client can dedupe on it (a
+                // reminder has no tx; its `event:name` repeats every period).
+                data.insert("dedup".to_string(), dedup);
                 self.deliver(tokens, &payload, &data, Some(&collapse), true).await;
                 Ok(())
             }
@@ -3004,6 +3008,7 @@ struct NamePayload {
     amount: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     days: Option<u32>,
+    dedup: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -4305,6 +4310,7 @@ mod name_push_tests {
             tx_id: "ab".into(),
             amount: Some("3500000000".into()),
             days: None,
+            dedup: "ab:sold".into(),
         };
         let v = serde_json::to_value(&payload).unwrap();
         assert_eq!(
@@ -4313,7 +4319,7 @@ mod name_push_tests {
                 "aps": {"alert": {"title": "alice.kachat sold", "body": "Your listing was bought."},
                         "mutable-content": 1, "sound": "default"},
                 "type": "name_event", "event": "name_sold", "name": "alice", "tx_id": "ab",
-                "amount": "3500000000"
+                "amount": "3500000000", "dedup": "ab:sold"
             })
         );
     }

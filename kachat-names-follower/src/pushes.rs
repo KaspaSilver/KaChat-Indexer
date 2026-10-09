@@ -25,6 +25,17 @@ pub struct NamePush {
     pub dedup: String,
 }
 
+impl NamePush {
+    /// A renewal reminder (`due_reminder`'s event/days/kind) for `n`. A reminder has no
+    /// transaction, so `tx_id` carries the per-period dedup key (XP-017): Android dedupes
+    /// name pushes on `tx_id`, and an empty one collapsed every period's reminder of a kind
+    /// into one. The key changes with `expiresAt`, so each renewal period notifies again.
+    pub fn reminder(n: &NameState, event: &'static str, days: Option<u32>, kind: &str) -> Self {
+        let dedup = format!("{}:{}:{kind}", hex::encode(n.key), n.expires_at);
+        Self { to_key: n.owner, event, name: n.name_str(), tx_id: dedup.clone(), amount: None, days, dedup }
+    }
+}
+
 /// The pushes a batch's events produce. `before` is the tracked set before the batch (the
 /// spent offer of an accept lives only there); `after` is the set after it; `values` holds
 /// each tracked UTXO's value (offer amounts); `names` maps keys to name strings.
@@ -344,6 +355,18 @@ mod tests {
         let mut own = ev("offer", key, 5);
         own.to = Some(seller);
         assert!(event_pushes(&[own], &HashMap::new(), &after, &HashMap::new(), &names, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn reminder_carries_a_per_period_dedup_key_in_tx_id() {
+        let a = name([1; 32], [2; 32], 100, 1_000);
+        let b = name([1; 32], [2; 32], 100, 2_000);
+        let p = NamePush::reminder(&a, "name_renewal_open", None, "open");
+        assert_eq!(p.dedup, format!("{}:1000:open", hex::encode([1u8; 32])));
+        assert_eq!(p.tx_id, p.dedup);
+        assert_eq!(p.to_key, [2; 32]);
+        // The next period (renewed: new expiresAt) gets a different key.
+        assert_ne!(NamePush::reminder(&b, "name_renewal_open", None, "open").tx_id, p.tx_id);
     }
 
     #[test]
