@@ -9,7 +9,8 @@
 //!   layout). Skipped when absent.
 //! - **frozen copies:** `testdata/vectors-v2.json` (KaChat `e1e3455^`), `vectors-v3.json`
 //!   (KaChat `0ed15e9^`), `vectors-v4.json` (KaChat `d82dfb2`) and `vectors-v5.json`
-//!   (kachat-domains `6eddc7a`, `vectors/KachatNamesVectors-v5.json`: the migration `import`).
+//!   (kachat-domains `ba8abe8`, `vectors/KachatNamesVectors-v5.json` on the audited templates: the
+//!   migration `import`).
 
 use std::collections::HashSet;
 

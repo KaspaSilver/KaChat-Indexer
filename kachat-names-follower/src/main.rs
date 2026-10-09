@@ -891,8 +891,19 @@ mod tests {
     /// price 0 -- and the 7 gaps around them, every one at its real output.
     #[test]
     fn replays_the_v5_import_drill() {
-        let drill: serde_json::Value = serde_json::from_str(include_str!("../testdata/v5-import-drill.json")).unwrap();
-        let path = std::env::temp_dir().join("kachat-names-v5-drill-manifest.json");
+        replay_drill(include_str!("../testdata/v5-import-drill.json"), "first");
+    }
+
+    /// The second drill (kachat-domains e99bbac): the audited templates (C2, the offer fee
+    /// cap), registry 1283f749…bfa2, importing fdc403f5….
+    #[test]
+    fn replays_the_audited_v5_import_drill() {
+        replay_drill(include_str!("../testdata/v5-import-drill-audited.json"), "audited");
+    }
+
+    fn replay_drill(json: &str, tag: &str) {
+        let drill: serde_json::Value = serde_json::from_str(json).unwrap();
+        let path = std::env::temp_dir().join(format!("kachat-names-v5-drill-{tag}-manifest.json"));
         std::fs::write(&path, drill["manifest"].to_string()).unwrap();
         let m = read_manifest(path.to_str().unwrap()).unwrap();
         assert_eq!(m.version, 5);
@@ -931,9 +942,9 @@ mod tests {
             return;
         }
         let m = read_manifest(path).unwrap();
-        // Registry v5 on the testnet day clock (kachat-domains 0903875, 2026-10-09): it imported
-        // the v4 day-clock registry e6b72448…; v4 bff18554…/e6b72448… and v3 90f56bd1… are retired.
-        assert_eq!(m.registry, "fdc403f5ef76ea7c71dcb5305d09daf7ab7fd68dc1d274a314fc8ca9111e571d");
+        // Registry v5 on the audited code (kachat-domains e99bbac, 2026-10-09): it imported the
+        // first v5 drill fdc403f5…, which imported the v4 day clock e6b72448…; all retired.
+        assert_eq!(m.registry, "1283f749506c454488a6b7264197658ed1c12051f1887905c4396243a89fbfa2");
         assert_eq!(m.version, 5);
         assert_eq!(m.price_covenant_id, None, "v5, like v4, has no price record");
         assert!(m.price_shards.is_empty());
