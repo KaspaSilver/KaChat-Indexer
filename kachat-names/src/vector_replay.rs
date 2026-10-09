@@ -3,13 +3,13 @@
 //! output script the real builder produced, so this checks transitions + templates + P2SH
 //! (+ v3 covenant bindings) end to end.
 //!
-//! Two files, two registries:
-//! - **v3**, the current one: shipped in the iOS repo as `KaChatTests/KachatNamesVectors.json`
+//! Every registry generation the follower supports, so each stays exactly right:
+//! - **the current file** shipped in the iOS repo as `KaChatTests/KachatNamesVectors.json`
 //!   (looked up at `$KACHAT_NAMES_VECTORS`, else next to this repo in the "Everything KaChat"
 //!   layout). Skipped when absent.
-//! - **v2** and **v3**, frozen in `testdata/vectors-v2.json` (KaChat `e1e3455^`) and
-//!   `testdata/vectors-v3.json` (KaChat `0ed15e9^`), so every registry generation the follower
-//!   supports stays exactly right. The current file is registry v4 (KaChat `d82dfb2`).
+//! - **frozen copies:** `testdata/vectors-v2.json` (KaChat `e1e3455^`), `vectors-v3.json`
+//!   (KaChat `0ed15e9^`), `vectors-v4.json` (KaChat `d82dfb2`) and `vectors-v5.json`
+//!   (kachat-domains `6eddc7a`, `vectors/KachatNamesVectors-v5.json`: the migration `import`).
 
 use std::collections::HashSet;
 
@@ -37,6 +37,10 @@ fn vector_sets() -> Vec<(&'static str, Value)> {
     out.push(("v2 (testdata)", v2));
     let v3 = load(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vectors-v3.json")).expect("testdata/vectors-v3.json");
     out.push(("v3 (testdata)", v3));
+    let v4 = load(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vectors-v4.json")).expect("testdata/vectors-v4.json");
+    out.push(("v4 (testdata)", v4));
+    let v5 = load(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vectors-v5.json")).expect("testdata/vectors-v5.json");
+    out.push(("v5 (testdata)", v5));
     out
 }
 
@@ -155,6 +159,7 @@ fn want_ops(step: &Value) -> Option<Vec<&'static str>> {
     let label = step["label"].as_str().unwrap();
     Some(vec![match step["op"].as_str().unwrap() {
         "register" => "register",
+        "import" => "import",
         "renew" => "renew",
         "extend" => "extend",
         "transfer" => "transfer",
@@ -249,7 +254,11 @@ fn connected_lifecycle_tracks_the_live_set() {
         }
 
         let mut done = false;
+        let mut imported = 0;
         for step in v["steps"].as_array().unwrap() {
+            if step["op"] == "import" {
+                imported += 1; // v5: imported names stay live through the whole chain
+            }
             let label = format!("{set}: {}", step["label"].as_str().unwrap());
             let tx = tx_of(step);
             reg.apply(&t, &tx);
@@ -263,7 +272,7 @@ fn connected_lifecycle_tracks_the_live_set() {
             assert_eq!(tracked, live, "[{label}] tracked set == live registry UTXOs");
             if step["label"] == "reclaim lapse-tn" {
                 // The chain ends here; later steps are standalone edge cases on synthetic UTXOs.
-                assert_eq!(reg.names().count(), 1, "[{set}] only alpha-tn is left");
+                assert_eq!(reg.names().count(), 1 + imported, "[{set}] only alpha-tn (and any imports) is left");
                 done = true;
                 break;
             }
