@@ -46,3 +46,5 @@ protocol = { path = "../protocol" }
 
 [dev-dependencies]
 tempfile = "3.20"
+# §5.10 relay test: recompute the consensus txId of a converted RpcTransaction.
+kaspa-consensus-core = { workspace = true }

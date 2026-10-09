@@ -376,10 +376,144 @@ async fn internal_broadcast_push(
 
 // §5.10: internal relay — the webserver's scheduler POSTs a due, phone-signed transaction here at
 // its `notBefore`, and this service (the only one on a node-compatible wRPC version) broadcasts it.
-// Body: `{ "transaction": <kaspa-rpc-core RpcTransaction JSON> }`. Never signs; forwards bytes only.
+// Body: `{ "transaction": <tx JSON> }`, where the tx JSON is what the phones stored: the Kaspa REST
+// `POST /transactions` shape (`amount`, `scriptPublicKey: {version, scriptPublicKey}`, no `gas`/
+// `mass`), or the kaspa-rpc-core RpcTransaction shape (`value`, `"<version><script>"` hex). Never
+// signs; forwards bytes only.
 #[derive(Debug, Deserialize)]
 pub struct InternalSubmitTx {
     pub transaction: serde_json::Value,
+}
+
+// Lenient reading of either shape. Defaults match kachat-webserver's `scheduled.rs::TxJson`, which
+// computed the stored txId from the same JSON, so the relayed transaction keeps that id.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayTxJson {
+    version: u16,
+    inputs: Vec<RelayTxInputJson>,
+    outputs: Vec<RelayTxOutputJson>,
+    lock_time: u64,
+    subnetwork_id: String,
+    #[serde(default)]
+    gas: u64,
+    #[serde(default)]
+    payload: Option<String>,
+    #[serde(default)]
+    mass: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayTxInputJson {
+    previous_outpoint: RelayTxOutpointJson,
+    #[serde(default)]
+    signature_script: String,
+    sequence: u64,
+    #[serde(default)]
+    sig_op_count: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayTxOutpointJson {
+    transaction_id: String,
+    index: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayTxOutputJson {
+    #[serde(alias = "value")]
+    amount: u64,
+    script_public_key: RelayScriptJson,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RelayScriptJson {
+    // REST: `{ "version": 0, "scriptPublicKey": "<script hex>" }`.
+    Object {
+        version: u16,
+        #[serde(rename = "scriptPublicKey", alias = "script")]
+        script: String,
+    },
+    // RPC: two big-endian version bytes, then the script, as one hex string.
+    Hex(String),
+}
+
+fn relay_hex(field: &str, hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err(format!("{field}: odd-length hex"));
+    }
+    let mut out = vec![0u8; hex.len() / 2];
+    faster_hex::hex_decode(hex.as_bytes(), &mut out).map_err(|e| format!("{field}: {e}"))?;
+    Ok(out)
+}
+
+/// The relay body's transaction (`{transaction:{…}}` or bare `{…}`, REST or RPC shape) as an
+/// RpcTransaction, built field by field for the pinned kaspa-rpc-core (v1.1.0-rc.2).
+fn relay_rpc_transaction(transaction: serde_json::Value) -> Result<RpcTransaction, String> {
+    use kaspa_rpc_core::{
+        RpcHash, RpcScriptPublicKey, RpcSubnetworkId, RpcTransactionInput,
+        RpcTransactionOutpoint, RpcTransactionOutput,
+    };
+    use std::str::FromStr;
+    let inner = match transaction.get("transaction") {
+        Some(t) if t.is_object() => t.clone(),
+        _ => transaction,
+    };
+    let tx: RelayTxJson = serde_json::from_value(inner).map_err(|e| e.to_string())?;
+    let mut inputs = Vec::with_capacity(tx.inputs.len());
+    for (n, i) in tx.inputs.into_iter().enumerate() {
+        let transaction_id = RpcHash::from_str(&i.previous_outpoint.transaction_id)
+            .map_err(|e| format!("inputs[{n}].previousOutpoint.transactionId: {e}"))?;
+        inputs.push(RpcTransactionInput {
+            previous_outpoint: RpcTransactionOutpoint {
+                transaction_id,
+                index: i.previous_outpoint.index,
+            },
+            signature_script: relay_hex("signatureScript", &i.signature_script)?,
+            sequence: i.sequence,
+            sig_op_count: i.sig_op_count,
+            verbose_data: None,
+        });
+    }
+    let mut outputs = Vec::with_capacity(tx.outputs.len());
+    for o in tx.outputs {
+        let (version, script) = match o.script_public_key {
+            RelayScriptJson::Object { version, script } => {
+                (version, relay_hex("scriptPublicKey", &script)?)
+            }
+            RelayScriptJson::Hex(h) => {
+                let bytes = relay_hex("scriptPublicKey", &h)?;
+                if bytes.len() < 2 {
+                    return Err("scriptPublicKey: too short".to_string());
+                }
+                (u16::from_be_bytes([bytes[0], bytes[1]]), bytes[2..].to_vec())
+            }
+        };
+        outputs.push(RpcTransactionOutput {
+            value: o.amount,
+            script_public_key: RpcScriptPublicKey::from_vec(version, script),
+            verbose_data: None,
+        });
+    }
+    let subnetwork_id = RpcSubnetworkId::from_str(&tx.subnetwork_id)
+        .map_err(|e| format!("subnetworkId: {e}"))?;
+    let payload = relay_hex("payload", tx.payload.as_deref().unwrap_or(""))?;
+    Ok(RpcTransaction {
+        version: tx.version,
+        inputs,
+        outputs,
+        lock_time: tx.lock_time,
+        subnetwork_id,
+        gas: tx.gas,
+        payload,
+        // 0 = let the node compute it, as kaspa-rest-server's submit does.
+        mass: tx.mass,
+        verbose_data: None,
+    })
 }
 
 async fn internal_submit_tx(
@@ -390,7 +524,7 @@ async fn internal_submit_tx(
     if !state.internal_authorized(&headers) {
         return (StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
-    let tx: RpcTransaction = match serde_json::from_value(payload.transaction) {
+    let tx = match relay_rpc_transaction(payload.transaction) {
         Ok(tx) => tx,
         Err(e) => {
             return (
@@ -1720,6 +1854,99 @@ impl PushApiError {
 mod tests {
     use super::*;
     use secp256k1::{Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey};
+
+    // §5.10: what KaPostsAPIClient.restJSON (iOS) stores via /schedule-post and the webserver
+    // relays verbatim: REST shape, `amount`, `{version, scriptPublicKey}`, no gas, no mass.
+    fn ios_scheduled_body() -> serde_json::Value {
+        serde_json::json!({ "transaction": {
+            "version": 0,
+            "inputs": [{
+                "previousOutpoint": { "transactionId": "ab".repeat(32), "index": 1 },
+                "signatureScript": "4101", "sequence": 0, "sigOpCount": 1
+            }],
+            "outputs": [{ "amount": 123456, "scriptPublicKey": { "version": 0, "scriptPublicKey": "20aaac" } }],
+            "lockTime": 0,
+            "subnetworkId": "0000000000000000000000000000000000000000",
+            "payload": faster_hex::hex_string(b"kchat:1:post:02aa:aGk="),
+        }})
+    }
+
+    fn consensus_id(tx: RpcTransaction) -> String {
+        kaspa_consensus_core::tx::Transaction::try_from(tx).unwrap().id().to_string()
+    }
+
+    #[test]
+    fn relay_rejected_the_phones_shape_before_the_fix() {
+        // The old code path: straight into RpcTransaction (needs value, gas, mass).
+        let body: InternalSubmitTx = serde_json::from_value(ios_scheduled_body()).unwrap();
+        let inner = body.transaction["transaction"].clone();
+        assert!(serde_json::from_value::<RpcTransaction>(inner).is_err());
+    }
+
+    #[test]
+    fn relay_converts_the_ios_rest_shape() {
+        let body: InternalSubmitTx = serde_json::from_value(ios_scheduled_body()).unwrap();
+        let tx = relay_rpc_transaction(body.transaction).unwrap();
+        assert_eq!(tx.version, 0);
+        assert_eq!(tx.gas, 0);
+        assert_eq!(tx.mass, 0);
+        assert_eq!(tx.payload, b"kchat:1:post:02aa:aGk=".to_vec());
+        assert_eq!(tx.inputs.len(), 1);
+        assert_eq!(tx.inputs[0].previous_outpoint.index, 1);
+        assert_eq!(tx.inputs[0].signature_script, vec![0x41, 0x01]);
+        assert_eq!(tx.inputs[0].sig_op_count, 1);
+        assert_eq!(tx.outputs[0].value, 123_456);
+        assert_eq!(tx.outputs[0].script_public_key.version(), 0);
+        assert_eq!(tx.outputs[0].script_public_key.script(), &[0x20, 0xaa, 0xac]);
+        // Same id as kachat-webserver's scheduled.rs computes for this JSON (its sample tx).
+        assert_eq!(
+            consensus_id(tx),
+            "639d84551894db9a2c8260d462c9dbd173e9b0490d467fb419ada153b7f160b2"
+        );
+    }
+
+    #[test]
+    fn relay_converts_the_android_rest_shape() {
+        // Android's RawTransaction also sends gas; a null payload is omitted by Gson.
+        let mut body = ios_scheduled_body();
+        body["transaction"]["gas"] = serde_json::json!(0);
+        let with_payload = consensus_id(relay_rpc_transaction(body.clone()).unwrap());
+        assert_eq!(with_payload, consensus_id(relay_rpc_transaction(ios_scheduled_body()).unwrap()));
+        body["transaction"].as_object_mut().unwrap().remove("payload");
+        assert!(relay_rpc_transaction(body).unwrap().payload.is_empty());
+    }
+
+    #[test]
+    fn relay_still_accepts_the_rpc_shape() {
+        let rpc = serde_json::json!({
+            "version": 0,
+            "inputs": [{
+                "previousOutpoint": { "transactionId": "ab".repeat(32), "index": 1 },
+                "signatureScript": "4101", "sequence": 0, "sigOpCount": 1, "verboseData": null
+            }],
+            "outputs": [{ "value": 123456, "scriptPublicKey": "000020aaac", "verboseData": null }],
+            "lockTime": 0, "gas": 0, "mass": 0, "verboseData": null,
+            "subnetworkId": "0000000000000000000000000000000000000000",
+            "payload": faster_hex::hex_string(b"kchat:1:post:02aa:aGk="),
+        });
+        // It is valid RpcTransaction JSON as-is, and converts to the same transaction.
+        let direct: RpcTransaction = serde_json::from_value(rpc.clone()).unwrap();
+        let converted = relay_rpc_transaction(serde_json::json!({ "transaction": rpc })).unwrap();
+        assert_eq!(consensus_id(direct), consensus_id(converted.clone()));
+        assert_eq!(
+            consensus_id(converted),
+            consensus_id(relay_rpc_transaction(ios_scheduled_body()).unwrap())
+        );
+    }
+
+    #[test]
+    fn relay_rejects_junk() {
+        assert!(relay_rpc_transaction(serde_json::json!({ "payload": "6b" })).is_err());
+        assert!(relay_rpc_transaction(serde_json::json!({ "transaction": "x" })).is_err());
+        let mut bad = ios_scheduled_body();
+        bad["transaction"]["payload"] = serde_json::json!("zz");
+        assert!(relay_rpc_transaction(bad).is_err());
+    }
 
     #[test]
     fn canonicalize_sets_are_stable() {

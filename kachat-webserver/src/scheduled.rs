@@ -680,6 +680,8 @@ mod tests {
             "payload": hex::encode(b"kchat:1:post:02aa:aGk="),
         }});
         assert_eq!(transaction_id(&body).as_deref(), Some(id.as_str()));
+        // Pinned: kasia-indexer's /internal/push/submit-tx test converts this same JSON to this id.
+        assert_eq!(id, "639d84551894db9a2c8260d462c9dbd173e9b0490d467fb419ada153b7f160b2");
         // The signature script is not part of the id; the payload is.
         let mut other = body.clone();
         other["transaction"]["inputs"][0]["signatureScript"] = serde_json::json!("ff");

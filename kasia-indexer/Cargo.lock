@@ -1582,6 +1582,7 @@ dependencies = [
  "itertools 0.14.0",
  "jsonwebtoken",
  "kaspa-addresses",
+ "kaspa-consensus-core",
  "kaspa-rpc-core",
  "kaspa-wrpc-client",
  "protocol",
