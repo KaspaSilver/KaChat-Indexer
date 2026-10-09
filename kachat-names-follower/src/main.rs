@@ -934,6 +934,37 @@ mod tests {
         assert!(!reg.utxos.contains_key(&m.genesis_outpoint), "the genesis gap is spent");
     }
 
+    /// .kachat mainnet v1 (kachat-domains 8f9435b, 2026-10-09): the registry v4 contracts on the
+    /// year clock. The follower must read it exactly: id, version, clock, genesis gap script.
+    #[test]
+    fn reads_the_live_mainnet_manifest() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kachat-domains/manifests/kachat-names-mainnet.json");
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: no mainnet manifest");
+            return;
+        }
+        let m = read_manifest(path).unwrap();
+        assert_eq!(m.registry, "348bd2c81170f267a2a7039cbf3a6f275e80b189d6c956183ea73ff3ffde75a4");
+        assert_eq!(m.version, 4, "mainnet v1 runs the v4 contracts and keeps registryVersion 4");
+        assert_eq!(m.network, "mainnet");
+        assert_eq!(m.price_covenant_id, None);
+        assert!(m.price_shards.is_empty());
+        assert_eq!(m.templates.period_ms, 31_536_000_000, "a 365-day year");
+        assert_eq!(m.grace_ms, 7_776_000_000, "90 days of grace");
+        assert_eq!(m.renew_window_ms, 2_592_000_000, "renewal opens 30 days before expiry");
+        assert_eq!(m.genesis_txid, "a0281841bf77807a7780f13cc84c0a3e4cd8df3d076b7f052ffc9c898cca90ff");
+        assert_eq!(hex::encode(m.genesis_outpoint.0), m.genesis_txid);
+        assert_eq!(m.genesis_gap.lo, [0u8; 32]);
+        assert_eq!(m.genesis_gap.hi, [0xffu8; 32]);
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(hex::encode(m.scan_from), raw["genesis"]["scanFrom"].as_str().unwrap());
+        let gap0 = &raw["genesis"]["authorizedOutputs"][0];
+        assert_eq!(hex::encode(m.templates.gap.spk(&m.genesis_gap.encode())), gap0["scriptPublicKey"].as_str().unwrap());
+        // The P2SH address the follower derives for the genesis gap is the manifest's mainnet one.
+        let spk = hex::decode(gap0["scriptPublicKey"].as_str().unwrap()).unwrap();
+        assert_eq!(spk_address(Prefix::Mainnet, &spk).as_deref(), gap0["address"].as_str());
+    }
+
     #[test]
     fn reads_the_live_testnet_manifest() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kachat-domains/manifests/kachat-names-testnet-10.json");
