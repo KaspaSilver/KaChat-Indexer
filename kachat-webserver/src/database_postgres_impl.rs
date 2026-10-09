@@ -185,7 +185,7 @@ impl PostgresDbManager {
         if content_search.is_some() {
             bind_count += 1;
             content_conditions = format!(
-                " AND convert_from(decode(c.base64_encoded_message, 'base64'), 'UTF8') ILIKE ${} ESCAPE '\\'",
+                " AND kachat_b64_utf8(c.base64_encoded_message) ILIKE ${} ESCAPE '\\'",
                 bind_count
             );
         }
@@ -964,7 +964,7 @@ impl DatabaseInterface for PostgresDbManager {
         if let Some(_) = searched_user_nickname.as_ref() {
             bind_count += 1;
             query.push_str(&format!(
-                " AND convert_from(decode(b.base64_encoded_nickname, 'base64'), 'UTF8') ILIKE ${}",
+                " AND kachat_b64_utf8(b.base64_encoded_nickname) ILIKE ${}",
                 bind_count
             ));
         }
@@ -1104,7 +1104,7 @@ impl DatabaseInterface for PostgresDbManager {
                 WHERE content_type IN ('post', 'reply', 'quote', 'poll')
                 GROUP BY sender_pubkey
             ) pc ON pc.sender_pubkey = b.sender_pubkey
-            WHERE (convert_from(decode(b.base64_encoded_nickname, 'base64'), 'UTF8') ILIKE $2 ESCAPE '\'
+            WHERE (kachat_b64_utf8(b.base64_encoded_nickname) ILIKE $2 ESCAPE '\'
                    OR encode(b.sender_pubkey, 'hex') ILIKE $3 ESCAPE '\')
             "#,
         );

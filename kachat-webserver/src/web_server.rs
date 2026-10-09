@@ -394,10 +394,31 @@ impl WebServer {
             names: crate::names::NamesState::from_env(),
         });
 
+        // Rate-limit windows are one minute; drop entries idle for two so one-off (or rotating)
+        // client addresses don't grow the maps for the life of the process.
+        spawn_rate_limit_pruner(app_state.clone());
+
         // §5.10: start the per-minute scheduler that broadcasts due scheduled posts. A
         // names-only server has no KaPosts tables, so it has nothing to schedule.
         if !names_only() {
             crate::scheduled::spawn_scheduler(app_state.clone());
+            // kachat-audits IDX-005: search decodes stored base64 with kachat_b64_utf8, which
+            // returns NULL instead of failing the whole query on one bad row. The processor
+            // creates it too; whichever starts first does (idempotent).
+            if let Err(e) = sqlx::query(
+                r#"CREATE OR REPLACE FUNCTION kachat_b64_utf8(value TEXT) RETURNS TEXT AS $$
+                BEGIN
+                    RETURN convert_from(decode(value, 'base64'), 'UTF8');
+                EXCEPTION WHEN others THEN
+                    RETURN NULL;
+                END;
+                $$ LANGUAGE plpgsql IMMUTABLE"#,
+            )
+            .execute(&app_state.scheduled_pool)
+            .await
+            {
+                tracing::warn!("could not create kachat_b64_utf8: {e}");
+            }
         }
 
         Self { app_state }
@@ -519,7 +540,7 @@ impl WebServer {
                     .allow_headers(Any),
             )
             // Resolve the real client IP from proxy headers BEFORE handlers rate-limit on it.
-            .layer(middleware::from_fn(resolve_client_ip))
+            .layer(middleware::from_fn_with_state(self.app_state.clone(), resolve_client_ip))
             .with_state(self.app_state.clone())
     }
 
@@ -539,9 +560,18 @@ impl WebServer {
 }
 
 // Rate limiting middleware
-async fn check_rate_limit(
+pub(crate) async fn check_rate_limit(
     state: &AppState,
     client_addr: SocketAddr,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    check_rate_limit_n(state, client_addr, 1).await
+}
+
+/// Charge `n` requests at once (e.g. `/identity/batch`, one per address looked up).
+pub(crate) async fn check_rate_limit_n(
+    state: &AppState,
+    client_addr: SocketAddr,
+    n: u32,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
     let now = Instant::now();
     let mut rate_limits = state.rate_limit_map.write().await;
@@ -557,7 +587,7 @@ async fn check_rate_limit(
         entry.window_start = now;
     }
 
-    entry.count += 1;
+    entry.count = entry.count.saturating_add(n);
 
     if entry.count > state.server_config.rate_limit {
         let error = ApiError {
@@ -570,10 +600,31 @@ async fn check_rate_limit(
     Ok(())
 }
 
+const RATE_LIMIT_IDLE: Duration = Duration::from_secs(120);
+
+/// Every minute, drop rate-limit entries (general and /translate) whose window started over
+/// two minutes ago: their count would be reset on the next request anyway.
+fn spawn_rate_limit_pruner(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let now = Instant::now();
+            state
+                .rate_limit_map
+                .write()
+                .await
+                .retain(|_, e| now.duration_since(e.window_start) < RATE_LIMIT_IDLE);
+            crate::translate::prune_rate_limits(&state.translate_rate_limit_map, now, RATE_LIMIT_IDLE).await;
+        }
+    });
+}
+
 /// Extract the real client IP from proxy headers. Prefers `X-Real-IP`, which our nginx front
 /// sets to the connecting client and clients cannot spoof (nginx overwrites it). Falls back to
 /// the last hop of `X-Forwarded-For` — the entry the immediate trusted proxy appended (the
-/// first hop is client-supplied and spoofable, so it is deliberately not used).
+/// first hop is client-supplied and spoofable, so it is deliberately not used). Only called
+/// when the TCP peer is a trusted proxy; anyone else could put anything in these headers.
 fn client_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
     if let Some(ip) = headers
         .get("x-real-ip")
@@ -589,16 +640,33 @@ fn client_ip_from_headers(headers: &HeaderMap) -> Option<IpAddr> {
         .and_then(|s| s.trim().parse::<IpAddr>().ok())
 }
 
+/// The client a request is charged to: the forwarded client when the TCP peer is a trusted
+/// proxy (`--trusted-proxies`), else the peer itself. IPv4-mapped addresses become IPv4 and
+/// IPv6 is keyed by its /64, the block one subscriber is usually given.
+fn rate_limit_key(peer: IpAddr, headers: &HeaderMap, trusted: &[crate::config::IpNet]) -> IpAddr {
+    let peer = peer.to_canonical();
+    let ip = if trusted.iter().any(|n| n.contains(peer)) {
+        client_ip_from_headers(headers).map(|ip| ip.to_canonical()).unwrap_or(peer)
+    } else {
+        peer
+    };
+    match ip {
+        IpAddr::V6(v6) => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+        v4 => v4,
+    }
+}
+
 /// Middleware: rewrite `ConnectInfo<SocketAddr>` to the real client IP so per-IP rate limiting
 /// works behind nginx (otherwise every user shares the proxy's single IP). Port is normalized to
 /// 0 so the rate-limit map keys purely by client IP. Runs before handlers, which then rate-limit
 /// transparently via their existing `ConnectInfo` extractor — no per-handler changes needed.
-async fn resolve_client_ip(mut req: Request, next: Next) -> Response {
+async fn resolve_client_ip(State(state): State<Arc<AppState>>, mut req: Request, next: Next) -> Response {
     let peer_ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip());
-    if let Some(ip) = client_ip_from_headers(req.headers()).or(peer_ip) {
+    if let Some(peer) = peer_ip {
+        let ip = rate_limit_key(peer, req.headers(), &state.server_config.trusted_proxies);
         req.extensions_mut()
             .insert(ConnectInfo(SocketAddr::new(ip, 0)));
     }
@@ -3015,5 +3083,31 @@ async fn handle_get_trending_hashtags(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(real_ip: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", real_ip.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn forwarded_ip_only_from_a_trusted_proxy() {
+        let trusted = crate::config::parse_trusted_proxies(crate::config::DEFAULT_TRUSTED_PROXIES).unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // nginx on the docker network: the header names the client.
+        assert_eq!(rate_limit_key(ip("172.18.0.3"), &headers("8.8.8.8"), &trusted), ip("8.8.8.8"));
+        // A direct client cannot pick its own identity.
+        assert_eq!(rate_limit_key(ip("9.9.9.9"), &headers("8.8.8.8"), &trusted), ip("9.9.9.9"));
+        assert_eq!(rate_limit_key(ip("9.9.9.9"), &headers("8.8.8.8"), &[]), ip("9.9.9.9"));
+        // IPv6 is keyed by its /64; IPv4-mapped addresses as IPv4.
+        assert_eq!(rate_limit_key(ip("2001:db8:1:2:aaaa::1"), &HeaderMap::new(), &trusted), ip("2001:db8:1:2::"));
+        assert_eq!(rate_limit_key(ip("::ffff:9.9.9.9"), &HeaderMap::new(), &trusted), ip("9.9.9.9"));
+        assert_eq!(rate_limit_key(ip("127.0.0.1"), &headers("2001:db8::5"), &trusted), ip("2001:db8::"));
     }
 }

@@ -87,6 +87,11 @@ pub struct TranslateRateEntry {
 
 pub type TranslateRateLimitMap = Arc<RwLock<HashMap<SocketAddr, TranslateRateEntry>>>;
 
+/// Drop entries whose window started more than `idle` ago (see web_server's pruner).
+pub(crate) async fn prune_rate_limits(map: &TranslateRateLimitMap, now: Instant, idle: Duration) {
+    map.write().await.retain(|_, e| now.duration_since(e.window_start) < idle);
+}
+
 async fn check_translate_rate_limit(
     app: &AppState,
     addr: SocketAddr,

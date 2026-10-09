@@ -171,6 +171,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn non_chat_kachat_ops_are_not_chat_operations() {
+        for payload in [
+            &b"kchat:1:bcast:general:hello"[..],
+            b"kchat:1:post:02ab:sig:aGk=:[]",
+            b"kchat:1:profile:{}",
+            b"kchat:1:name:x",
+            b"kchat:1:somethingnew:abc",
+        ] {
+            assert_eq!(parse_sealed_operation(payload), None);
+        }
+    }
+
+    #[test]
     fn test_deserialize_sealed_payment() {
         let payload = b"ciph_msg:1:payment:abc123";
         let result = parse_sealed_operation(payload);

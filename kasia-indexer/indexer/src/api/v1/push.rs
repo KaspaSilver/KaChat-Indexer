@@ -64,8 +64,6 @@ impl PushApi {
         registry: PushRegistryHandle,
         network_type: RpcNetworkType,
         auth_mode: PushAuthMode,
-        _app_attest_team_id: Option<String>,
-        _app_attest_bundle_id: Option<String>,
         ext_push_tx: flume::Sender<ExtensionPushEvent>,
         rpc_client: KaspaRpcClient,
     ) -> Self {
@@ -339,7 +337,7 @@ impl PushApi {
 
 /// Constant-time equality of a presented secret and the configured one. Both are
 /// hashed first, so the comparison also does not leak the secret's length.
-fn secret_matches(presented: &[u8], secret: &[u8]) -> bool {
+pub(super) fn secret_matches(presented: &[u8], secret: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
     let (a, b) = (Sha256::digest(presented), Sha256::digest(secret));
     a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0

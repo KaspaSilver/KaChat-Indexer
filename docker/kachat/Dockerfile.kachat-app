@@ -7,7 +7,9 @@
 FROM rust:1.91-alpine AS ourbuild
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
 WORKDIR /src
-COPY Cargo.toml ./
+# The committed lockfile pins every dependency (kachat-audits IDX-010); --locked fails the build
+# rather than resolving fresh versions.
+COPY Cargo.toml Cargo.lock ./
 RUN sed -i '/members = \[/,/\]/c\members = ["kachat-transaction-processor","kachat-webserver","kachat-admin","kachat-names","kachat-names-follower"]' Cargo.toml
 COPY kachat-transaction-processor ./kachat-transaction-processor
 COPY kachat-webserver ./kachat-webserver
@@ -15,7 +17,7 @@ COPY kachat-admin ./kachat-admin
 # .kachat names: the pure engine (the webserver's read API uses it too) + the follower.
 COPY kachat-names ./kachat-names
 COPY kachat-names-follower ./kachat-names-follower
-RUN cargo build --release --bin kachat-transaction-processor --bin kachat-webserver --bin kachat-admin --bin kachat-names-follower
+RUN cargo build --release --locked --bin kachat-transaction-processor --bin kachat-webserver --bin kachat-admin --bin kachat-names-follower
 
 # --- Stage 2: build the vendored chat (kasia) indexer ---
 FROM rust:1.89.0-alpine3.20 AS chatbuild
@@ -27,6 +29,9 @@ RUN cargo build --release
 # --- Stage 3: runtime with supervisord + all binaries ---
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates libssl3 libcrypto3 libgcc supervisor
+# Unprivileged user for every service (kachat-audits IDX-011). Binaries stay root-owned, so a
+# compromised service cannot rewrite them.
+RUN addgroup -S -g 10001 kachat && adduser -S -D -H -u 10001 -G kachat kachat
 WORKDIR /app
 
 # Block ingester binary lifted from the upstream Alpine image (musl-compatible).
@@ -40,6 +45,9 @@ COPY --from=chatbuild /src/target/release/indexer /app/kachat-chat-indexer
 # Launch scripts + supervisor config.
 COPY docker/kachat/app/ /app/
 COPY docker/kachat/supervisord.conf /etc/supervisord.conf
-RUN chmod +x /app/run-*.sh
+COPY docker/kachat/entrypoint.sh /usr/local/bin/kachat-entrypoint
+RUN chmod +x /app/run-*.sh /usr/local/bin/kachat-entrypoint \
+ && mkdir -p /app/data && chown kachat:kachat /app/data
 
-ENTRYPOINT ["supervisord", "-c", "/etc/supervisord.conf"]
+# Root only long enough to re-own the data volume and copy the push keys, then supervisord.
+ENTRYPOINT ["/usr/local/bin/kachat-entrypoint"]

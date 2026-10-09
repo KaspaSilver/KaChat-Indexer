@@ -36,7 +36,8 @@ struct Args {
     db_name: String,
     #[arg(long, default_value = "username")]
     db_user: String,
-    #[arg(long, default_value = "password")]
+    /// kachat-audits IDX-011: read from env DB_PASSWORD so it stays off the command line.
+    #[arg(long, env = "DB_PASSWORD", hide_env_values = true, default_value = "password")]
     db_password: String,
     #[arg(long, default_value_t = 4)]
     db_max_connections: u32,
@@ -89,6 +90,16 @@ fn is_testnet() -> bool {
 /// indexer (explorer API, chat store directory); an explicit value always wins.
 fn network_default(value: &str, mainnet_default: &str, testnet_default: &str) -> String {
     if is_testnet() && value == mainnet_default { testnet_default.to_string() } else { value.to_string() }
+}
+
+/// kachat-audits IDX-001: the chat indexer's maintenance routes (/export, /import-file,
+/// /personal/purge-all, /contextual-messages/import) require `x-internal-secret` =
+/// INTERNAL_PUSH_SECRET. Attaches it when set; unset means the indexer answers 401.
+fn with_internal_secret(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var("INTERNAL_PUSH_SECRET").map(|s| s.trim().to_string()) {
+        Ok(s) if !s.is_empty() => rb.header("x-internal-secret", s),
+        _ => rb,
+    }
 }
 
 #[derive(Clone)]
@@ -864,7 +875,7 @@ async fn post_chat_import(
 
     resp.forwarded = to_import.len();
     for chunk in to_import.chunks(200) {
-        match client.post(&state.chat_import_url).json(&chunk).send().await {
+        match with_internal_secret(client.post(&state.chat_import_url)).json(&chunk).send().await {
             Ok(r) => {
                 let dto: ImportResultDto = r.json().await.unwrap_or_default();
                 resp.imported += dto.imported;
@@ -893,7 +904,7 @@ async fn get_chat_export(State(state): State<AppState>) -> axum::response::Respo
         Ok(c) => c,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "client error").into_response(),
     };
-    match client.get(&state.chat_export_url).send().await {
+    match with_internal_secret(client.get(&state.chat_export_url)).send().await {
         Ok(r) if r.status().is_success() => {
             let bytes = r.bytes().await.unwrap_or_default();
             (
@@ -924,8 +935,7 @@ async fn post_chat_import_file(
         Ok(c) => c,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "client error").into_response(),
     };
-    match client
-        .post(&state.chat_import_file_url)
+    match with_internal_secret(client.post(&state.chat_import_file_url))
         .body(body.to_vec())
         .send()
         .await
@@ -1421,7 +1431,7 @@ async fn post_chat_purge(State(state): State<AppState>) -> axum::response::Respo
         Ok(c) => c,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "client error").into_response(),
     };
-    match client.post(&state.chat_purge_url).send().await {
+    match with_internal_secret(client.post(&state.chat_purge_url)).send().await {
         Ok(r) => {
             let txt = r.text().await.unwrap_or_default();
             info!("kachat-admin triggered chat store purge");

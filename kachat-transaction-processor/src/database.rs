@@ -168,6 +168,9 @@ impl KDbClient {
         // Step 1c: idempotently ensure the KaPosts personal-mode block/mute denylist exists.
         self.create_denylist_schema().await?;
 
+        // Step 1c': safe nickname decode + one-off cleanup of undecodable nicknames (IDX-005).
+        self.create_safe_nickname_decode().await?;
+
         // Step 1d: idempotently ensure the post-translation cache table exists (fork addition).
         self.create_translations_schema().await?;
 
@@ -419,6 +422,38 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// kachat-audits IDX-005: `kachat_b64_utf8(text)` decodes base64 to UTF-8 text and returns
+    /// NULL instead of raising, so SQL that decodes stored nicknames can use it without one bad
+    /// row failing the whole query. Then blank out (`''`, the column's NOT NULL default) every
+    /// stored K-profile nickname that does not decode — rows written before the processor
+    /// validated nicknames. Idempotent: a clean table updates nothing.
+    async fn create_safe_nickname_decode(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION kachat_b64_utf8(value TEXT) RETURNS TEXT AS $$
+            BEGIN
+                RETURN convert_from(decode(value, 'base64'), 'UTF8');
+            EXCEPTION WHEN others THEN
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql IMMUTABLE
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        let cleaned = sqlx::query(
+            "UPDATE k_broadcasts SET base64_encoded_nickname = '' \
+             WHERE base64_encoded_nickname <> '' AND kachat_b64_utf8(base64_encoded_nickname) IS NULL",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if cleaned > 0 {
+            warn!("Blanked {} undecodable K-profile nickname(s)", cleaned);
+        }
         Ok(())
     }
 

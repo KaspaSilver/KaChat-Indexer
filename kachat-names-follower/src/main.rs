@@ -322,17 +322,20 @@ async fn run(args: Args) -> Result<()> {
         follower.seed(m.scan_from, m.genesis_outpoint, m.genesis_gap);
         follower.seed_shards(&m.price_shards);
         let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
-        let report = bootstrap::walk(&node, &http, &base, m.prefix, &m.templates, &mut follower.registry).await?;
+        let mut report = bootstrap::Report::default();
+        bootstrap::walk(&node, &http, &base, m.prefix, &m.templates, &mut follower.registry, &mut report).await?;
         for e in &report.events {
             info!("[names] [bootstrap-probe] {:<14} key {}… tx {}", e.op, &hex::encode(e.key)[..12], hex::encode(e.tx_id));
         }
         let names: Vec<String> = follower.registry.names().map(|(_, n)| n.name_str()).collect();
         info!(
-            "[names] [bootstrap-probe] {} round(s), {} tx(s), {} live rows, unresolved {}; names {:?}",
+            "[names] [bootstrap-probe] {} round(s), {} tx(s), {} live rows, unresolved {}, unverifiable {}, rejected {}; names {:?}",
             report.rounds,
             report.applied.len(),
             follower.registry.utxos.len(),
             report.unresolved,
+            report.unverified,
+            report.rejected,
             names
         );
         let missing = self_test(&node, &m, &follower.registry).await?;
@@ -425,6 +428,10 @@ async fn run(args: Args) -> Result<()> {
     // chain after the checkpoint may carry them again; they are skipped, not re-applied).
     let mut last_bootstrap: Option<Instant> = None;
     let mut bootstrapped_txids: HashSet<[u8; 32]> = HashSet::new();
+    // IDX-013: a walk is only checkpointed once complete. Until then its progress (applied in
+    // memory to the registry) accumulates here and the next attempt resumes from it.
+    let mut boot = bootstrap::Report::default();
+    let mut boot_incomplete = false;
 
     loop {
         let from = follower.checkpoint.unwrap_or(m.scan_from);
@@ -439,18 +446,32 @@ async fn run(args: Args) -> Result<()> {
                 // shrinking the batch and retrying forever as if just started.
                 let pruned = start_block_pruned(&node, from, &e).await;
                 // §3: rebuild from the REST API instead, then follow the node from its sink.
-                // Tried at most every 10 minutes (the API may be down, or not caught up).
-                if pruned
-                    && args.rest_bootstrap != "off"
-                    && last_bootstrap.is_none_or(|t| t.elapsed() >= Duration::from_secs(600))
-                {
+                // Tried at most every 10 minutes after a failure (the API may be down), every 2
+                // minutes while a walk is incomplete (waiting for the API to catch up).
+                let retry_after = Duration::from_secs(if boot_incomplete { 120 } else { 600 });
+                if pruned && args.rest_bootstrap != "off" && last_bootstrap.is_none_or(|t| t.elapsed() >= retry_after) {
                     last_bootstrap = Some(Instant::now());
                     let base = bootstrap::rest_base(&m.network);
                     info!("[names] start block {} is pruned: rebuilding the registry from {base}", hex::encode(from));
                     let sink = node.client.get_sink().await.map_err(|e| anyhow!("getSink: {e}"))?.sink;
                     let sink_daa = node.virtual_daa().await.unwrap_or(0);
-                    match bootstrap::walk(&node, &http, &base, m.prefix, &m.templates, &mut follower.registry).await {
-                        Ok(report) => {
+                    // A spend accepted in the last moments is often not in the REST database
+                    // yet: walk again (it resumes where it stopped) after growing pauses.
+                    let mut outcome = Ok(());
+                    for pause in [0u64, 10, 30, 90] {
+                        if pause > 0 {
+                            info!("[names] bootstrap: {} spent output(s) not followed yet; walking again in {pause}s", boot.unresolved);
+                            tokio::time::sleep(Duration::from_secs(pause)).await;
+                        }
+                        outcome = bootstrap::walk(&node, &http, &base, m.prefix, &m.templates, &mut follower.registry, &mut boot).await;
+                        if outcome.is_err() || boot.unresolved == 0 {
+                            break;
+                        }
+                    }
+                    match outcome {
+                        Ok(()) if boot.unresolved == 0 => {
+                            let report = std::mem::take(&mut boot);
+                            boot_incomplete = false;
                             for tx in &report.applied {
                                 for (i, o) in tx.outputs.iter().enumerate() {
                                     let op = (tx.id, i as u32);
@@ -479,21 +500,38 @@ async fn run(args: Args) -> Result<()> {
                                 follower.registry.utxos.len(),
                                 hex::encode(sink.as_bytes())
                             );
-                            if report.unresolved > 0 {
-                                warn!("[names] bootstrap: {} spent output(s) not yet in the REST API; the node will carry them", report.unresolved);
+                            if report.unverified > 0 {
+                                warn!(
+                                    "[names] bootstrap: {} transaction(s) taken on the REST API's word (their blocks are pruned on this node); the live set was checked against the node",
+                                    report.unverified
+                                );
                             }
                             continue;
+                        }
+                        // Spends the REST API does not have (yet): the node's chain after its
+                        // sink would never carry them again, so checkpointing now would leave
+                        // the follower unsynced for good. Say so and try again later.
+                        Ok(()) => {
+                            boot_incomplete = true;
+                            tracing::error!(
+                                "[names] bootstrap incomplete: {} spent registry output(s) whose spending transaction {base} does not have{}; not checkpointing, retrying in 2 minutes",
+                                boot.unresolved,
+                                if boot.rejected > 0 { format!(" ({} REST transaction(s) rejected as not matching their id)", boot.rejected) } else { String::new() }
+                            );
                         }
                         Err(err) => warn!("[names] bootstrap failed ({err:#}); retrying in 10 minutes"),
                     }
                 }
                 if pruned {
-                    let first = status.fatal_reason.is_none();
-                    status.fatal_reason = Some("start_block_pruned".into());
+                    // /names/status `error`: the start block is gone, and (with the REST
+                    // bootstrap) whether the rebuild is stuck on spends REST can't show.
+                    let reason = if boot_incomplete { "bootstrap_unresolved" } else { "start_block_pruned" };
+                    let first = status.fatal_reason.as_deref() != Some(reason);
+                    status.fatal_reason = Some(reason.into());
                     status.start_block = Some(from);
                     status.synced = false;
                     store::save_status(&pool, &status).await?;
-                    if first || last_fatal_log.elapsed() >= Duration::from_secs(60) {
+                    if !boot_incomplete && (first || last_fatal_log.elapsed() >= Duration::from_secs(60)) {
                         last_fatal_log = Instant::now();
                         tracing::error!(
                             "[names] start block {} is below the node's pruning point; this node can't replay the registry from it (see docs/KACHAT_NAMES_PRUNED_START.md)",
@@ -512,6 +550,44 @@ async fn run(args: Args) -> Result<()> {
         if status.fatal_reason.take().is_some() {
             status.start_block = None;
             info!("[names] the start block is reachable again; following");
+        }
+        // IDX-014: a removed block that changed the registry must be in the undo journal
+        // (persisted with the checkpoint, so it survives restarts). If it is not (the reorg is
+        // deeper than the journal keeps, or the journal predates this version), the live set
+        // can't be reverted: start over from the manifest rather than serve state the chain
+        // no longer has.
+        let mut unrevertable = None;
+        for block in &batch.removed_blocks {
+            if !follower.registry.journal_has_block(block) && store::history_has_block(&pool, block).await? {
+                unrevertable = Some(*block);
+                break;
+            }
+        }
+        if let Some(block) = unrevertable {
+            tracing::error!(
+                "[names] reorg removes chain block {} whose registry changes are not in the undo journal; rebuilding the registry from the manifest",
+                hex::encode(block)
+            );
+            store::rewind(&pool).await?;
+            let (registry, loaded_meta, loaded_status) = store::load(&pool).await?;
+            follower = Follower::new(args.journal_keep);
+            follower.registry = registry;
+            follower.seed(m.scan_from, m.genesis_outpoint, m.genesis_gap);
+            follower.seed_shards(&m.price_shards);
+            meta = loaded_meta;
+            meta.insert(m.genesis_outpoint, UtxoMeta { value: 0, created_at: 0, created_daa: 0 });
+            for (op, _) in &m.price_shards {
+                meta.insert(*op, UtxoMeta { value: 0, created_at: 0, created_daa: 0 });
+            }
+            status = loaded_status;
+            refuted.clear();
+            suspects.clear();
+            bootstrapped_txids.clear();
+            boot = bootstrap::Report::default();
+            boot_incomplete = false;
+            last_bootstrap = None;
+            dirty = true;
+            continue;
         }
         // Transactions the REST bootstrap already applied are not applied again.
         if !bootstrapped_txids.is_empty() {

@@ -13,12 +13,13 @@
 
 use crate::web_server::AppState;
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// The genesis manifest handed over after the testnet-10 genesis
@@ -139,7 +140,13 @@ pub fn name_key_hex(name: &str) -> String {
 /// chain and route every `/names/*` lookup here as soon as it matches their manifest. So it
 /// is withheld (null) until the follower can actually answer those lookups; the manifest's
 /// id is reported separately as `manifestRegistryCovenantId` for the panel.
-pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn handle_names_status(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    if let Err(e) = crate::web_server::check_rate_limit(&state, addr).await {
+        return e.into_response();
+    }
     let n = &state.names;
     let manifest_registry = n.manifest.as_ref().and_then(|m| m.registry_covenant_id.clone());
     // Synced = kachat-names-follower caught up, self-tested clean, heartbeat fresh, and
@@ -180,10 +187,17 @@ pub async fn handle_names_status(State(state): State<Arc<AppState>>) -> impl Int
             "bootstrappedAt": follower.as_ref().map(|f| f.bootstrapped_at).filter(|d| *d > 0),
         })),
     )
+    .into_response()
 }
 
 /// GET /names/manifest — the manifest the module runs with, verbatim; 503 when off.
-pub async fn handle_names_manifest(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn handle_names_manifest(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    if let Err(e) = crate::web_server::check_rate_limit(&state, addr).await {
+        return e.into_response();
+    }
     match &state.names.raw {
         Some(raw) => (StatusCode::OK, Json((**raw).clone())).into_response(),
         None => (

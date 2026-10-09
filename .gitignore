@@ -8,14 +8,13 @@ kachat-transaction-processor/Cargo.lock
 kachat-webserver/target
 kachat-webserver/Cargo.lock
 kachat-webserver/locust/__pycache__
-Cargo.lock
 # Local one-off recovery tool (wipes a pruned chat-indexer resume cursor); kept out of git.
 /scratch-cursor-reset/
-# Exception: kasia-indexer ships in the kachat-app container and is built from a fresh clone by
-# the Quick-Start panel. Commit its lockfile so builds are reproducible and a future crates.io
-# yank of a transitive dep can't break a fresh resolve (a locked version is always allowed).
-!kasia-indexer/Cargo.lock
-/target
+# Lockfiles are committed (root workspace and kasia-indexer): both ship in the kachat-app
+# container, built from a fresh clone by the Quick-Start panel, so builds are reproducible and a
+# future crates.io yank of a transitive dep can't break a fresh resolve (kachat-audits IDX-010).
+# Build output anywhere in the tree (not only the root /target).
+target/
 SKI_2.2.0_MIGRATION_ISSUES.md
 
 # Secrets: never commit real env files. Use *.env.example templates (placeholders only).
@@ -24,4 +23,5 @@ SKI_2.2.0_MIGRATION_ISSUES.md
 !*.env.example
 # Local backups that may contain secrets.
 *.bak
-*.bak.*names-vectors.json
+*.bak.*
+names-vectors.json

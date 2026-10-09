@@ -4,7 +4,7 @@ use anyhow::Result;
 use hex;
 use serde_json;
 use sqlx::Row;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Kaspa message signature verification imports (from main K-indexer)
 use kaspa_wallet_core::message::{PersonalMessage, verify_message};
@@ -223,6 +223,36 @@ pub fn is_image_art(body: &str) -> bool {
 ///   - not "text-as-image" art (predominantly drawing/braille/block glyphs — see [`MIN_ART_GLYPHS`]).
 /// Returns `Err(reason)` describing why a message was rejected. (A plain repost — body that is
 /// exactly the marker — has an empty body and passes.)
+/// Longest K-protocol profile nickname (characters, after base64 decoding) the processor stores.
+pub const MAX_K_NICKNAME_CHARS: usize = 100;
+
+/// kachat-audits IDX-005: a K `broadcast` (user profile) is stored only when every field SQL
+/// later decodes is valid base64 and the nickname is UTF-8 within `MAX_K_NICKNAME_CHARS`.
+/// The webserver's user search decodes nicknames in SQL, where one bad row failed the whole query.
+pub fn validate_k_profile(
+    base64_nickname: &str,
+    base64_profile_image: Option<&str>,
+    base64_message: &str,
+) -> Result<(), &'static str> {
+    use base64::{Engine as _, engine::general_purpose};
+    let nickname = general_purpose::STANDARD
+        .decode(base64_nickname)
+        .map_err(|_| "nickname is not valid base64")?;
+    let nickname = std::str::from_utf8(&nickname).map_err(|_| "nickname is not valid UTF-8")?;
+    if nickname.chars().count() > MAX_K_NICKNAME_CHARS {
+        return Err("nickname exceeds max length");
+    }
+    if let Some(image) = base64_profile_image {
+        general_purpose::STANDARD
+            .decode(image)
+            .map_err(|_| "profile image is not valid base64")?;
+    }
+    general_purpose::STANDARD
+        .decode(base64_message)
+        .map_err(|_| "message is not valid base64")?;
+    Ok(())
+}
+
 pub fn validate_kachat_message(base64_encoded_message: &str) -> Result<(), &'static str> {
     use base64::{Engine as _, engine::general_purpose};
     let bytes = general_purpose::STANDARD
@@ -503,22 +533,11 @@ pub struct KFollowRecord {
 
 pub struct KProtocolProcessor {
     db_pool: DbPool,
-    /// Network name ("mainnet" / "testnet-10"), used to prefix broadcast sender addresses.
-    network: String,
 }
 
 impl KProtocolProcessor {
-    pub fn new(db_pool: DbPool, network: String) -> Self {
-        Self { db_pool, network }
-    }
-
-    /// Bech32 human-readable prefix for the active network.
-    fn address_hrp(&self) -> &'static str {
-        if self.network == "mainnet" {
-            "kaspa"
-        } else {
-            "kaspatest"
-        }
+    pub fn new(db_pool: DbPool) -> Self {
+        Self { db_pool }
     }
 
     /// Verify a Kaspa message signature using the proper kaspa-wallet-core verification
@@ -1149,39 +1168,52 @@ impl KProtocolProcessor {
             return Ok(());
         }
 
-        // Sender = the self-send address (broadcasts pay back to the author). simply-kaspa's
-        // addresses_transactions stores the bech32 payload without the hrp; prefix it.
+        // Sender (kachat-audits XP-012): the address input 0 spends from, accepted only when
+        // output 0 pays that same address (the self-send every client writes). See
+        // bcast_sender.rs for why this asks the node instead of addresses_transactions (which
+        // held any input/output address of the tx, so anyone could post as anyone).
         //
-        // RACE: this worker is woken by a LISTEN/NOTIFY the instant the *transaction* row
-        // lands, but simply-kaspa writes the address rows a moment later -- so a first
-        // lookup often misses them, and the broadcast used to be dropped for good
-        // ("no indexed sender address, skipping"). Poll briefly (up to ~6s) for the row
-        // before giving up; it normally shows within a second or two.
+        // RACE: this worker is woken the instant the *transaction* row lands, usually before
+        // a chain block has accepted the tx, so the first lookups come back Unknown. Retry for
+        // up to ~12 s; a tx still unresolved after that is dropped, never guessed.
         let transaction_id_bytes = hex::decode(transaction_id)?;
-        let mut addr: Option<String> = None;
+        let block_hash: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT block_hash FROM transactions WHERE transaction_id = $1")
+                .bind(&transaction_id_bytes)
+                .fetch_optional(&self.db_pool)
+                .await?
+                .flatten();
+        let Some(block_hash) = block_hash else {
+            info!("Broadcast {} has no block hash, skipping", transaction_id);
+            return Ok(());
+        };
+        let mut verdict = crate::bcast_sender::Verdict::Unknown;
         for attempt in 0..12u32 {
-            addr = sqlx::query_scalar(
-                "SELECT address FROM addresses_transactions WHERE transaction_id = $1 LIMIT 1",
-            )
-            .bind(&transaction_id_bytes)
-            .fetch_optional(&self.db_pool)
-            .await?;
-            if addr.is_some() {
-                break;
+            match crate::bcast_sender::resolve(&transaction_id_bytes, &block_hash).await {
+                Ok(crate::bcast_sender::Verdict::Unknown) => {}
+                Ok(v) => {
+                    verdict = v;
+                    break;
+                }
+                Err(e) if attempt == 0 => {
+                    debug!("Broadcast {} sender lookup failed: {e}", transaction_id)
+                }
+                Err(_) => {}
             }
-            if attempt == 0 {
-                info!(
-                    "Broadcast {} sender address not indexed yet, waiting for the address index",
-                    transaction_id
-                );
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         }
-        let sender_address = match addr {
-            Some(a) => format!("{}:{}", self.address_hrp(), a),
-            None => {
-                warn!(
-                    "Broadcast {} still has no indexed sender address after waiting, skipping",
+        let sender_address = match verdict {
+            crate::bcast_sender::Verdict::Verified(a) => a,
+            crate::bcast_sender::Verdict::Forged { input, output } => {
+                info!(
+                    "Broadcast {} dropped: output 0 pays {} but input 0 spends from {}",
+                    transaction_id, output, input
+                );
+                return Ok(());
+            }
+            crate::bcast_sender::Verdict::Unknown => {
+                info!(
+                    "Broadcast {} dropped: input 0's address could not be resolved",
                     transaction_id
                 );
                 return Ok(());
@@ -1953,6 +1985,15 @@ impl KProtocolProcessor {
             profile_image_str,
             k_broadcast.base64_encoded_message
         );
+
+        if let Err(reason) = validate_k_profile(
+            &k_broadcast.base64_encoded_nickname,
+            k_broadcast.base64_encoded_profile_image.as_deref(),
+            &k_broadcast.base64_encoded_message,
+        ) {
+            info!("Broadcast {} rejected: {}, skipping", transaction_id, reason);
+            return Ok(());
+        }
 
         // Verify the signature
         if !self.verify_kaspa_signature(
@@ -3171,5 +3212,31 @@ mod content_validation_tests {
         assert!(!is_image_art("Ahoj je tu niekto zo Slovenska ??"));
         assert!(!is_image_art("{\"type\":\"reaction\",\"emoji\":\"❤️\",\"targetTxId\":\"abc123\"}"));
         assert!(!is_image_art(&format!("data:audio/webm;base64,{}", "A".repeat(5000))));
+    }
+}
+
+#[cfg(test)]
+mod k_profile_validation_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose};
+
+    fn b64(s: &[u8]) -> String {
+        general_purpose::STANDARD.encode(s)
+    }
+
+    #[test]
+    fn accepts_a_normal_profile() {
+        assert!(validate_k_profile(&b64("Alice".as_bytes()), Some(&b64(b"\x89PNG")), &b64(b"hi")).is_ok());
+        assert!(validate_k_profile(&b64(b""), None, &b64(b"")).is_ok());
+    }
+
+    #[test]
+    fn rejects_what_sql_cannot_decode() {
+        assert!(validate_k_profile("%%%%", None, &b64(b"hi")).is_err());
+        assert!(validate_k_profile(&b64(&[0xff, 0xfe]), None, &b64(b"hi")).is_err());
+        assert!(validate_k_profile(&b64(b"a"), Some("not base64!"), &b64(b"hi")).is_err());
+        assert!(validate_k_profile(&b64(b"a"), None, "%%").is_err());
+        let long = "x".repeat(MAX_K_NICKNAME_CHARS + 1);
+        assert!(validate_k_profile(&b64(long.as_bytes()), None, &b64(b"hi")).is_err());
     }
 }

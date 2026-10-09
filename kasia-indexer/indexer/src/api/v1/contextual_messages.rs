@@ -4,6 +4,7 @@ use anyhow::bail;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::middleware::from_fn;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use indexer_actors::metrics::SharedMetrics;
@@ -57,7 +58,12 @@ impl ContextualMessageApi {
         Router::new()
             .route("/by-sender", get(get_contextual_messages_by_sender))
             .route("/by-inbox", get(get_contextual_messages_by_inbox))
-            .route("/import", post(import_contextual_messages))
+            // kachat-audits IDX-001: bulk insert, internal callers only (kachat-admin).
+            .route(
+                "/import",
+                post(import_contextual_messages)
+                    .route_layer(from_fn(super::admin_auth::require_internal_secret)),
+            )
     }
 }
 

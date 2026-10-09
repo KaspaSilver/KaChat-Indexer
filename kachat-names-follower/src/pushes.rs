@@ -47,10 +47,17 @@ pub fn event_pushes(
         let Some(name) = names.get(&e.key).cloned() else { continue };
         let tx = hex::encode(e.tx_id);
         match e.op {
-            // A new offer: tell the name's current owner, with the offered amount.
+            // A new offer, with the offered amount, for the name's current owner -- but only when
+            // they can act on it (IDX-016): an unbound (v2) offer, or one bound to them. An offer
+            // bound to a former owner can never be accepted (the buyer takes a refund), so
+            // nobody is told of it.
             "offer" => {
                 let Some(owner) = owner_of(&e.key, after) else { continue };
-                if Some(owner) == e.to {
+                if e.from.is_some_and(|seller| seller != owner) {
+                    continue;
+                }
+                let to = owner;
+                if Some(to) == e.to {
                     continue; // an offer on your own name
                 }
                 let amount = after
@@ -59,7 +66,7 @@ pub fn event_pushes(
                     .and_then(|(op, _)| values.get(op))
                     .map(|v| *v as i64);
                 out.push(NamePush {
-                    to_key: owner,
+                    to_key: to,
                     event: "name_offer",
                     name,
                     tx_id: tx.clone(),
@@ -270,6 +277,38 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!((p[0].event, p[0].to_key, p[0].amount), ("name_offer", owner, Some(900_000_000)));
         assert_eq!(text("name_offer", "alice", Some(900_000_000), None).1, "Someone offered 9 for it.");
+    }
+
+    #[test]
+    fn a_bound_offer_notifies_the_owner_only_when_bound_to_them() {
+        // Bob owns alice now. Carol's offer bound to Alice (a former owner) can never be
+        // accepted, so nobody is pushed; bound to Bob, Bob is told once.
+        let (key, bob, carol, alice) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+        let offer_op = ([9u8; 32], 0);
+        let after: HashMap<_, _> = [
+            (([5u8; 32], 2), Tracked::Name(name(key, bob, 0, NOW + 400 * DAY_MS))),
+            (offer_op, Tracked::Offer(OfferState { key, buyer: carol, seller: Some(alice), refund_after: 10 })),
+        ]
+        .into();
+        let values: HashMap<_, _> = [(offer_op, 500_000_000u64)].into();
+        let names: HashMap<_, _> = [(key, "alice".to_string())].into();
+        let mut e = ev("offer", key, 9);
+        e.to = Some(carol);
+        e.from = Some(alice);
+        assert!(event_pushes(&[e.clone()], &HashMap::new(), &after, &values, &names, &HashMap::new()).is_empty());
+
+        e.from = Some(bob);
+        let p = event_pushes(&[e.clone()], &HashMap::new(), &after, &values, &names, &HashMap::new());
+        assert_eq!(p.iter().map(|x| (x.event, x.to_key, x.amount)).collect::<Vec<_>>(), vec![(
+            "name_offer",
+            bob,
+            Some(500_000_000)
+        )]);
+
+        // Unbound (v2): the owner, as before.
+        e.from = None;
+        let p = event_pushes(&[e], &HashMap::new(), &after, &values, &names, &HashMap::new());
+        assert_eq!(p.iter().map(|x| x.to_key).collect::<Vec<_>>(), vec![bob]);
     }
 
     #[test]

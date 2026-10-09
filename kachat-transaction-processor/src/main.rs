@@ -1,3 +1,4 @@
+mod bcast_sender;
 mod config;
 mod database;
 mod hashtag_extractor;
@@ -35,8 +36,13 @@ struct Args {
     #[arg(short = 'U', long, help = "Database username")]
     db_user: Option<String>,
 
-    #[arg(short = 'p', long, help = "Database password")]
+    /// kachat-audits IDX-011: read from env DB_PASSWORD so it stays off the command line.
+    #[arg(short = 'p', long, env = "DB_PASSWORD", hide_env_values = true, help = "Database password")]
     db_password: Option<String>,
+
+    /// Node wRPC (Borsh) URL, used to verify public-chat broadcast senders (XP-012).
+    #[arg(long, env = "KASPA_NODE_WBORSH_URL")]
+    node_url: Option<String>,
 
     #[arg(short = 'm', long, help = "Maximum database connections")]
     db_max_connections: Option<usize>,
@@ -125,6 +131,7 @@ async fn main() -> Result<()> {
     // Load configuration from CLI arguments only
     let config = AppConfig::from_args(&args);
     crate::push_notify::set_network(&config.network);
+    crate::bcast_sender::init(args.node_url.clone());
     info!(
         "Configuration loaded: {} workers, channel: {}, network: {}, reindex: {}",
         config.workers.count,

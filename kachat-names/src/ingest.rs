@@ -244,13 +244,15 @@ pub struct Tx {
 
 /// What one applied transaction changed, enough to reverse it on a reorg (§4.1): the UTXOs
 /// it added (to delete), the UTXOs it consumed (to restore), and any profile it replaced.
-#[derive(Debug, Clone)]
-struct UndoEntry {
-    block: [u8; 32],
-    added: Vec<Outpoint>,
-    removed: Vec<(Outpoint, Tracked)>,
+/// Public so a follower can persist the journal and restore it after a restart: a reorg below
+/// the stored checkpoint must still be undone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoEntry {
+    pub block: [u8; 32],
+    pub added: Vec<Outpoint>,
+    pub removed: Vec<(Outpoint, Tracked)>,
     /// (address, prior value) — `None` prior means the profile didn't exist before.
-    profile: Option<(Vec<u8>, Option<(String, (u64, [u8; 32]))>)>,
+    pub profile: Option<(Vec<u8>, Option<(String, (u64, [u8; 32]))>)>,
 }
 
 /// A name-registry event, emitted as the applier mutates state (for history + pushes).
@@ -623,6 +625,21 @@ impl Registry {
     /// Number of undo entries currently retained (for the reader's pruning + tests).
     pub fn journal_len(&self) -> usize {
         self.journal.len()
+    }
+
+    /// The undo journal, oldest first (for persisting it with the checkpoint).
+    pub fn journal(&self) -> &[UndoEntry] {
+        &self.journal
+    }
+
+    /// Replace the undo journal with one loaded from storage (oldest first).
+    pub fn restore_journal(&mut self, journal: Vec<UndoEntry>) {
+        self.journal = journal;
+    }
+
+    /// Whether the journal holds anything to undo for this chain block.
+    pub fn journal_has_block(&self, block: &[u8; 32]) -> bool {
+        self.journal.iter().any(|e| &e.block == block)
     }
 
     fn apply_register(

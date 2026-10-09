@@ -629,6 +629,28 @@ fn revoke_castling_right_if_corner_touched(sq: Square, board: &mut Board) {
 pub const ARENA_CHANNEL: &str = "chess-arena";
 const PLAYER_COUNT: usize = 8;
 const CLOCK_MS: i64 = 5 * 60 * 1000;
+/// Chain time is charged only past an allowance per move, so the seconds a move spends
+/// reaching the other phone are nobody's thinking time (ChessTournamentCodec.moveDelayMs).
+const MOVE_DELAY_MS: i64 = 10 * 1000;
+/// First allowance window only: a side's first move had 25 s before its clock ran.
+const FIRST_MOVE_GRACE_MS: i64 = 25 * 1000;
+/// Rule windows, by the game's start block time (ChessTournamentCodec.allowanceFromMs /
+/// allowanceV2FromMs): before the first, no allowance; between them, 25 s on a side's first
+/// move and 10 s after; from the second, 10 s on every move. A rule never reaches back.
+const ALLOWANCE_FROM_MS: i64 = 1_790_208_000_000;
+const ALLOWANCE_V2_FROM_MS: i64 = 1_790_280_000_000;
+
+/// The allowance for the move at `ply` (1 = white's first, 2 = black's first) in a game
+/// started at `started_at`. Mirrors ChessTournamentCodec.allowanceMs.
+fn allowance_ms(ply: usize, started_at: i64) -> i64 {
+    if started_at >= ALLOWANCE_V2_FROM_MS {
+        return MOVE_DELAY_MS;
+    }
+    if started_at < ALLOWANCE_FROM_MS {
+        return 0;
+    }
+    if ply <= 2 { FIRST_MOVE_GRACE_MS } else { MOVE_DELAY_MS }
+}
 /// A seat in a waiting room lasts this long; if the room hasn't filled it's given back.
 const SEAT_TTL_MS: i64 = 5 * 60 * 1000;
 
@@ -754,6 +776,8 @@ struct Game {
     white: String,
     black: String,
     board: Board,
+    /// Block time the game started; picks its allowance rules.
+    started_at: i64,
     moves_count: usize,
     white_used_ms: i64,
     black_used_ms: i64,
@@ -794,6 +818,11 @@ impl Game {
         } else {
             None
         }
+    }
+    /// What the side to move is charged for `elapsed` ms of chain time since the last event:
+    /// the time past this ply's allowance (ChessTournamentGame.chargedMs).
+    fn charged_ms(&self, elapsed: i64) -> i64 {
+        (elapsed - allowance_ms(self.moves_count + 1, self.started_at)).max(0)
     }
     fn used_ms(&self, color: Color) -> i64 {
         if color == Color::White {
@@ -1032,7 +1061,8 @@ fn apply_event(event: ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
                     Some(c) if c != game.side_to_move() => {}
                     _ => return,
                 }
-                let elapsed = (event.block_time - game.last_event_at).max(0);
+                // Valid only if the side to move ran out past the same allowance a move gets.
+                let elapsed = game.charged_ms(event.block_time - game.last_event_at);
                 let remaining = CLOCK_MS - game.used_ms(game.side_to_move());
                 if elapsed < remaining {
                     return;
@@ -1083,7 +1113,8 @@ fn apply_move(event: &ArenaEvent, tournaments: &mut HashMap<String, Tournament>)
             (Some(f), Some(t)) => (f, t),
             _ => return,
         };
-        let elapsed = (event.block_time - game.last_event_at).max(0);
+        // A move after the mover's clock ran out (past this move's allowance) is void.
+        let elapsed = game.charged_ms(event.block_time - game.last_event_at);
         let remaining = CLOCK_MS - game.used_ms(game.side_to_move());
         if elapsed >= remaining {
             return;
@@ -1229,6 +1260,7 @@ fn make_game(round: i32, index: i32, white: String, black: String, time: i64) ->
         white,
         black,
         board,
+        started_at: time,
         moves_count: 0,
         white_used_ms: 0,
         black_used_ms: 0,
@@ -1560,5 +1592,90 @@ mod tests {
         let room = t.get("duel-1").unwrap();
         assert_eq!(room.players, vec!["p2".to_string()]);
         assert!(room.started_at.is_none());
+    }
+
+    #[test]
+    fn allowance_windows_match_the_apps() {
+        // ChessTournamentCodec.allowanceMs vectors.
+        assert_eq!(allowance_ms(1, ALLOWANCE_FROM_MS - 1), 0);
+        assert_eq!(allowance_ms(1, ALLOWANCE_FROM_MS), 25_000);
+        assert_eq!(allowance_ms(2, ALLOWANCE_FROM_MS), 25_000);
+        assert_eq!(allowance_ms(3, ALLOWANCE_FROM_MS), 10_000);
+        assert_eq!(allowance_ms(1, ALLOWANCE_V2_FROM_MS), 10_000);
+        assert_eq!(allowance_ms(7, ALLOWANCE_V2_FROM_MS), 10_000);
+    }
+
+    /// A v2-window duel (10 s per move): a 9 s move costs nothing, a 15 s move costs 5 s.
+    /// White plays f3 (9 s), black e5 (15 s, black has 295 s left), white g4 (15 s).
+    fn allowance_duel_opening(start: i64) -> Vec<ArenaRow> {
+        let mv = |tx: &str, who: &str, bt: i64, n: i32, from: &str, to: &str| {
+            ev(tx, who, bt, &format!(
+                r#"{{"type":"chess_t","v":1,"t":"duel-1","a":"move","g":"1-0","n":{n},"from":"{from}","to":"{to}"}}"#
+            ))
+        };
+        vec![
+            ev("j1", "alice", start - 1_000, r#"{"type":"chess_t","v":1,"t":"duel-1","a":"join"}"#),
+            ev("j2", "bob", start, r#"{"type":"chess_t","v":1,"t":"duel-1","a":"join"}"#),
+            mv("m1", "alice", start + 9_000, 1, "f2", "f3"),
+            mv("m2", "bob", start + 24_000, 2, "e7", "e5"),
+            mv("m3", "alice", start + 39_000, 3, "g2", "g4"),
+        ]
+    }
+
+    #[test]
+    fn moves_are_charged_past_the_allowance() {
+        let start = ALLOWANCE_V2_FROM_MS + 1_000_000;
+        let ts = events(allowance_duel_opening(start));
+        let g = ts.get("duel-1").unwrap().game(1, 0).unwrap();
+        assert_eq!(g.moves_count, 3);
+        assert_eq!((g.white_used_ms, g.black_used_ms), (5_000, 5_000));
+
+        // Black mates 304.999 s later: charged 294.999 s of the 295 s left, so the phones accept
+        // it (the raw elapsed time would have flagged black and dropped the move).
+        let mut rows = allowance_duel_opening(start);
+        rows.push(ev("m4", "bob", start + 39_000 + 304_999,
+            r#"{"type":"chess_t","v":1,"t":"duel-1","a":"move","g":"1-0","n":4,"from":"d8","to":"h4"}"#));
+        let ts = events(rows);
+        let g = ts.get("duel-1").unwrap().game(1, 0).unwrap();
+        assert_eq!(g.winner.as_deref(), Some("bob"));
+        assert!(g.outcome == Some(Outcome::Checkmate));
+
+        // One millisecond later the move is past black's clock: void, the game goes on.
+        let mut rows = allowance_duel_opening(start);
+        rows.push(ev("m4", "bob", start + 39_000 + 305_000,
+            r#"{"type":"chess_t","v":1,"t":"duel-1","a":"move","g":"1-0","n":4,"from":"d8","to":"h4"}"#));
+        let ts = events(rows);
+        assert!(ts.get("duel-1").unwrap().game(1, 0).unwrap().winner.is_none());
+    }
+
+    #[test]
+    fn timeout_claims_wait_for_the_allowance() {
+        let start = ALLOWANCE_V2_FROM_MS + 1_000_000;
+        let claim = r#"{"type":"chess_t","v":1,"t":"duel-1","a":"claim","g":"1-0"}"#;
+        // 300 s after white's g4, black has used 290 s of its 295 s (the first 10 s are free):
+        // the claim is early and ignored, as on the phones.
+        let mut rows = allowance_duel_opening(start);
+        rows.push(ev("c1", "alice", start + 39_000 + 300_000, claim));
+        let ts = events(rows);
+        assert!(ts.get("duel-1").unwrap().game(1, 0).unwrap().winner.is_none());
+
+        // At 305 s black is out: the claim wins.
+        let mut rows = allowance_duel_opening(start);
+        rows.push(ev("c1", "alice", start + 39_000 + 300_000, claim));
+        rows.push(ev("c2", "alice", start + 39_000 + 305_000, claim));
+        let ts = events(rows);
+        let g = ts.get("duel-1").unwrap().game(1, 0).unwrap();
+        assert_eq!(g.winner.as_deref(), Some("alice"));
+        assert!(g.outcome == Some(Outcome::Timeout));
+        assert_eq!(g.black_used_ms, CLOCK_MS);
+    }
+
+    #[test]
+    fn games_before_the_allowance_are_charged_in_full() {
+        // Same opening in a game started before 2026-09-24: every second counts.
+        let start = ALLOWANCE_FROM_MS - 10_000_000;
+        let ts = events(allowance_duel_opening(start));
+        let g = ts.get("duel-1").unwrap().game(1, 0).unwrap();
+        assert_eq!((g.white_used_ms, g.black_used_ms), (24_000, 15_000));
     }
 }

@@ -86,7 +86,7 @@ NETWORK_TYPE=mainnet
 # push mutation auth mode: legacy, mixed, strict (default: mixed)
 # - legacy: no signature required
 # - mixed: accepts signed + legacy, but wallet-bound tokens require auth
-# - strict: signature + nonce + App Attest required for register/update/unregister
-#   (requires APNS_TEAM_ID and APNS_TOPIC to derive App Attest App ID)
+# - strict: signature + nonce required for register/update/unregister
+#   (no App Attest: the server does not verify device attestation)
 #PUSH_AUTH_MODE=mixed
 ```

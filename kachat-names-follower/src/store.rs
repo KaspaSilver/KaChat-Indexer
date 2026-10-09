@@ -3,12 +3,14 @@
 //! The registry's live set is small (one row per gap / name / offer UTXO), so after any batch
 //! that changed it the whole set is rewritten in one transaction together with the checkpoint;
 //! a crash between batches resumes from the last committed checkpoint with matching rows.
+//! The reorg undo journal is written in the same transaction (IDX-014), so a reorg that reaches
+//! below the checkpoint after a restart can still be undone.
 //! Index names deliberately avoid `idx_k_` (the KaPosts schema verifier counts those).
 
 use std::collections::HashMap;
 
 use anyhow::Result;
-use kachat_names::ingest::{Event, Outpoint, Registry, Tracked};
+use kachat_names::ingest::{Event, Outpoint, Registry, Tracked, UndoEntry};
 use kachat_names::{GapState, NameState, OfferState, PriceState};
 use sqlx::{PgPool, Row};
 
@@ -83,6 +85,8 @@ pub async fn create_schema(pool: &PgPool) -> Result<()> {
         "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS fatal_reason TEXT",
         "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS start_block BYTEA",
         "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS bootstrapped_at BIGINT NOT NULL DEFAULT 0",
+        // IDX-014: the registry's reorg undo journal (JSON, see `encode_journal`).
+        "ALTER TABLE names_state ADD COLUMN IF NOT EXISTS undo_journal TEXT",
         "CREATE INDEX IF NOT EXISTS names_utxos_key ON names_utxos (key)",
         "CREATE INDEX IF NOT EXISTS names_utxos_owner ON names_utxos (owner)",
         "CREATE INDEX IF NOT EXISTS names_utxos_buyer ON names_utxos (buyer)",
@@ -174,6 +178,90 @@ fn b32(v: Option<Vec<u8>>) -> Option<[u8; 32]> {
     v.and_then(|b| b.try_into().ok())
 }
 
+/// Start over from the manifest after a reorg the journal cannot undo: the live set, its
+/// history and the checkpoint go; the registry id and the reminders already sent stay.
+pub async fn rewind(pool: &PgPool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for t in ["names_utxos", "names_history"] {
+        sqlx::query(&format!("DELETE FROM {t}")).execute(&mut *tx).await?;
+    }
+    sqlx::query(
+        r#"UPDATE names_state SET checkpoint = NULL, undo_journal = NULL, indexed_daa = 0, synced = FALSE,
+               self_test_ok = FALSE, bootstrapped_at = 0 WHERE id = 1"#,
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Whether any history row was written for this chain block (it changed the registry).
+pub async fn history_has_block(pool: &PgPool, block: &[u8; 32]) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM names_history WHERE block = $1)")
+        .bind(block.to_vec())
+        .fetch_one(pool)
+        .await?)
+}
+
+fn tracked_encode(t: &Tracked) -> (&'static str, String) {
+    match t {
+        Tracked::Gap(g) => ("gap", hex::encode(g.encode())),
+        Tracked::Name(n) => ("name", hex::encode(n.encode())),
+        Tracked::Offer(o) => ("offer", hex::encode(o.encode())),
+        Tracked::Shard(p) => ("shard", hex::encode(p.encode())),
+    }
+}
+
+fn tracked_decode(kind: &str, state: &str) -> Option<Tracked> {
+    let b = hex::decode(state).ok()?;
+    Some(match kind {
+        "gap" => Tracked::Gap(GapState::decode(&b)?),
+        "name" => Tracked::Name(NameState::decode(&b)?),
+        "offer" => Tracked::Offer(OfferState::decode(&b)?),
+        "shard" => Tracked::Shard(PriceState::decode(&b)?),
+        _ => return None,
+    })
+}
+
+/// The undo journal as stored: `[{"b": block, "a": [[txid, idx]], "r": [[txid, idx, kind, state]]}]`,
+/// oldest first, each state in its on-chain encoding. Profile undo is left out: this follower
+/// does not keep profiles (the profiles follower does), and entries with nothing else go too.
+pub fn encode_journal(journal: &[UndoEntry]) -> String {
+    let entries: Vec<serde_json::Value> = journal
+        .iter()
+        .filter(|e| !e.added.is_empty() || !e.removed.is_empty())
+        .map(|e| {
+            serde_json::json!({
+                "b": hex::encode(e.block),
+                "a": e.added.iter().map(|op| serde_json::json!([hex::encode(op.0), op.1])).collect::<Vec<_>>(),
+                "r": e.removed.iter().map(|(op, t)| {
+                    let (kind, state) = tracked_encode(t);
+                    serde_json::json!([hex::encode(op.0), op.1, kind, state])
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(entries).to_string()
+}
+
+/// [`encode_journal`] read back. `None` if any entry does not decode: a journal that is only
+/// partly readable would undo a reorg only partly, which is worse than knowing it can't.
+pub fn decode_journal(text: &str) -> Option<Vec<UndoEntry>> {
+    let b32 = |v: &serde_json::Value| -> Option<[u8; 32]> { hex::decode(v.as_str()?).ok()?.try_into().ok() };
+    let op = |v: &serde_json::Value| -> Option<Outpoint> { Some((b32(&v[0])?, u32::try_from(v[1].as_u64()?).ok()?)) };
+    let mut out = Vec::new();
+    for e in serde_json::from_str::<serde_json::Value>(text).ok()?.as_array()? {
+        let added = e["a"].as_array()?.iter().map(op).collect::<Option<Vec<_>>>()?;
+        let removed = e["r"]
+            .as_array()?
+            .iter()
+            .map(|r| Some((op(r)?, tracked_decode(r[2].as_str()?, r[3].as_str()?)?)))
+            .collect::<Option<Vec<_>>>()?;
+        out.push(UndoEntry { block: b32(&e["b"])?, added, removed, profile: None });
+    }
+    Some(out)
+}
+
 /// Load the persisted registry, per-UTXO metadata, profile times and checkpoint.
 pub async fn load(pool: &PgPool) -> Result<(Registry, HashMap<Outpoint, UtxoMeta>, Status)> {
     let mut reg = Registry::new();
@@ -226,7 +314,14 @@ pub async fn load(pool: &PgPool) -> Result<(Registry, HashMap<Outpoint, UtxoMeta
             },
         );
     }
-    let status = match sqlx::query("SELECT * FROM names_state WHERE id = 1").fetch_optional(pool).await? {
+    let state = sqlx::query("SELECT * FROM names_state WHERE id = 1").fetch_optional(pool).await?;
+    if let Some(text) = state.as_ref().and_then(|r| r.try_get::<Option<String>, _>("undo_journal").ok().flatten()) {
+        match decode_journal(&text) {
+            Some(journal) => reg.restore_journal(journal),
+            None => tracing::warn!("[names] the stored undo journal does not decode; a reorg below the checkpoint will rebuild"),
+        }
+    }
+    let status = match state {
         Some(r) => Status {
             checkpoint: b32(r.get("checkpoint")),
             indexed_daa: r.get::<i64, _>("indexed_daa") as u64,
@@ -346,6 +441,11 @@ pub async fn persist(
         .execute(&mut *tx)
         .await?;
     }
+    // The undo journal with the state it undoes (IDX-014).
+    sqlx::query("UPDATE names_state SET undo_journal = $1 WHERE id = 1")
+        .bind(encode_journal(reg.journal()))
+        .execute(&mut *tx)
+        .await?;
     write_status(&mut tx, status).await?;
     tx.commit().await?;
     Ok(())
@@ -407,4 +507,71 @@ pub async fn set_refuted(pool: &PgPool, refuted: &std::collections::HashSet<Outp
     }
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_undo_journal_round_trips() {
+        let (key, owner, buyer, seller) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+        let name = NameState {
+            key,
+            name: kachat_names::pad_name(b"alice"),
+            owner,
+            price: 5,
+            period_start: 1_790_000_000_000,
+            expires_at: 1_821_536_000_000,
+        };
+        let journal = vec![
+            UndoEntry {
+                block: [0xa0; 32],
+                added: vec![([0x11; 32], 0), ([0x11; 32], 1), ([0x11; 32], 2)],
+                removed: vec![(([0x9a; 32], 0), Tracked::Gap(GapState { lo: [0; 32], hi: [0xff; 32] }))],
+                profile: None,
+            },
+            UndoEntry {
+                block: [0xb0; 32],
+                added: vec![([0x12; 32], 0)],
+                removed: vec![
+                    (([0x11; 32], 2), Tracked::Name(name)),
+                    (([0x13; 32], 0), Tracked::Offer(OfferState { key, buyer, seller: Some(seller), refund_after: -7 })),
+                    (([0x14; 32], 0), Tracked::Offer(OfferState { key, buyer, seller: None, refund_after: 9 })),
+                    (([0x15; 32], 3), Tracked::Shard(PriceState { shard: 2, authority: [5; 32], prices: [1, 2, 3, 4, 5] })),
+                ],
+                profile: None,
+            },
+        ];
+        // A profile-only entry is not this follower's to keep.
+        let mut with_profile = journal.clone();
+        with_profile.insert(1, UndoEntry { block: [0xc0; 32], added: vec![], removed: vec![], profile: Some((vec![1], None)) });
+        assert_eq!(decode_journal(&encode_journal(&with_profile)), Some(journal));
+        assert_eq!(decode_journal("[]"), Some(vec![]));
+        assert_eq!(decode_journal(r#"[{"b":"00","a":[],"r":[]}]"#), None, "a bad entry fails the whole journal");
+    }
+
+    #[test]
+    fn a_restored_journal_undoes_a_reorg_after_a_restart() {
+        // Before the restart: block A spent the genesis gap into two gaps.
+        let genesis = ([0x9a; 32], 0u32);
+        let gap = GapState { lo: [0; 32], hi: [0xff; 32] };
+        let (left, right) = (GapState { lo: [0; 32], hi: [0x80; 32] }, GapState { lo: [0x80; 32], hi: [0xff; 32] });
+        let journal = vec![UndoEntry {
+            block: [0xa0; 32],
+            added: vec![([0x11; 32], 0), ([0x11; 32], 1)],
+            removed: vec![(genesis, Tracked::Gap(gap))],
+            profile: None,
+        }];
+        let stored = encode_journal(&journal);
+        // After it: the live set as `load` reads it, plus the stored journal.
+        let mut reg = Registry::new();
+        reg.utxos.insert(([0x11; 32], 0), Tracked::Gap(left));
+        reg.utxos.insert(([0x11; 32], 1), Tracked::Gap(right));
+        reg.restore_journal(decode_journal(&stored).unwrap());
+        assert!(reg.journal_has_block(&[0xa0; 32]));
+        reg.undo_block(&[0xa0; 32]);
+        assert_eq!(reg.utxos.len(), 1);
+        assert_eq!(reg.utxos.get(&genesis), Some(&Tracked::Gap(gap)), "block A undone from the restored journal");
+    }
 }

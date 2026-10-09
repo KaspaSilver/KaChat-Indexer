@@ -20,7 +20,7 @@ impl Worker {
         db_pool: DbPool,
         config: AppConfig,
     ) -> Self {
-        let k_processor = KProtocolProcessor::new(db_pool.clone(), config.network.clone());
+        let k_processor = KProtocolProcessor::new(db_pool.clone());
         Self {
             id,
             receiver,

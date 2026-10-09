@@ -9,6 +9,7 @@ use crate::context::IndexerContext;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
+use axum::middleware::from_fn;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use indexer_actors::metrics::{IndexerMetricsSnapshot, SharedMetrics};
@@ -34,6 +35,7 @@ use std::net::SocketAddr;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+mod admin_auth;
 pub mod contextual_messages;
 pub mod export;
 pub mod group_control;
@@ -250,6 +252,15 @@ impl Api {
                 "/stats",
                 get(export::get_stats).with_state(self.export_api.clone()),
             )
+            .merge(self.admin_router())
+    }
+
+    /// Maintenance/data routes. kachat-audits IDX-001: every one requires the
+    /// `x-internal-secret` header (see `admin_auth`); `route_layer` keeps the guard off
+    /// the public routes merged above.
+    fn admin_router(&self) -> Router {
+        admin_auth::init();
+        Router::new()
             // KaChat fork: full-store export + import-file (large-body).
             .route(
                 "/export",
@@ -272,6 +283,7 @@ impl Api {
                 "/self-stash-gc-orphans",
                 post(export::gc_self_stash_orphans).with_state(self.export_api.clone()),
             )
+            .route_layer(from_fn(admin_auth::require_internal_secret))
     }
 }
 

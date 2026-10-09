@@ -33,7 +33,8 @@ struct Args {
     #[arg(short = 'u', long, help = "Database username")]
     db_user: String,
 
-    #[arg(short = 'p', long, help = "Database password")]
+    // From the environment (kachat-audits IDX-011), so the password is never on a command line.
+    #[arg(short = 'p', long, env = "DB_PASSWORD", hide_env_values = true, help = "Database password")]
     db_password: String,
 
     #[arg(
@@ -76,6 +77,14 @@ struct Args {
         help = "LibreTranslate base URL for the /translate endpoint"
     )]
     libretranslate_url: String,
+
+    #[arg(
+        long,
+        env = "WEBSERVER_TRUSTED_PROXIES",
+        default_value = config::DEFAULT_TRUSTED_PROXIES,
+        help = "Comma-separated proxy addresses/CIDRs whose X-Real-IP / X-Forwarded-For are honoured (empty: none)"
+    )]
+    trusted_proxies: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -118,7 +127,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<(), Box<dyn std
     info!("Rate limit: {} requests/minute per IP", args.rate_limit);
 
     // Load configuration from CLI arguments only
-    let config = AppConfig::from_args(&args, worker_threads);
+    let config = AppConfig::from_args(&args, worker_threads).map_err(|e| format!("--trusted-proxies: {e}"))?;
+    info!("Trusted proxies: {:?}", config.server.trusted_proxies);
 
     let connection_string = config.connection_string();
     info!(

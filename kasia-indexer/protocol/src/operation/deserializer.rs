@@ -2,7 +2,7 @@ use crate::operation::{
     SealedContextualMessageV1, SealedGroupControlV1, SealedGroupMessageV1, SealedHandshakeV2,
     SealedMessageOrSealedHandshakeVNone, SealedOperation, SealedPaymentV1, SealedSelfStashV1,
 };
-use tracing::warn;
+use tracing::{trace, warn};
 
 /// Canonical KaChat protocol prefix. KaChat is its own network on Kaspa; all new chat content is
 /// written with this prefix.
@@ -11,6 +11,14 @@ pub const PROTOCOL_PREFIX: &str = "kchat:";
 /// forward. (KaChat no longer interoperates with the Kasia network — this is read-only legacy.)
 pub const LEGACY_PROTOCOL_PREFIX: &str = "ciph_msg:";
 pub const VERSION_1_PART: &str = "1:";
+/// Ops under the `kchat:1:` root that belong to other KaChat services, not the chat indexer:
+/// KaPosts (the transaction processor), public chats + chess (`bcast`), K profiles
+/// (`broadcast`) and address profiles (`profile`), .kachat names (`name`, `offer`, `prices`).
+const FOREIGN_KACHAT_OPS: &[&str] = &[
+    "post", "reply", "vote", "upvote", "downvote", "quote", "unquote", "follow", "unfollow",
+    "block", "unblock", "edit", "delete", "poll", "pollvote", "broadcast", "bcast", "profile",
+    "name", "offer", "prices",
+];
 
 pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_>> {
     // Dual-read: accept the canonical `kchat:` prefix and the legacy `ciph_msg:` prefix (same
@@ -187,8 +195,20 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
             }))
         }
         Some(msg_type_and_content) => {
-            let msg_type_and_content = faster_hex::hex_string(msg_type_and_content);
-            warn!("Unknown operation type: {msg_type_and_content}");
+            // kachat-audits IDX-012: every other KaChat family shares the `kchat:1:` root
+            // (KaPosts, public chats/chess, profiles, .kachat names). Skip those quietly; warn
+            // only on unrecognised op names, and never dump the payload.
+            let op_end = msg_type_and_content
+                .iter()
+                .position(|b| *b == b':')
+                .unwrap_or(msg_type_and_content.len());
+            let op = &msg_type_and_content[..op_end];
+            if FOREIGN_KACHAT_OPS.iter().any(|known| known.as_bytes() == op) {
+                trace!("Skipping non-chat KaChat operation: {}", String::from_utf8_lossy(op));
+            } else {
+                let shown = String::from_utf8_lossy(&op[..op.len().min(32)]);
+                warn!("Unknown operation type: {:?}", shown);
+            }
             None
         }
     }

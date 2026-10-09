@@ -466,8 +466,6 @@ async fn main() -> anyhow::Result<()> {
             push_registry.clone(),
             context.network_type,
             context.config.push_auth_mode,
-            context.config.apns_team_id.clone(),
-            context.config.apns_topic.clone(),
             ext_push_tx.clone(),
             context.rpc_client.clone(),
         ),
