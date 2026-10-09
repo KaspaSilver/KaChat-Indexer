@@ -267,6 +267,10 @@ impl Window {
 
 /// Deliver one name push to its recipient (owner/seller/buyer key → their address).
 async fn send_push(http: &reqwest::Client, base: &str, secret: Option<&str>, prefix: Prefix, p: &pushes::NamePush) {
+    // A standalone .kachat Domains server with no push service next to it sends none.
+    if base.trim().is_empty() {
+        return;
+    }
     let to = Address::new(prefix, Version::PubKey, &p.to_key).to_string();
     match pushes::send(http, base, secret, &to, p).await {
         Ok(()) => info!("[names] push {} {} -> {}", p.event, p.name, to),

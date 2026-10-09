@@ -394,8 +394,11 @@ impl WebServer {
             names: crate::names::NamesState::from_env(),
         });
 
-        // §5.10: start the per-minute scheduler that broadcasts due scheduled posts.
-        crate::scheduled::spawn_scheduler(app_state.clone());
+        // §5.10: start the per-minute scheduler that broadcasts due scheduled posts. A
+        // names-only server has no KaPosts tables, so it has nothing to schedule.
+        if !names_only() {
+            crate::scheduled::spawn_scheduler(app_state.clone());
+        }
 
         Self { app_state }
     }
@@ -404,12 +407,9 @@ impl WebServer {
         let timeout_duration = Duration::from_secs(self.app_state.server_config.request_timeout);
         let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 
-        Router::new()
-            .route("/", get(handle_root))
-            .route("/health", get(handle_health))
-            .route("/stats", get(handle_stats))
-            // .kachat names registry (testnet): status/manifest here, the read API over the
-            // kachat-names-follower tables in names_api (docs/KACHAT_NAMES_APP_CONTRACT.md).
+        // .kachat names registry: status/manifest here, the read API over the
+        // kachat-names-follower tables in names_api (docs/KACHAT_NAMES_APP_CONTRACT.md).
+        let names = Router::new()
             .route("/names/status", get(crate::names::handle_names_status))
             .route("/names/manifest", get(crate::names::handle_names_manifest))
             .route("/names/prices", get(crate::names_api::prices))
@@ -429,63 +429,85 @@ impl WebServer {
             .route("/profiles/history", get(crate::names_api::profile_history))
             .route("/profiles/:address", get(crate::names_api::profile))
             .route("/identity/batch", post(crate::names_api::identity_batch))
-            .route("/identity/:address", get(crate::names_api::identity))
-            .route(
-                "/metrics",
-                get(move || async move { metric_handle.render() }),
-            )
-            .route("/get-posts", get(handle_get_posts))
-            .route("/get-post-details", get(handle_get_post_details))
-            // Fetch one post by id, any age or author, in the feed's KPost shape.
-            // Same contract as get-post-details; named for what the apps call.
-            .route("/get-post", get(handle_get_post_details))
-            // §5.9: single-poll refresh (options + live counts + myVote).
-            .route("/get-poll", get(handle_get_poll))
-            // §5.10 scheduled posts: build+sign on the phone, submit at notBefore server-side.
-            .route("/schedule-post", post(crate::scheduled::handle_schedule_post))
-            .route("/scheduled-posts", get(crate::scheduled::handle_scheduled_posts))
-            .route(
-                "/cancel-scheduled-post",
-                post(crate::scheduled::handle_cancel_scheduled_post),
-            )
-            // The post plus its parent chain, walked server-side.
-            .route("/get-thread", get(handle_get_thread))
-            .route("/get-posts-watching", get(handle_get_posts_watching))
-            .route(
-                "/get-contents-following",
-                get(handle_get_contents_following),
-            )
-            .route("/get-replies", get(handle_get_replies))
-            .route("/get-post-engagement", get(handle_get_post_engagement))
-            .route("/get-broadcasts", get(handle_get_broadcasts))
-            .route("/get-mentions", get(handle_get_mentions))
-            .route("/get-users", get(handle_get_users))
-            .route("/get-most-active-users", get(handle_get_most_active_users))
-            .route("/get-users-count", get(handle_get_users_count))
-            .route("/search-users", get(handle_search_users))
-            // Unified content/people search (§5.6). type=posts (default) | users.
-            .route("/search", get(handle_search))
-            .route("/get-user-details", get(handle_get_user_details))
-            .route("/get-followed-users", get(handle_get_followed_users))
-            .route("/get-users-following", get(handle_get_users_following))
-            .route("/get-users-followers", get(handle_get_users_followers))
-            .route("/get-blocked-users", get(handle_get_blocked_users))
-            .route(
-                "/get-notifications-count",
-                get(handle_get_notifications_count),
-            )
-            .route("/get-notifications", get(handle_get_notifications))
-            .route("/get-hashtag-content", get(handle_get_hashtag_content))
-            .route("/get-trending-hashtags", get(handle_get_trending_hashtags))
-            // Chess Tournaments (5.1) leaderboard (§6).
-            .route("/chess/leaderboard", get(handle_chess_leaderboard))
-            .route("/chess/player", get(handle_chess_player))
-            .route("/chess/tournaments", get(handle_chess_tournaments))
-            .route("/translate", post(crate::translate::handle_translate))
-            .route(
-                "/translate/languages",
-                get(crate::translate::handle_translate_languages),
-            )
+            .route("/identity/:address", get(crate::names_api::identity));
+
+        let router = if names_only() {
+            // The .kachat Domains server (docs/KACHAT_NAMES_STANDALONE.md): the names, profiles
+            // and identity API over its own database, and nothing that needs the chat or
+            // KaPosts indexer.
+            Router::new()
+                .route("/", get(handle_names_root))
+                .route("/health", get(handle_names_health))
+                .merge(names)
+                .route(
+                    "/metrics",
+                    get(move || async move { metric_handle.render() }),
+                )
+        } else {
+            Router::new()
+                .route("/", get(handle_root))
+                .route("/health", get(handle_health))
+                .route("/stats", get(handle_stats))
+                .merge(names)
+                .route(
+                    "/metrics",
+                    get(move || async move { metric_handle.render() }),
+                )
+                .route("/get-posts", get(handle_get_posts))
+                .route("/get-post-details", get(handle_get_post_details))
+                // Fetch one post by id, any age or author, in the feed's KPost shape.
+                // Same contract as get-post-details; named for what the apps call.
+                .route("/get-post", get(handle_get_post_details))
+                // §5.9: single-poll refresh (options + live counts + myVote).
+                .route("/get-poll", get(handle_get_poll))
+                // §5.10 scheduled posts: build+sign on the phone, submit at notBefore server-side.
+                .route("/schedule-post", post(crate::scheduled::handle_schedule_post))
+                .route("/scheduled-posts", get(crate::scheduled::handle_scheduled_posts))
+                .route(
+                    "/cancel-scheduled-post",
+                    post(crate::scheduled::handle_cancel_scheduled_post),
+                )
+                // The post plus its parent chain, walked server-side.
+                .route("/get-thread", get(handle_get_thread))
+                .route("/get-posts-watching", get(handle_get_posts_watching))
+                .route(
+                    "/get-contents-following",
+                    get(handle_get_contents_following),
+                )
+                .route("/get-replies", get(handle_get_replies))
+                .route("/get-post-engagement", get(handle_get_post_engagement))
+                .route("/get-broadcasts", get(handle_get_broadcasts))
+                .route("/get-mentions", get(handle_get_mentions))
+                .route("/get-users", get(handle_get_users))
+                .route("/get-most-active-users", get(handle_get_most_active_users))
+                .route("/get-users-count", get(handle_get_users_count))
+                .route("/search-users", get(handle_search_users))
+                // Unified content/people search (§5.6). type=posts (default) | users.
+                .route("/search", get(handle_search))
+                .route("/get-user-details", get(handle_get_user_details))
+                .route("/get-followed-users", get(handle_get_followed_users))
+                .route("/get-users-following", get(handle_get_users_following))
+                .route("/get-users-followers", get(handle_get_users_followers))
+                .route("/get-blocked-users", get(handle_get_blocked_users))
+                .route(
+                    "/get-notifications-count",
+                    get(handle_get_notifications_count),
+                )
+                .route("/get-notifications", get(handle_get_notifications))
+                .route("/get-hashtag-content", get(handle_get_hashtag_content))
+                .route("/get-trending-hashtags", get(handle_get_trending_hashtags))
+                // Chess Tournaments (5.1) leaderboard (§6).
+                .route("/chess/leaderboard", get(handle_chess_leaderboard))
+                .route("/chess/player", get(handle_chess_player))
+                .route("/chess/tournaments", get(handle_chess_tournaments))
+                .route("/translate", post(crate::translate::handle_translate))
+                .route(
+                    "/translate/languages",
+                    get(crate::translate::handle_translate_languages),
+                )
+        };
+
+        router
             .layer(prometheus_layer)
             .layer(TimeoutLayer::new(timeout_duration))
             // 2MB: /translate accepts up to 50 posts × 25k chars.
@@ -584,6 +606,31 @@ async fn resolve_client_ip(mut req: Request, next: Next) -> Response {
 }
 
 // API Handler Functions
+
+/// `KACHAT_WEBSERVER_ONLY=names`: serve only the .kachat names, profiles and identity API
+/// (the standalone .kachat Domains server). Anything else, or unset, is the full indexer API.
+pub fn names_only() -> bool {
+    std::env::var("KACHAT_WEBSERVER_ONLY").map(|v| v.trim() == "names").unwrap_or(false)
+}
+
+async fn handle_names_root() -> &'static str {
+    "KaChat .kachat Domains API"
+}
+
+async fn handle_names_health(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+    let network = app_state.names.manifest.as_ref().and_then(|m| m.network.clone());
+    Ok(Json(serde_json::json!({
+        "status": "healthy",
+        "service": "kachat-names",
+        "version": env!("CARGO_PKG_VERSION"),
+        "network": network,
+        "names": app_state.names.is_on(),
+    })))
+}
 
 async fn handle_root() -> &'static str {
     "K-indexer API Server - Posts API v1.0"
