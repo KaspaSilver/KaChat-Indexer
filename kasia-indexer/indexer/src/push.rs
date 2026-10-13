@@ -2090,6 +2090,10 @@ pub struct PushDispatcher {
     funds_rx: flume::Receiver<FundsPushEvent>,
     registry: PushRegistryHandle,
     metrics: SharedMetrics,
+    /// Master on/off switch (env `KACHAT_PUSH_ENABLED`). When false the dispatcher accepts and
+    /// stores device registrations but sends no notifications — the "service off" state the panel
+    /// toggle drives. Absent env = true, so existing deployments keep their current behavior.
+    enabled: bool,
     apns: Option<ApnsClient>,
     fcm: Option<FcmClient>,
     network_type: RpcNetworkType,
@@ -2129,12 +2133,24 @@ impl PushDispatcher {
                 None
             }
         };
+        // Master switch: absent (or any value other than a clear "off") means enabled, so
+        // deployments that never set it keep working exactly as before.
+        let enabled = std::env::var("KACHAT_PUSH_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true);
+        if enabled {
+            info!("[Push] service enabled");
+        } else {
+            info!("[Push] service OFF (KACHAT_PUSH_ENABLED); registrations accepted, no notifications sent");
+        }
         Self {
             rx,
             ext_rx,
             funds_rx,
             metrics: registry.metrics(),
             registry,
+            enabled,
             apns,
             fcm,
             network_type: context.network_type,
@@ -2537,7 +2553,7 @@ impl PushDispatcher {
     }
 
     fn push_enabled(&self) -> bool {
-        self.apns.is_some() || self.fcm.is_some()
+        self.enabled && (self.apns.is_some() || self.fcm.is_some())
     }
 
     /// Route a fan-out set of tokens to the correct transport per registered platform: APNs for
