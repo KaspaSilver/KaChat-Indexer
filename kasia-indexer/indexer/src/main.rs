@@ -180,7 +180,27 @@ async fn main() -> anyhow::Result<()> {
     load_personal_addresses();
     load_personal_group_ids();
 
-    let config = Config::new(context.clone().db_path).max_write_buffer_size(512 * 1024 * 1024);
+    // fjall's default caps background workers at cpus.min(4) = 4 flush + 4 compaction regardless of
+    // core count. With our ~30 partitions on a 16-core host that starves compaction: L0 runs pile
+    // up and the partition write-stall kicks in (soft at l0_run_count 20, hard halt at 32), which
+    // shows up as laggy / dropped push. Give compaction more threads (the box has spare cores and
+    // no cgroup CPU limit). max_write_buffer_size stays 512 MiB — RAM is the tight resource, not the
+    // buffer. Both worker counts are env-overridable so they can be retuned without a rebuild.
+    let compaction_workers = std::env::var("FJALL_COMPACTION_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8);
+    let flush_workers = std::env::var("FJALL_FLUSH_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
+    info!("fjall background workers: {compaction_workers} compaction, {flush_workers} flush");
+    let config = Config::new(context.clone().db_path)
+        .max_write_buffer_size(512 * 1024 * 1024)
+        .compaction_workers(compaction_workers)
+        .flush_workers(flush_workers);
     let tx_keyspace = config.open_transactional()?;
     let virtual_daa = Arc::new(AtomicU64::new(0));
     // Partitions
