@@ -8,6 +8,7 @@
 //! signal, so nothing it serves may be refutable by the chain.
 
 mod bootstrap;
+mod fees;
 mod node;
 mod profiles;
 mod pushes;
@@ -420,6 +421,10 @@ async fn run(args: Args) -> Result<()> {
     let mut names_by_key: HashMap<[u8; 32], String> = HashMap::new();
     let mut window = Window::default();
     let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    // Fees for history indexed before they were recorded (fees.rs), where the REST API is allowed.
+    if args.rest_bootstrap != "off" {
+        tokio::spawn(fees::backfill(pool.clone(), http.clone(), bootstrap::rest_base(&m.network)));
+    }
     let push_secret = (!args.push_secret.is_empty()).then_some(args.push_secret.as_str());
     let mut last_reminder_scan = Instant::now() - Duration::from_secs(60);
     let mut last_heartbeat = Instant::now() - Duration::from_secs(60);

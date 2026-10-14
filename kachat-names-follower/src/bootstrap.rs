@@ -103,7 +103,7 @@ pub fn parse_rest_tx(j: &Value) -> Option<RestTx> {
         let cov = i["covenant_id"].as_str().filter(|c| !c.is_empty()).and_then(|c| hex::decode(c).ok()?.try_into().ok());
         inputs.push((
             num(&i["index"]).unwrap_or(k as u64),
-            TxInput { previous_outpoint: (prev, idx), signature_script: sig, spent_script: Vec::new() },
+            TxInput { spent_amount: None, previous_outpoint: (prev, idx), signature_script: sig, spent_script: Vec::new() },
             cov,
             // Not served by the REST API today: assume 0 (a wallet's default).
             num(&i["sequence"]).unwrap_or(0),

@@ -105,6 +105,10 @@ pub async fn create_schema(pool: &PgPool) -> Result<()> {
             years BIGINT
         )"#,
         "CREATE INDEX IF NOT EXISTS names_history_key ON names_history (key, id)",
+        // What each transaction paid miners (sompi; the registry's price is paid as fee): from
+        // the node's spent amounts as it indexes, or filled in later from the Kaspa REST API for
+        // rows indexed before (`backfill_fees`). -1 = could not be worked out.
+        "ALTER TABLE names_history ADD COLUMN IF NOT EXISTS fee BIGINT",
         "CREATE INDEX IF NOT EXISTS names_history_block ON names_history (block)",
         r#"CREATE TABLE IF NOT EXISTS names_profiles (
             spk BYTEA PRIMARY KEY,
@@ -424,8 +428,8 @@ pub async fn persist(
     }
     for (e, name) in events {
         sqlx::query(
-            r#"INSERT INTO names_history (block, tx_id, op, key, name, at, daa, from_key, to_key, price, years)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"#,
+            r#"INSERT INTO names_history (block, tx_id, op, key, name, at, daa, from_key, to_key, price, years, fee)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"#,
         )
         .bind(e.block.to_vec())
         .bind(e.tx_id.to_vec())
@@ -438,6 +442,7 @@ pub async fn persist(
         .bind(e.to.map(|k| k.to_vec()))
         .bind(e.price)
         .bind(e.years)
+        .bind(e.fee)
         .execute(&mut *tx)
         .await?;
     }

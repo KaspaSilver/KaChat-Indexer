@@ -209,6 +209,9 @@ pub struct TxInput {
     /// The scriptPublicKey of the output this input spends (empty when unknown). A profile
     /// record is honoured only on a real self-send: an input spent from the same address.
     pub spent_script: Vec<u8>,
+    /// The amount of the output this input spends, in sompi (None when unknown): with every
+    /// input's amount known, the transaction's fee is what went in minus what came out.
+    pub spent_amount: Option<u64>,
 }
 
 /// A transaction output.
@@ -242,6 +245,20 @@ pub struct Tx {
     pub block_time: i64,
 }
 
+impl Tx {
+    /// What the transaction paid miners, in sompi: its inputs' amounts minus its outputs'. For
+    /// .kachat that is the network fee plus the registry's price, which is paid as fee. None
+    /// when any input's amount is unknown.
+    pub fn fee(&self) -> Option<i64> {
+        let mut spent: u64 = 0;
+        for i in &self.inputs {
+            spent = spent.checked_add(i.spent_amount?)?;
+        }
+        let out: u64 = self.outputs.iter().try_fold(0u64, |a, o| a.checked_add(o.value))?;
+        i64::try_from(spent.checked_sub(out)?).ok()
+    }
+}
+
 /// What one applied transaction changed, enough to reverse it on a reorg (§4.1): the UTXOs
 /// it added (to delete), the UTXOs it consumed (to restore), and any profile it replaced.
 /// Public so a follower can persist the journal and restore it after a restart: a reorg below
@@ -273,6 +290,8 @@ pub struct Event {
     pub price: Option<i64>,
     /// Years bought (`register`, `renew`).
     pub years: Option<i64>,
+    /// What the whole transaction paid miners (`Tx::fee`), sompi; None when unknown.
+    pub fee: Option<i64>,
 }
 
 /// The tracked registry: gaps/names/offers by outpoint, profiles by address.
@@ -821,7 +840,10 @@ impl Registry {
     }
 
     fn event(&self, op: &'static str, key: [u8; 32], tx: &Tx) -> Event {
-        Event { op, key, tx_id: tx.id, block: tx.accepting_block, daa: tx.accepting_daa, at: tx.block_time, from: None, to: None, price: None, years: None }
+        Event {
+            op, key, tx_id: tx.id, block: tx.accepting_block, daa: tx.accepting_daa, at: tx.block_time,
+            from: None, to: None, price: None, years: None, fee: tx.fee(),
+        }
     }
 }
 

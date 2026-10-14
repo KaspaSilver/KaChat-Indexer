@@ -158,7 +158,7 @@ mod tests {
         let (left, right, nm) = crate::transition::register(gap, b"alice", [7u8; 32], 1_790_000_000_000, 2);
         Tx {
             id: [0x11; 32],
-            inputs: vec![TxInput { spent_script: Vec::new(),
+            inputs: vec![TxInput { spent_amount: None, spent_script: Vec::new(),
                 previous_outpoint: genesis,
                 signature_script: sig(
                     &[b"alice".to_vec(), [7u8; 32].to_vec(), [3u8; 32].to_vec(), scriptnum(1_790_000_000_000), scriptnum(2), vec![], vec![]],
@@ -218,7 +218,7 @@ mod tests {
     fn profile_tx(id: u8, block: [u8; 32], daa: u64, from: &[u8], to: &[u8], json: &str) -> Tx {
         Tx {
             id: [id; 32],
-            inputs: vec![TxInput { previous_outpoint: ([id ^ 0xff; 32], 0), signature_script: vec![], spent_script: from.to_vec() }],
+            inputs: vec![TxInput { spent_amount: None, previous_outpoint: ([id ^ 0xff; 32], 0), signature_script: vec![], spent_script: from.to_vec() }],
             outputs: vec![TxOutput { script_public_key: to.to_vec(), value: 1, covenant: None }],
             payload: format!("kchat:1:profile:{json}").into_bytes(),
             accepting_block: block,

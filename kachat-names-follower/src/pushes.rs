@@ -268,7 +268,7 @@ mod tests {
         NameState { key, name: pad_name(b"alice"), owner, price, period_start: expires - 31_536_000_000, expires_at: expires }
     }
     fn ev(op: &'static str, key: [u8; 32], tx: u8) -> Event {
-        Event { op, key, tx_id: [tx; 32], block: [0; 32], daa: 1, at: NOW, from: None, to: None, price: None, years: None }
+        Event { op, key, tx_id: [tx; 32], block: [0; 32], daa: 1, at: NOW, from: None, to: None, price: None, years: None, fee: None }
     }
 
     #[test]

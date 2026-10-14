@@ -1038,7 +1038,8 @@ static NAMES_STATS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time
 /// overview: names by status (active / in grace / lapsed) and distinct owners, the market now
 /// (names listed for sale, cheapest listing, open offers and the KAS they hold), and activity
 /// from the history (registrations, renewals, sales, offers made, listings, transfers: all time,
-/// last 24 h, last 7 days, one per transaction) plus fixed-price sales volume. Amounts are sompi
+/// last 24 h, last 7 days, one per transaction), fixed-price sales volume, and the fees .kachat
+/// activity paid miners (all time / 24 h / 7 d; the registry's price is paid as fee). Amounts are sompi
 /// decimal strings. Cached for a minute, like `/stats`. Not under `/names/` so it never hides a
 /// name called "stats".
 pub async fn names_stats(
@@ -1121,6 +1122,25 @@ async fn compute_names_stats(c: &Ctx) -> Result<Value, sqlx::Error> {
         .fetch_one(&c.pool)
         .await?
         .get("v");
+    // What .kachat activity paid miners: each transaction's inputs minus outputs (its network
+    // fee plus the registry's price, which is paid as fee), once per transaction. `pending` are
+    // older transactions whose fee the follower is still filling in. Left out (not an error)
+    // where the follower is too old to record fees.
+    let fees = sqlx::query(
+        "SELECT COALESCE(sum(fee), 0)::BIGINT AS t, COALESCE(sum(fee) FILTER (WHERE at > $1), 0)::BIGINT AS d1, \
+         COALESCE(sum(fee) FILTER (WHERE at > $2), 0)::BIGINT AS d7, count(*) AS n \
+         FROM (SELECT DISTINCT ON (tx_id) tx_id, fee, at FROM names_history WHERE fee >= 0 ORDER BY tx_id) f",
+    )
+    .bind(d1)
+    .bind(d7)
+    .fetch_one(&c.pool)
+    .await
+    .ok()
+    .map(|f| (f.get::<i64, _>("t"), f.get::<i64, _>("d1"), f.get::<i64, _>("d7"), f.get::<i64, _>("n")));
+    let pending: i64 = sqlx::query_scalar("SELECT count(DISTINCT tx_id) FROM names_history WHERE fee IS NULL")
+        .fetch_one(&c.pool)
+        .await
+        .unwrap_or(0);
     Ok(json!({
         "names": {
             "active": r.get::<i64, _>("active"),
@@ -1136,6 +1156,13 @@ async fn compute_names_stats(c: &Ctx) -> Result<Value, sqlx::Error> {
         },
         "activity": activity,
         "salesVolume": vol.to_string(),
+        "fees": fees.map(|(t, d1, d7, n)| json!({
+            "total": t.to_string(),
+            "last24h": d1.to_string(),
+            "last7d": d7.to_string(),
+            "transactions": n,
+            "pending": pending,
+        })),
         "indexedDaa": c.indexed_daa,
         "updatedAt": now,
     }))

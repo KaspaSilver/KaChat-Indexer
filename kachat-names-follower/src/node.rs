@@ -132,6 +132,8 @@ fn map_tx(tx: &RpcOptionalTransaction, block: [u8; 32], daa: u64, time: i64) -> 
                 .and_then(|u| u.script_public_key.as_ref())
                 .map(|s| s.script().to_vec())
                 .unwrap_or_default(),
+            // ... and its amount, for the fee the transaction paid (stats).
+            spent_amount: input.verbose_data.as_ref().and_then(|v| v.utxo_entry.as_ref()).and_then(|u| u.amount),
         });
     }
     let outputs = tx
