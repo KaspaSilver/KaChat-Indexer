@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use indexer_actors::push::ExtensionPushEvent;
 use axum::response::IntoResponse;
-use axum::routing::{delete, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -94,6 +94,7 @@ impl PushApi {
             .route("/update", put(update_registration))
             .route("/unregister", delete(unregister_device))
             .route("/ring", post(ring_call))
+            .route("/stats", get(get_push_stats))
     }
 
     /// Internal-only routes (mounted at /internal/push, NOT publicly proxied). The broadcast +
@@ -1802,6 +1803,20 @@ fn status_code_for_push_error(err: &anyhow::Error) -> StatusCode {
         StatusCode::INTERNAL_SERVER_ERROR
     } else {
         StatusCode::BAD_REQUEST
+    }
+}
+
+/// `GET /push/stats` — aggregate device-registry census (total devices, platform and APNs-
+/// environment breakdown, VoIP/KaPosts/primary coverage). Read-only. Lives on :8600, which carries
+/// the other unauthenticated maintenance routes and is not publicly proxied (kachat-audits KQS-003).
+async fn get_push_stats(State(state): State<PushApi>) -> impl IntoResponse {
+    match state.registry.stats().await {
+        Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("push stats failed: {err}"),
+        )
+            .into_response(),
     }
 }
 

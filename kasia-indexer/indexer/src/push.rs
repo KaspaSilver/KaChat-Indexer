@@ -1209,6 +1209,36 @@ impl PushRegistry {
         Ok(out)
     }
 
+    /// Aggregate census of the whole device store for `GET /push/stats`. One full scan (the store
+    /// is small and this is called on demand, not per-push), same pattern as the VoIP/inbox lookups.
+    fn stats(&self) -> anyhow::Result<PushStats> {
+        let rtx = self.tx_keyspace.read_tx();
+        let mut s = PushStats::default();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let value = entry?;
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            s.total += 1;
+            *s.by_platform.entry(reg.platform.clone()).or_default() += 1;
+            // APNs routing: everything except android goes to APNs, so its environment matters.
+            if reg.platform != "android" {
+                let env = reg.apns_environment.clone().unwrap_or_else(|| "unknown".to_string());
+                *s.apns_by_environment.entry(env).or_default() += 1;
+            }
+            if reg.voip_token.is_some() {
+                s.voip_capable += 1;
+            }
+            if reg.primary_address.is_some() {
+                s.with_primary_address += 1;
+            }
+            if reg.kaposts_pubkey.is_some() {
+                s.kaposts_enabled += 1;
+            }
+        }
+        Ok(s)
+    }
+
     /// No-handshake messaging (KaChat 5.2): every device whose primary (own) address hashes to
     /// `inbox_tag` — the recipient of a `dm` carrying that tag. Iterates all registrations (no
     /// reverse index; dm-discovery pushes are rare relative to chat, mirroring the VoIP lookup).
@@ -1490,6 +1520,9 @@ enum PushRegistryCommand {
         token: String,
         response: RegistryResponse<Option<DeviceRegistration>>,
     },
+    Stats {
+        response: RegistryResponse<PushStats>,
+    },
 }
 
 pub struct PushRegistryActor {
@@ -1699,6 +1732,10 @@ impl PushRegistryActor {
                 }
                 PushRegistryCommand::RegistrationForToken { token, response } => {
                     let result = self.registry.get_registration(&token);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::Stats { response } => {
+                    let result = self.registry.stats();
                     let _ = response.send(result);
                 }
             }
@@ -1990,6 +2027,12 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// Aggregate device-registry census for `GET /push/stats`.
+    pub async fn stats(&self) -> anyhow::Result<PushStats> {
+        self.request(|response| PushRegistryCommand::Stats { response })
+            .await
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
     }
@@ -2082,6 +2125,26 @@ pub struct DeviceRegistration {
     pub app_attest_sign_count: Option<u32>,
     pub created_at: u64,
     pub last_seen: u64,
+}
+
+/// Aggregate registry census returned by `GET /push/stats`. Counts the whole device store so the
+/// panel / an operator can see totals without grepping logs.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PushStats {
+    /// Total device registrations stored.
+    pub total: usize,
+    /// Count per `platform` string (e.g. `ios`, `android`, `macos`).
+    pub by_platform: std::collections::BTreeMap<String, usize>,
+    /// For APNs-bound devices (everything except `android`), count per stored APNs environment:
+    /// `production`, `sandbox`, or `unknown` (not yet learned). A large `sandbox`/`unknown` share
+    /// is the usual cause of iOS "never fires".
+    pub apns_by_environment: std::collections::BTreeMap<String, usize>,
+    /// Devices carrying a VoIP (PushKit) token (can receive call rings).
+    pub voip_capable: usize,
+    /// Devices with a primary address bound.
+    pub with_primary_address: usize,
+    /// Devices that enabled KaPosts notifications (have a kaposts pubkey).
+    pub kaposts_enabled: usize,
 }
 
 pub struct PushDispatcher {
