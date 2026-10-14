@@ -458,6 +458,7 @@ impl WebServer {
             .route("/market/listings", get(crate::names_api::listings))
             .route("/market/activity", get(crate::names_api::market_activity))
             .route("/names/activity", get(crate::names_api::names_activity))
+            .route("/stats/names", get(crate::names_api::names_stats))
             .route("/profiles/stats", get(crate::names_api::profile_stats))
             .route("/profiles/history", get(crate::names_api::profile_history))
             .route("/profiles/:address", get(crate::names_api::profile))

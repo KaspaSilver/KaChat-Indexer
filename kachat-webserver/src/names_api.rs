@@ -1031,6 +1031,116 @@ pub async fn profile_stats(
     Json(v).into_response()
 }
 
+static NAMES_STATS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Value)>>> =
+    std::sync::OnceLock::new();
+
+/// `GET /stats/names` — registry totals for the Kaspa Quick Start panel's .kachat Domains
+/// overview: names by status (active / in grace / lapsed) and distinct owners, the market now
+/// (names listed for sale, cheapest listing, open offers and the KAS they hold), and activity
+/// from the history (registrations, renewals, sales, offers made, listings, transfers: all time,
+/// last 24 h, last 7 days, one per transaction) plus fixed-price sales volume. Amounts are sompi
+/// decimal strings. Cached for a minute, like `/stats`. Not under `/names/` so it never hides a
+/// name called "stats".
+pub async fn names_stats(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    if let Err(e) = limit(&state, addr, 1).await {
+        return e;
+    }
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let cache = NAMES_STATS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Some(v) = cache
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().filter(|(at, _)| at.elapsed() < PROFILE_STATS_TTL).map(|(_, v)| v.clone()))
+    {
+        return Json(v).into_response();
+    }
+    match compute_names_stats(&c).await {
+        Ok(v) => {
+            if let Ok(mut g) = cache.lock() {
+                *g = Some((std::time::Instant::now(), v.clone()));
+            }
+            Json(v).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+/// The history ops each activity figure counts (as `/stats`'s .kachat categories).
+const NAMES_ACTIVITY: [(&str, &[&str]); 6] = [
+    ("registrations", &["register", "import"]),
+    ("renewals", &["renew", "extend"]),
+    ("sales", &["sale", "offer_accepted"]),
+    ("offers", &["offer"]),
+    ("listings", &["list"]),
+    ("transfers", &["transfer"]),
+];
+
+async fn compute_names_stats(c: &Ctx) -> Result<Value, sqlx::Error> {
+    let now = c.now;
+    let r = sqlx::query(
+        "SELECT \
+           count(*) FILTER (WHERE kind = 'name' AND expires_at > $1) AS active, \
+           count(*) FILTER (WHERE kind = 'name' AND expires_at <= $1 AND expires_at + $2 > $1) AS grace, \
+           count(*) FILTER (WHERE kind = 'name' AND expires_at + $2 <= $1) AS lapsed, \
+           count(DISTINCT owner) FILTER (WHERE kind = 'name' AND expires_at + $2 > $1) AS owners, \
+           count(*) FILTER (WHERE kind = 'name' AND price > 0 AND expires_at > $1) AS listed, \
+           min(price) FILTER (WHERE kind = 'name' AND price > 0 AND expires_at > $1) AS floor, \
+           count(*) FILTER (WHERE kind = 'offer') AS offers, \
+           COALESCE(sum(value) FILTER (WHERE kind = 'offer'), 0)::BIGINT AS offer_value \
+         FROM names_utxos WHERE NOT refuted",
+    )
+    .bind(now)
+    .bind(c.grace_ms)
+    .fetch_one(&c.pool)
+    .await?;
+    let d1 = now - 86_400_000;
+    let d7 = now - 7 * 86_400_000;
+    let mut activity = serde_json::Map::new();
+    for (key, ops) in NAMES_ACTIVITY {
+        let list = ops.iter().map(|o| format!("'{o}'")).collect::<Vec<_>>().join(",");
+        let h = sqlx::query(&format!(
+            "SELECT count(DISTINCT tx_id) AS t, count(DISTINCT tx_id) FILTER (WHERE at > $1) AS d1, \
+             count(DISTINCT tx_id) FILTER (WHERE at > $2) AS d7 FROM names_history WHERE op IN ({list})"
+        ))
+        .bind(d1)
+        .bind(d7)
+        .fetch_one(&c.pool)
+        .await?;
+        activity.insert(
+            key.to_string(),
+            json!({ "total": h.get::<i64, _>("t"), "last24h": h.get::<i64, _>("d1"), "last7d": h.get::<i64, _>("d7") }),
+        );
+    }
+    let vol: i64 = sqlx::query("SELECT COALESCE(sum(price), 0)::BIGINT AS v FROM names_history WHERE op = 'sale'")
+        .fetch_one(&c.pool)
+        .await?
+        .get("v");
+    Ok(json!({
+        "names": {
+            "active": r.get::<i64, _>("active"),
+            "grace": r.get::<i64, _>("grace"),
+            "lapsed": r.get::<i64, _>("lapsed"),
+            "owners": r.get::<i64, _>("owners"),
+        },
+        "market": {
+            "listed": r.get::<i64, _>("listed"),
+            "floorPrice": r.get::<Option<i64>, _>("floor").map(|p| p.to_string()),
+            "openOffers": r.get::<i64, _>("offers"),
+            "openOfferValue": r.get::<i64, _>("offer_value").to_string(),
+        },
+        "activity": activity,
+        "salesVolume": vol.to_string(),
+        "indexedDaa": c.indexed_daa,
+        "updatedAt": now,
+    }))
+}
+
 static PROFILE_STATS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Value)>>> =
     std::sync::OnceLock::new();
 const PROFILE_STATS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
