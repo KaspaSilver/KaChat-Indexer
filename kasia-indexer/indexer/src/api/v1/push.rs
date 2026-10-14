@@ -1807,11 +1807,33 @@ fn status_code_for_push_error(err: &anyhow::Error) -> StatusCode {
 }
 
 /// `GET /push/stats` — aggregate device-registry census (total devices, platform and APNs-
-/// environment breakdown, VoIP/KaPosts/primary coverage). Read-only. Lives on :8600, which carries
-/// the other unauthenticated maintenance routes and is not publicly proxied (kachat-audits KQS-003).
+/// environment breakdown, VoIP/KaPosts/primary coverage). Read-only.
+///
+/// This router is mounted at `/v1/push` on the public chat API, so the route is public unless the
+/// proxy in front refuses it (Kaspa Quick Start does: kachat-audits IDX-025). Counting walks and
+/// decodes every registration on the push-registry actor that every push delivery waits on, so
+/// the answer is kept for a minute and that walk happens at most once a minute however often the
+/// route is called.
 async fn get_push_stats(State(state): State<PushApi>) -> impl IntoResponse {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>> =
+        std::sync::OnceLock::new();
+    const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Some(v) = cache
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().filter(|(at, _)| at.elapsed() < TTL).map(|(_, v)| v.clone()))
+    {
+        return (StatusCode::OK, Json(v)).into_response();
+    }
     match state.registry.stats().await {
-        Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+        Ok(stats) => {
+            let v = serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null);
+            if let Ok(mut g) = cache.lock() {
+                *g = Some((std::time::Instant::now(), v.clone()));
+            }
+            (StatusCode::OK, Json(v)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("push stats failed: {err}"),
