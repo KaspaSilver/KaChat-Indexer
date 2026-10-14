@@ -26,7 +26,7 @@ use crate::api_handlers::ApiHandlers;
 use crate::config::ServerConfig;
 use crate::database_trait::DatabaseInterface;
 use crate::models::{
-    ApiError, BroadcastsResponse, ChessLeaderboardResponse, ChessPlayerRow, ChessTournamentRow,
+    ApiError, BroadcastChannelsResponse, BroadcastsResponse, ChessLeaderboardResponse, ChessPlayerRow, ChessTournamentRow,
     ChessTournamentsResponse, GetThreadResponse, PaginatedEngagementResponse,
     PaginatedNotificationsResponse, PaginatedPostsResponse, PaginatedRepliesResponse,
     PaginatedUsersResponse, PollData, PostDetailsResponse, ServerUserPost, TrendingHashtagsResponse,
@@ -511,6 +511,7 @@ impl WebServer {
                 .route("/get-replies", get(handle_get_replies))
                 .route("/get-post-engagement", get(handle_get_post_engagement))
                 .route("/get-broadcasts", get(handle_get_broadcasts))
+                .route("/broadcast-channels", get(handle_broadcast_channels))
                 .route("/get-mentions", get(handle_get_mentions))
                 .route("/get-users", get(handle_get_users))
                 .route("/get-most-active-users", get(handle_get_most_active_users))
@@ -2217,6 +2218,27 @@ async fn handle_chess_tournaments(
         tournaments,
         generated_at: now_ms(),
     }))
+}
+
+/// GET /broadcast-channels - the public chat rooms this indexer tracks right now (the admin
+/// dashboard's list, else the defaults). Apps use it so a room added here gets the indexer's
+/// 30-day history, retention and push even when the app doesn't ship it as a default room.
+async fn handle_broadcast_channels(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<BroadcastChannelsResponse>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+    match app_state.db.get_tracked_broadcast_channels().await {
+        Ok(channels) => Ok(Json(BroadcastChannelsResponse { channels })),
+        Err(err) => {
+            log_error!("Failed to read the tracked broadcast channels: {}", err);
+            let error = ApiError {
+                error: "Internal server error".to_string(),
+                code: "INTERNAL_ERROR".to_string(),
+            };
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)))
+        }
+    }
 }
 
 async fn handle_get_broadcasts(

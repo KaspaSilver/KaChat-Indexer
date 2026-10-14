@@ -632,6 +632,28 @@ impl PostgresDbManager {
     }
 }
 
+/// The processor's fallback room list when `k_vars['broadcast_channels']` is unset. Kept in sync
+/// with `DEFAULT_BROADCAST_CHANNELS` in kachat-transaction-processor/src/k_protocol.rs (and
+/// kachat-admin, which shows it as suggestions).
+const DEFAULT_BROADCAST_CHANNELS: [&str; 16] = [
+    "kaspa",
+    "kachat-bugs",
+    "kaspa-indonesia",
+    "kaspa-czech",
+    "kaspa-german",
+    "kaspa-espanol",
+    "kaspa-francais",
+    "kaspa-portugues",
+    "kaspa-slovak",
+    "kaspa-chinese",
+    "kaspa-japanese",
+    "kaspa-korean",
+    "kaspa-hebrew",
+    "kaspa-romania",
+    "kaspa-russian",
+    "chess-arena",
+];
+
 #[async_trait]
 #[allow(unused_variables)]
 impl DatabaseInterface for PostgresDbManager {
@@ -3934,6 +3956,38 @@ impl DatabaseInterface for PostgresDbManager {
         self.get_network_from_db()
             .await
             .map_err(|e| DatabaseError::QueryError(e.to_string()))
+    }
+
+    /// The same effective set the processor indexes (`k_protocol::channel_is_tracked`):
+    /// `k_vars['broadcast_channels']` when set (an empty value = none), else the defaults;
+    /// nothing at all while `feature_broadcasts` is off.
+    async fn get_tracked_broadcast_channels(&self) -> DatabaseResult<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT key, value FROM k_vars WHERE key IN ('broadcast_channels', 'feature_broadcasts')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        let mut configured: Option<String> = None;
+        for row in rows {
+            let key: String = row.get("key");
+            let value: String = row.get("value");
+            match key.as_str() {
+                "feature_broadcasts" if value.trim().to_lowercase() == "off" => return Ok(Vec::new()),
+                "broadcast_channels" => configured = Some(value),
+                _ => {}
+            }
+        }
+        let mut channels: Vec<String> = match configured {
+            Some(list) => list
+                .split(['\n', '\r', ',', ' ', '\t'])
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => DEFAULT_BROADCAST_CHANNELS.iter().map(|s| s.to_string()).collect(),
+        };
+        channels.dedup();
+        Ok(channels)
     }
 
     async fn get_users_count(&self) -> DatabaseResult<u64> {

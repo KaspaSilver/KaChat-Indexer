@@ -231,6 +231,9 @@ pub trait DatabaseInterface: Send + Sync {
     // Get network type from k_vars table
     async fn get_network(&self) -> DatabaseResult<String>;
 
+    // The public chat rooms this indexer tracks right now (GET /broadcast-channels)
+    async fn get_tracked_broadcast_channels(&self) -> DatabaseResult<Vec<String>>;
+
     // Get database statistics
     async fn get_stats(&self) -> DatabaseResult<DatabaseStats>;
 

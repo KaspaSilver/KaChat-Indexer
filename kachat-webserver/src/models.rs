@@ -635,6 +635,12 @@ pub struct BroadcastMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct BroadcastChannelsResponse {
+    /// Normalized room names (lowercase) this indexer indexes now; it keeps each 30 days.
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BroadcastsResponse {
     pub messages: Vec<BroadcastMessage>,
     #[serde(rename = "hasMore")]
