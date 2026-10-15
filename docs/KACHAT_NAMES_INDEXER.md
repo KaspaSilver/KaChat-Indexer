@@ -380,6 +380,14 @@ The APNs payload has the same shape as the existing app pushes:
 - `name` is without `.kachat`.
 - The amount unit (KAS or TKAS) is added by the app from the network the phone runs on.
 
+**Only the chatting address gets these (kachat-audits XP-024, owner decision 2026-10-15).** A
+push goes to devices whose registered `primaryAddress` is the record's owner, seller or buyer, and
+a device registers its chatting address. A name claimed, bought or offered from one of the
+wallet's spending addresses ("Buy From") therefore gets no remote push. The apps remind about
+those themselves: each schedules local reminders from the spending-held name's `expiresAt`
+(renewal open, expiry, end of grace). The indexer is not told which addresses belong to one
+wallet, on purpose.
+
 ---
 
 ## Rollout
