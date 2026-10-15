@@ -394,72 +394,47 @@ struct StatsResponse {
     // Per-channel stored-row counts (only channels that currently have rows appear here; the UI
     // merges these against the full tracked-channel list so empty rooms still render as 0).
     bcast_by_channel: Vec<ChannelCount>,
-    /// KaChat transactions in the last 24 hours (`tx_24h`).
-    tx_24h: Tx24h,
+    /// Every KaChat transaction in the last 24 hours (`tx_24h`); null with an older processor.
+    tx_24h: Option<Tx24h>,
 }
 
-/// KaChat transactions in the last 24 hours: KaPosts actions (posts, replies, quotes, reposts,
-/// votes, follows, blocks, profile broadcasts) and public chats from their tables, and private
-/// chat activity (messages, handshakes, payments, group messages and controls) from the chat
-/// indexer's running totals (`chat_tx_since`). `chats` is None while the chat indexer is not
-/// reachable; `chats_since` is when its count starts (later than 24 h ago until the samples cover
-/// a whole day).
+/// Every KaChat transaction in the last 24 hours (kachat-audits IDX-026): each `kchat:1:`
+/// transaction is counted by minute and kind as the ingester inserts it (the processor's trigger
+/// on `transactions`, table `kachat_tx_minutes`), so this is the exact sum, whatever the
+/// transaction is (chats, public chats, KaPosts, payments, .kachat, profiles, chess, ...).
+/// `by_kind` keys are the word after `kchat:1:`. `since` is when counting started, while that is
+/// less than a day ago; None when it covers the whole day.
 #[derive(Serialize)]
 struct Tx24h {
     total: i64,
-    kaposts: i64,
-    public_chats: i64,
-    chats: Option<i64>,
-    chats_since: Option<i64>,
+    by_kind: std::collections::BTreeMap<String, i64>,
+    since: Option<i64>,
 }
 
-/// The chat indexer's totals that each count one KaChat transaction (its /metrics, snake_case).
-const CHAT_TX_COUNTERS: [&str; 5] =
-    ["contextual_messages", "handshakes_by_sender", "payments_by_sender", "group_messages", "group_controls"];
-const CHAT_SAMPLE_EVERY_MS: i64 = 10 * 60_000;
+const TX_MINUTES_KEEP_MS: i64 = 3 * 86_400_000;
 
-/// Private chat transactions in the last 24 hours. The chat indexer only keeps running totals,
-/// so the sum of its counters is sampled every 10 minutes (kachat_chat_tx_samples) and the day's
-/// count is the growth over the samples in the window. A total that drops (the chat indexer was
-/// restarted and counts from zero again) counts its new value as growth. None when it is not
-/// reachable; with the samples, the time the count starts from.
-async fn chat_tx_since(state: &AppState, now: i64) -> Option<(i64, i64)> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().ok()?;
-    let m: serde_json::Value = client.get(&state.chat_metrics_url).send().await.ok()?.json().await.ok()?;
-    let current: i64 = CHAT_TX_COUNTERS.iter().map(|k| m[k].as_i64().unwrap_or(0)).sum();
-    let pool = &state.pool;
-    sqlx::query("CREATE TABLE IF NOT EXISTS kachat_chat_tx_samples (at BIGINT PRIMARY KEY, total BIGINT NOT NULL)")
-        .execute(pool)
-        .await
-        .ok()?;
-    let last: Option<i64> = sqlx::query_scalar("SELECT max(at) FROM kachat_chat_tx_samples").fetch_one(pool).await.ok()?;
-    if last.is_none_or(|t| now - t >= CHAT_SAMPLE_EVERY_MS) {
-        let _ = sqlx::query("INSERT INTO kachat_chat_tx_samples (at, total) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-            .bind(now)
-            .bind(current)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM kachat_chat_tx_samples WHERE at < $1").bind(now - 26 * 3_600_000).execute(pool).await;
-    }
-    let day = now - 86_400_000;
-    // The newest sample at or before the window's start (the baseline), then every one after it.
-    let rows: Vec<(i64, i64)> = sqlx::query_as(
-        "SELECT at, total FROM kachat_chat_tx_samples \
-         WHERE at >= COALESCE((SELECT max(at) FROM kachat_chat_tx_samples WHERE at <= $1), 0) ORDER BY at",
+/// None until the processor has created `kachat_tx_minutes` (an older processor).
+async fn tx_24h(pool: &PgPool, now: i64) -> Option<Tx24h> {
+    let day_minute = (now - 86_400_000) / 60_000;
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT kind, COALESCE(sum(n), 0)::BIGINT FROM kachat_tx_minutes WHERE minute >= $1 GROUP BY kind",
     )
-    .bind(day)
+    .bind(day_minute)
     .fetch_all(pool)
     .await
     .ok()?;
-    let since = rows.first().map(|r| r.0.max(day)).unwrap_or(now);
-    let totals: Vec<i64> = rows.iter().map(|r| r.1).chain(std::iter::once(current)).collect();
-    Some((chat_growth(&totals), since))
-}
-
-/// How much a running total grew across samples, oldest first; a drop (a restart, counting from
-/// zero again) counts the new value as growth.
-fn chat_growth(totals: &[i64]) -> i64 {
-    totals.windows(2).map(|w| if w[1] >= w[0] { w[1] - w[0] } else { w[1] }).sum()
+    let first: Option<i64> = sqlx::query_scalar("SELECT min(minute) FROM kachat_tx_minutes").fetch_one(pool).await.ok()?;
+    // Counts older than a few days are no use to anyone.
+    let _ = sqlx::query("DELETE FROM kachat_tx_minutes WHERE minute < $1")
+        .bind((now - TX_MINUTES_KEEP_MS) / 60_000)
+        .execute(pool)
+        .await;
+    let by_kind: std::collections::BTreeMap<String, i64> = rows.into_iter().collect();
+    Some(Tx24h {
+        total: by_kind.values().sum(),
+        by_kind,
+        since: first.map(|m| m * 60_000).filter(|t| *t > now - 86_400_000),
+    })
 }
 
 /// Recursively sum file sizes under `path` (the chat indexer's fjall store). Metadata-only, so it's
@@ -540,32 +515,7 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
         .await
         .unwrap_or(0);
 
-    let day = now - 86_400_000;
-    let day_row = sqlx::query(
-        r#"
-        SELECT
-            (SELECT COUNT(*) FROM k_contents WHERE block_time >= $1)
-          + (SELECT COUNT(*) FROM k_votes WHERE block_time >= $1)
-          + (SELECT COUNT(*) FROM k_follows WHERE block_time >= $1)
-          + (SELECT COUNT(*) FROM k_blocks WHERE block_time >= $1)
-          + (SELECT COUNT(*) FROM k_broadcasts WHERE block_time >= $1)   AS kaposts,
-            (SELECT COUNT(*) FROM kachat_broadcasts WHERE block_time >= $1) AS public_chats
-        "#,
-    )
-    .bind(day)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(ApiError::db)?;
-    let kaposts_day: i64 = day_row.get("kaposts");
-    let public_day: i64 = day_row.get("public_chats");
-    let chats_day = chat_tx_since(&state, now).await;
-    let tx_24h = Tx24h {
-        total: kaposts_day + public_day + chats_day.map(|c| c.0).unwrap_or(0),
-        kaposts: kaposts_day,
-        public_chats: public_day,
-        chats: chats_day.map(|c| c.0),
-        chats_since: chats_day.map(|c| c.1),
-    };
+    let tx_24h = tx_24h(&state.pool, now).await;
 
     Ok(Json(StatsResponse {
         posts: row.get("posts"),
@@ -1748,18 +1698,5 @@ impl ApiError {
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
-    }
-}
-
-#[cfg(test)]
-mod chat_growth_tests {
-    use super::chat_growth;
-
-    #[test]
-    fn growth_over_the_day_survives_a_restart() {
-        assert_eq!(chat_growth(&[100, 130, 160]), 60);
-        assert_eq!(chat_growth(&[100, 130, 5, 25]), 30 + 5 + 20, "restarted after 130: counts from zero again");
-        assert_eq!(chat_growth(&[42]), 0);
-        assert_eq!(chat_growth(&[]), 0);
     }
 }

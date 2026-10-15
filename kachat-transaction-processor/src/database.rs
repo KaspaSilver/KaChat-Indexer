@@ -542,6 +542,22 @@ impl KDbClient {
     async fn create_notification_system(&self) -> Result<()> {
         info!("Creating notification function and trigger");
 
+        // Every KaChat transaction, counted per minute and per kind (the word after `kchat:1:`:
+        // comm, dm, bcast, name, profile, a KaPosts action, ...) as the ingester inserts it, for
+        // the admin's "KaChat transactions in the last 24 hours" (kachat-audits IDX-026: no more
+        // inferring chats from store sizes). The ingester keeps transactions for an hour only, so
+        // this is the durable record; the admin prunes it to a few days.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kachat_tx_minutes (
+                minute BIGINT NOT NULL,
+                kind TEXT NOT NULL,
+                n BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (minute, kind)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Fire on KaChat payloads only:
         //   - canonical KaChat payloads ('kchat:1:' = hex 6b636861743a313a) — covers both KaChat
         //     posts and KaChat broadcasts, since both start with `kchat:1:`;
@@ -556,6 +572,21 @@ impl KDbClient {
                 IF substr(encode(NEW.payload, 'hex'), 1, 16) = '6b636861743a313a'
                    OR substr(encode(NEW.payload, 'hex'), 1, 34) = '636970685f6d73673a313a62636173743a' THEN
                     PERFORM pg_notify('transaction_channel', encode(NEW.transaction_id, 'hex'));
+                END IF;
+                -- Count every kchat:1: transaction (what KaChat writes), by minute and kind. Never
+                -- allowed to fail the ingester's insert: a counting error only loses that count.
+                IF substr(encode(NEW.payload, 'hex'), 1, 16) = '6b636861743a313a' THEN
+                    BEGIN
+                        INSERT INTO kachat_tx_minutes (minute, kind, n)
+                        VALUES (
+                            COALESCE(NEW.block_time, (extract(epoch from now()) * 1000)::BIGINT) / 60000,
+                            COALESCE(NULLIF(left(split_part(encode(substring(NEW.payload from 9 for 24), 'escape'), ':', 1), 16), ''), 'other'),
+                            1
+                        )
+                        ON CONFLICT (minute, kind) DO UPDATE SET n = kachat_tx_minutes.n + 1;
+                    EXCEPTION WHEN OTHERS THEN
+                        NULL;
+                    END;
                 END IF;
                 RETURN NEW;
             END;
