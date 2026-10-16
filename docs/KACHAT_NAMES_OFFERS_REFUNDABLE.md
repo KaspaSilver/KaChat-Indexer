@@ -76,3 +76,28 @@ then, the CLI reports the 10,000-row `cursor_too_far` as "the registry has outgr
 Not urgent today: mainnet has about 42 names and no offers. But the keeper's protection depends on
 it, and mainnet opened to the public on 2026-10-16. When it's done, a note in `docs/KQS.md`
 section 6 (kachat-domains) can drop the "registered names only" caveat.
+
+## 3. Follow-up (2026-10-16, audit DOM-039): drop offers no real key can ever use
+
+**Status:** `/offers/refundable` and keyset paging are done (kachat-indexer `ee57e58`).
+
+**The problem.** An offer isn't created through the registry covenant. The indexer records any
+transaction with a `kchat:1:offer:<key>:<buyer>:<seller>:<refundAfter>` payload and an output
+paying the matching offer P2SH (`kachat-names/src/ingest.rs`, offer markers). Its buyer and
+seller can be any 32 bytes, so anyone can plant an offer that no real key can ever use:
+- a zero buyer or seller;
+- or one that is not a valid x-only secp256k1 key.
+
+Such an offer can never be withdrawn (that needs the buyer's signature) or accepted (that needs
+the seller's). With `refundAfter = 0` it sorts first in `/offers/refundable` forever.
+
+**Keeper side (done).** The keeper used to stop at the first such row. Since kachat-domains
+DOM-039 it skips and reports it, and keeps going.
+
+**Asked of the indexer.** When ingesting an offer marker, drop it unless both buyer and seller
+are non-zero, valid x-only keys. For example `secp256k1::XOnlyPublicKey::from_slice(&k).is_ok()
+&& k != [0; 32]`, the same rule the CLI's `parse_owner_address` applies. Then:
+- the apps' `/names/<name>/offers` and `/offers/by-buyer` stop listing junk offers;
+- `/offers/refundable` stays clean.
+
+It's harmless to existing offers: every offer an app or the CLI makes has two real keys.
