@@ -2888,6 +2888,32 @@ impl KProtocolProcessor {
         transaction: &Transaction,
         k_tip: crate::tips::KTip,
     ) -> Result<()> {
+        self.process_k_tip_mode(transaction, k_tip, BcastMode::Live).await.map(|_| ())
+    }
+
+    /// Pending-queue retry of a tip whose outputs the node did not return in time
+    /// (kachat-audits IDX-027). `block_hash` is the block that holds it, stored when queued.
+    pub async fn retry_tip(&self, transaction: &Transaction, block_hash: &[u8]) -> Result<BcastOutcome> {
+        let payload = hex::decode(transaction.payload.as_deref().unwrap_or_default())?;
+        let Some(rest) = std::str::from_utf8(&payload).ok().and_then(|p| p.strip_prefix("kchat:1:")) else {
+            return Ok(BcastOutcome::Done);
+        };
+        let parts: Vec<&str> = rest.split(':').collect();
+        let Ok(k_tip) = crate::tips::parse_tip_parts(&parts) else {
+            return Ok(BcastOutcome::Done);
+        };
+        self.process_k_tip_mode(transaction, k_tip, BcastMode::Retry(block_hash)).await
+    }
+
+    /// A tip, live or from the pending queue. Live, a tip whose outputs the node cannot give
+    /// within ~10 s is parked in the pending queue (bcast_pending.rs) instead of being dropped;
+    /// a retry asks once and says `StillUnknown` when the node still has no answer.
+    async fn process_k_tip_mode(
+        &self,
+        transaction: &Transaction,
+        k_tip: crate::tips::KTip,
+        mode: BcastMode<'_>,
+    ) -> Result<BcastOutcome> {
         let transaction_id = &transaction.transaction_id;
 
         // Signature is over "tip:<post_id>:<author_pubkey>:<sealed_hex>".
@@ -2897,7 +2923,7 @@ impl KProtocolProcessor {
             &k_tip.sender_pubkey,
         ) {
             error!("Invalid signature for tip {}, skipping", transaction_id);
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         }
 
         let (Some(tipper_x), Some(author_x)) = (
@@ -2905,11 +2931,11 @@ impl KProtocolProcessor {
             crate::tips::xonly_bytes(&k_tip.author_pubkey),
         ) else {
             info!("Tip {} has a malformed tipper/author key, skipping", transaction_id);
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         };
         if tipper_x == author_x {
             info!("Tip {} tips the tipper's own content, skipping", transaction_id);
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         }
 
         // The tipped content must be indexed and authored by <author_pubkey> (same bytes as
@@ -2929,35 +2955,40 @@ impl KProtocolProcessor {
                 "Tip {} targets {} which is not indexed content by {}, skipping",
                 transaction_id, k_tip.post_id, k_tip.author_pubkey
             );
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         }
 
         // The amount: what the outputs pay the author's address. Output amounts are not in the
         // ingest database, so ask the node for the block that holds this tx.
         let transaction_id_bytes = hex::decode(transaction_id)?;
-        let block_hash: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT block_hash FROM transactions WHERE transaction_id = $1",
-        )
-        .bind(&transaction_id_bytes)
-        .fetch_optional(&self.db_pool)
-        .await?
-        .flatten();
+        let block_hash: Option<Vec<u8>> = match mode {
+            BcastMode::Retry(hash) => Some(hash.to_vec()),
+            BcastMode::Live => sqlx::query_scalar(
+                "SELECT block_hash FROM transactions WHERE transaction_id = $1",
+            )
+            .bind(&transaction_id_bytes)
+            .fetch_optional(&self.db_pool)
+            .await?
+            .flatten(),
+        };
         let Some(block_hash) = block_hash else {
             info!("Tip {} has no block hash, skipping", transaction_id);
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         };
         if !crate::bcast_sender::configured() {
             warn!(
                 "Tip {} dropped: no node wRPC URL to read its outputs (--node-url / KASPA_NODE_WBORSH_URL)",
                 transaction_id
             );
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         }
         let payload = hex::decode(transaction.payload.as_deref().unwrap_or_default())?;
         let mut outputs = None;
         // The block is already known to the node (the ingester got it from there), so one call
-        // normally answers; retry only while the connection is (re)establishing.
-        for attempt in 0..10u32 {
+        // normally answers; live, retry only while the connection is (re)establishing, and the
+        // pending queue retries once per pass.
+        let tries = if matches!(mode, BcastMode::Retry(_)) { 1 } else { 10u32 };
+        for attempt in 0..tries {
             match crate::tips::fetch_tx_outputs(&transaction_id_bytes, &block_hash, &payload).await {
                 Ok(found) => {
                     outputs = Some(found);
@@ -2966,7 +2997,7 @@ impl KProtocolProcessor {
                 Err(e) if attempt == 0 => debug!("Tip {} outputs lookup failed: {e}", transaction_id),
                 Err(_) => {}
             }
-            if attempt + 1 < 10 {
+            if attempt + 1 < tries {
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
             }
         }
@@ -2974,21 +3005,34 @@ impl KProtocolProcessor {
             Some(Some(outputs)) => outputs,
             Some(None) => {
                 info!("Tip {} not found in its block on the node, skipping", transaction_id);
-                return Ok(());
+                return Ok(BcastOutcome::Done);
             }
-            None => {
-                warn!("Tip {} dropped: node did not answer for its outputs", transaction_id);
-                return Ok(());
-            }
+            None => match mode {
+                BcastMode::Retry(_) => return Ok(BcastOutcome::StillUnknown),
+                BcastMode::Live => {
+                    // node restarting or wRPC reconnecting: retried from the pending queue
+                    // instead of dropped for good (IDX-027)
+                    crate::bcast_pending::enqueue(
+                        &self.db_pool,
+                        &transaction_id_bytes,
+                        &payload,
+                        &block_hash,
+                        transaction.block_time.unwrap_or(0),
+                    )
+                    .await?;
+                    info!("Tip {}: outputs not read yet, queued for retry", transaction_id);
+                    return Ok(BcastOutcome::Done);
+                }
+            },
         };
         let amount = crate::tips::amount_paid_to(&outputs, &author_x);
         if amount == 0 {
             info!("Tip {} pays the author nothing, skipping", transaction_id);
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         }
         let Ok(amount_i64) = i64::try_from(amount) else {
             info!("Tip {} amount out of range, skipping", transaction_id);
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         };
 
         let block_time = transaction.block_time.unwrap_or(0);
@@ -3023,14 +3067,20 @@ impl KProtocolProcessor {
         .await?;
         if result.rows_affected() == 0 {
             info!("Tip {} already indexed, skipping", transaction_id);
-            return Ok(());
+            return Ok(BcastOutcome::Done);
         }
         info!(
             "Saved tip {}: {} sompi to {} for {}",
             transaction_id, amount, k_tip.author_pubkey, k_tip.post_id
         );
 
-        // KaPosts push to the author (PUSH_EXTENSIONS.md §3, kind "tip").
+        // KaPosts push to the author (PUSH_EXTENSIONS.md §3, kind "tip") - not for a tip a late
+        // retry saved: by then the payment push has told them, and it is history.
+        let late = matches!(mode, BcastMode::Retry(_))
+            && crate::bcast_pending::now_ms() - block_time > crate::bcast_pending::PUSH_MAX_AGE_MS;
+        if late {
+            return Ok(BcastOutcome::Done);
+        }
         crate::push_notify::notify_kaposts(
             &k_tip.author_pubkey,
             &k_tip.sender_pubkey,
@@ -3040,7 +3090,7 @@ impl KProtocolProcessor {
             Some(k_tip.post_id.clone()),
             transaction_id,
         );
-        Ok(())
+        Ok(BcastOutcome::Done)
     }
 
     /// Process K block action (block/unblock) in database

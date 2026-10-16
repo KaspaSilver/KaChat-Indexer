@@ -46,3 +46,17 @@ A reverse proxy can put these paths on the apps' indexer domain, so the apps nee
 Unchanged. Its webserver still serves the same names routes when it has a manifest, so a stack
 that has not moved still works. Kaspa Quick Start now hands the manifest only to this server and
 routes the names paths to it.
+
+**KaPosts push subtitles need this server's `/identity` (kachat-audits IDX-029).** The full
+indexer's processor puts the actor's `.kachat` name in KaPosts push subtitles ("alice.kachat
+liked your post"). It asks `GET <base>/identity/<address>` (2 s timeout; on any failure, or no
+`label`, it falls back to the short address). The base is `KACHAT_IDENTITY_URL` on the
+processor; unset, it is its own webserver (`http://127.0.0.1:$WEBSERVER_PORT`), which has no
+manifest on a Kaspa Quick Start stack, so the names never show. Kaspa Quick Start should set
+it on `kachat-app` to this server when `.kachat Domains` runs for that network
+(`KACHAT_IDENTITY_URL=http://kachat-names:3080`, and `http://kachat-names-testnet:3080` on
+`kachat-app-testnet`), and to an empty value (lookup off) when it does not.
+
+| Variable (full indexer's processor) | Default | Meaning |
+|---|---|---|
+| `KACHAT_IDENTITY_URL` | own webserver | Base URL of a server with `/identity/{address}` (this one). Empty = no lookup, short addresses only. |

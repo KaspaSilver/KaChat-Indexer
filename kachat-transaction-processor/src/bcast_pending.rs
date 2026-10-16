@@ -12,6 +12,10 @@
 //! On startup the last hour of `kchat:1:bcast:` / `ciph_msg:1:bcast:` transactions that are
 //! neither stored nor pending is swept into the queue, which covers broadcasts that an
 //! earlier build dropped or that arrived while the processor was down.
+//!
+//! KaPosts tips (`kchat:1:tip:`) share the queue (kachat-audits IDX-027): a tip whose outputs
+//! the node did not return in time is parked here the same way and retried with
+//! `retry_tip`; the startup sweep also queues the last hour's tips not in `k_tips`.
 
 use crate::database::{DbPool, Transaction};
 use crate::k_protocol::{BcastOutcome, KProtocolProcessor};
@@ -34,6 +38,7 @@ pub const PUSH_MAX_AGE_MS: i64 = 300_000;
 const BATCH: i64 = 50;
 
 const PREFIXES: [&[u8]; 2] = [b"kchat:1:bcast:", b"ciph_msg:1:bcast:"];
+const TIP_PREFIX: &[u8] = b"kchat:1:tip:";
 
 static FINAL_DROPS: AtomicU64 = AtomicU64::new(0);
 
@@ -107,7 +112,25 @@ async fn sweep(pool: &DbPool) -> Result<u64> {
     .bind(PREFIXES[1])
     .execute(pool)
     .await?;
-    Ok(r.rows_affected())
+    let tips = sqlx::query(
+        "INSERT INTO kachat_bcast_pending \
+             (transaction_id, payload, block_hash, block_time, first_seen, attempts, next_at) \
+         SELECT t.transaction_id, t.payload, t.block_hash, t.block_time, $1, 0, $1 \
+           FROM transactions t \
+          WHERE t.block_time >= $2 \
+            AND t.payload IS NOT NULL AND t.block_hash IS NOT NULL \
+            AND substring(t.payload FROM 1 FOR length($3)) = $3 \
+            AND NOT EXISTS (SELECT 1 FROM k_tips k WHERE k.transaction_id = t.transaction_id) \
+         ON CONFLICT (transaction_id) DO NOTHING",
+    )
+    .bind(now)
+    .bind(now - RETRY_FOR_MS)
+    .bind(TIP_PREFIX)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0); // k_tips may not exist yet on a first start
+    Ok(r.rows_affected() + tips)
 }
 
 /// The retry loop. Runs forever; started once from main.
@@ -118,7 +141,7 @@ pub async fn run(pool: DbPool) {
     }
     match sweep(&pool).await {
         Ok(0) => {}
-        Ok(n) => info!("Broadcast sender retry: queued {n} unstored broadcast(s) from the last hour"),
+        Ok(n) => info!("Pending retry: queued {n} unstored broadcast(s) and tip(s) from the last hour"),
         Err(e) => error!("Broadcast sender retry: startup sweep failed: {e}"),
     }
     // Let the feature-flag / channel-list refresher (main.rs, every 15 s) load once first, so a
@@ -163,7 +186,12 @@ pub async fn run(pool: DbPool) {
                 payload: Some(hex::encode(&payload)),
                 block_time: Some(row.get("block_time")),
             };
-            let outcome = processor.retry_broadcast(&tx, &block_hash).await;
+            let is_tip = payload.starts_with(TIP_PREFIX);
+            let outcome = if is_tip {
+                processor.retry_tip(&tx, &block_hash).await
+            } else {
+                processor.retry_broadcast(&tx, &block_hash).await
+            };
             if let Err(e) = &outcome {
                 debug!("Broadcast {} retry failed: {e}", tx.transaction_id);
             }
@@ -181,10 +209,18 @@ pub async fn run(pool: DbPool) {
             let attempts = attempts + 1;
             let now = now_ms();
             if exhausted(first_seen, attempts, now) {
-                note_final_drop(
-                    &tx.transaction_id,
-                    &format!("input 0's address not resolved after {attempts} lookups over an hour"),
-                );
+                if is_tip {
+                    let n = FINAL_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+                    error!(
+                        "Tip {} dropped for good: outputs not read after {attempts} lookups over an hour ({n} final drop(s) since start)",
+                        tx.transaction_id
+                    );
+                } else {
+                    note_final_drop(
+                        &tx.transaction_id,
+                        &format!("input 0's address not resolved after {attempts} lookups over an hour"),
+                    );
+                }
                 let _ = sqlx::query("DELETE FROM kachat_bcast_pending WHERE transaction_id = $1")
                     .bind(&id)
                     .execute(&pool)
