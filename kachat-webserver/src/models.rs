@@ -81,6 +81,9 @@ pub struct KPostRecord {
     // §5.9: poll data, filled by enrich_polls when this content is a poll; None otherwise.
     #[serde(default)]
     pub poll: Option<PollData>,
+    // §5.11: number of tips, filled by enrich_tips_count (None until enriched = 0).
+    #[serde(default)]
+    pub tips_count: Option<u64>,
     // Optional enriched metadata fields for optimized queries
     pub replies_count: Option<u64>,
     pub up_votes_count: Option<u64>,
@@ -121,6 +124,9 @@ pub struct KReplyRecord {
     pub content_type: Option<String>,
     // §5.7: chain time (ms) of the latest accepted edit, or None if never edited.
     pub edited_at: Option<i64>,
+    // §5.11: number of tips, filled by enrich_tips_count (None until enriched = 0).
+    #[serde(default)]
+    pub tips_count: Option<u64>,
     // Optional enriched metadata fields for optimized queries
     pub replies_count: Option<u64>,
     pub up_votes_count: Option<u64>,
@@ -241,6 +247,9 @@ pub struct ServerPost {
     /// §5.9: present only when content_type is "poll"; carries options, live counts and myVote.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll: Option<PollData>,
+    /// §5.11: how many times this content was tipped (rows in k_tips). Always present, 0 if none.
+    #[serde(rename = "tipsCount", default)]
+    pub tips_count: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -480,6 +489,7 @@ impl ServerPost {
             is_quote,
             quote,
             edited_at: record.edited_at.map(|v| v as u64),
+            tips_count: record.tips_count.unwrap_or(0),
             poll: record.poll.clone(),
         }
     }
@@ -614,6 +624,26 @@ pub struct EngagementActor {
     pub id: i64,
 }
 
+/// §5.11: one tip of a post, for get-post-tippers. `id` is the tip's own txid; `row_id` backs
+/// the compound cursor and is not serialized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tipper {
+    pub id: String,
+    #[serde(rename = "userPublicKey")]
+    pub user_public_key: String,
+    #[serde(rename = "amountSompi")]
+    pub amount_sompi: u64,
+    pub timestamp: u64,
+    #[serde(skip)]
+    pub row_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PaginatedTippersResponse {
+    pub tippers: Vec<Tipper>,
+    pub pagination: PaginationMetadata,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PaginatedEngagementResponse {
     pub engagement: Vec<EngagementActor>,
@@ -734,6 +764,7 @@ impl ServerReply {
             is_quote: false,
             quote: None,
             edited_at: record.edited_at.map(|v| v as u64),
+            tips_count: record.tips_count.unwrap_or(0),
             poll: None,
         }
     }

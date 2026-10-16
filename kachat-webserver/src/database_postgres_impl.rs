@@ -8,7 +8,7 @@ use crate::database_trait::{
 };
 use crate::models::{
     BroadcastMessage, ContentRecord, EngagementActor, KBroadcastRecord, KPostRecord, KReplyRecord,
-    KVoteRecord, NotificationContentRecord, PaginationMetadata, PollData,
+    KVoteRecord, NotificationContentRecord, PaginationMetadata, PollData, Tipper,
 };
 
 pub struct PostgresDbManager {
@@ -347,6 +347,7 @@ impl PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
                 edited_at: None,
+                tips_count: None,
                 poll: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
@@ -369,6 +370,8 @@ impl PostgresDbManager {
 
         // §5.7: fill editedAt for this page (non-fatal).
         let _ = self.enrich_edited_at(&mut posts).await;
+        // §5.11: fill tipsCount (non-fatal).
+        let _ = self.enrich_tips_count(&mut posts).await;
         // §5.9: attach poll data + content_type="poll" for any poll rows on this page.
         let _ = self.enrich_polls(&mut posts, &requester_pubkey_bytes).await;
         let pagination = self.create_compound_pagination_metadata(&posts, limit as u32, has_more);
@@ -477,7 +480,97 @@ impl HasEditedAt for KReplyRecord {
     }
 }
 
+/// §5.11: records whose `tipsCount` is filled from k_tips after fetch.
+trait HasTipsCount {
+    fn tips_tx_id(&self) -> &str;
+    fn set_tips_count(&mut self, value: u64);
+}
+
+impl HasTipsCount for KPostRecord {
+    fn tips_tx_id(&self) -> &str {
+        &self.transaction_id
+    }
+    fn set_tips_count(&mut self, value: u64) {
+        self.tips_count = Some(value);
+    }
+}
+
+impl HasTipsCount for KReplyRecord {
+    fn tips_tx_id(&self) -> &str {
+        &self.transaction_id
+    }
+    fn set_tips_count(&mut self, value: u64) {
+        self.tips_count = Some(value);
+    }
+}
+
+impl HasTipsCount for ContentRecord {
+    fn tips_tx_id(&self) -> &str {
+        match self {
+            ContentRecord::Post(p) => &p.transaction_id,
+            ContentRecord::Reply(r) => &r.transaction_id,
+            ContentRecord::Vote(v) => &v.transaction_id,
+        }
+    }
+    fn set_tips_count(&mut self, value: u64) {
+        match self {
+            ContentRecord::Post(p) => p.tips_count = Some(value),
+            ContentRecord::Reply(r) => r.tips_count = Some(value),
+            ContentRecord::Vote(_) => {}
+        }
+    }
+}
+
+impl HasCompoundCursor for Tipper {
+    fn get_timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    fn get_id(&self) -> i64 {
+        self.row_id
+    }
+}
+
 impl PostgresDbManager {
+    /// §5.11: fill `tipsCount` on a page of records with one batched count over k_tips (one
+    /// indexed GROUP BY per page). Records with no tips keep None, which serializes as 0. Failures
+    /// are swallowed by callers (a cold start before the processor created k_tips leaves 0).
+    async fn enrich_tips_count<T: HasTipsCount>(&self, items: &mut [T]) -> DatabaseResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = items
+            .iter()
+            .filter_map(|it| hex::decode(it.tips_tx_id()).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let rows = sqlx::query(
+            "SELECT encode(post_id, 'hex') as pid, COUNT(*) as cnt \
+             FROM k_tips WHERE post_id = ANY($1::bytea[]) GROUP BY post_id",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let pid: String = row.get("pid");
+            let cnt: i64 = row.get("cnt");
+            map.insert(pid, cnt.max(0) as u64);
+        }
+        for it in items.iter_mut() {
+            if let Some(v) = map.get(&it.tips_tx_id().to_lowercase()) {
+                it.set_tips_count(*v);
+            }
+        }
+        Ok(())
+    }
+
     /// Fill `edited_at` on a page of records with one batched lookup (§5.7). Content is served
     /// edited regardless (the message is overwritten in place at ingest); this only surfaces the
     /// "edited" timestamp/label. Failures are swallowed by callers so a cold-start race (column
@@ -2041,6 +2134,7 @@ impl DatabaseInterface for PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_raw,
                 edited_at: None,
+                tips_count: None,
                 poll: None,
                 content_type: row.try_get("content_type").ok(),
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
@@ -2064,6 +2158,8 @@ impl DatabaseInterface for PostgresDbManager {
         // Build pagination metadata
         // §5.7: fill editedAt for this page (non-fatal).
         let _ = self.enrich_edited_at(&mut items).await;
+        // §5.11: fill tipsCount (non-fatal).
+        let _ = self.enrich_tips_count(&mut items).await;
         // §5.9: attach poll data for any poll rows from followed users.
         let _ = self.enrich_polls(&mut items, &requester_pubkey_bytes).await;
         let pagination = if items.is_empty() {
@@ -2334,6 +2430,7 @@ impl DatabaseInterface for PostgresDbManager {
                         base64_encoded_message: row.get("base64_encoded_message"),
                         mentioned_pubkeys: mentioned_pubkeys_array,
                         edited_at: None,
+                        tips_count: None,
                         poll: None,
                         content_type: None,
                         replies_count: Some(row.get::<i64, _>("replies_count") as u64),
@@ -2373,6 +2470,7 @@ impl DatabaseInterface for PostgresDbManager {
                         base64_encoded_message: row.get("base64_encoded_message"),
                         mentioned_pubkeys: mentioned_pubkeys_array,
                         edited_at: None,
+                        tips_count: None,
                         content_type: None,
                         replies_count: Some(0), // Replies don't have replies
                         quotes_count: None,
@@ -2395,6 +2493,9 @@ impl DatabaseInterface for PostgresDbManager {
 
             content_records.push(content_record);
         }
+
+        // §5.11: fill tipsCount on the mentioning posts/replies (non-fatal).
+        let _ = self.enrich_tips_count(&mut content_records).await;
 
         let pagination =
             self.create_compound_pagination_metadata(&content_records, limit as u32, has_more);
@@ -2524,6 +2625,77 @@ impl DatabaseInterface for PostgresDbManager {
 
         Ok(PaginatedResult {
             items: actors,
+            pagination,
+        })
+    }
+
+    async fn get_post_tippers(
+        &self,
+        post_id: &str,
+        options: QueryOptions,
+    ) -> DatabaseResult<PaginatedResult<Tipper>> {
+        let post_id_bytes = Self::decode_hex_to_bytes(post_id)?;
+        let limit = options.limit.unwrap_or(50) as i64;
+        let offset_limit = limit + 1;
+
+        // Newest first; `before` is the compound cursor "<block_time>_<id>" of the last row seen.
+        let before = options
+            .before
+            .as_deref()
+            .and_then(|c| Self::parse_compound_cursor(c).ok());
+        let rows = match before {
+            Some((ts, id)) => sqlx::query(
+                r#"
+                SELECT id, transaction_id, sender_pubkey, amount, block_time
+                FROM k_tips
+                WHERE post_id = $1
+                  AND (block_time < $2 OR (block_time = $2 AND id < $3))
+                ORDER BY block_time DESC, id DESC
+                LIMIT $4
+                "#,
+            )
+            .bind(&post_id_bytes)
+            .bind(ts as i64)
+            .bind(id)
+            .bind(offset_limit),
+            None => sqlx::query(
+                r#"
+                SELECT id, transaction_id, sender_pubkey, amount, block_time
+                FROM k_tips
+                WHERE post_id = $1
+                ORDER BY block_time DESC, id DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(&post_id_bytes)
+            .bind(offset_limit),
+        }
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch post tippers: {}", e)))?;
+
+        let mut tippers: Vec<Tipper> = rows
+            .iter()
+            .map(|row| {
+                let tx_id: Vec<u8> = row.get("transaction_id");
+                let sender: Vec<u8> = row.get("sender_pubkey");
+                Tipper {
+                    id: Self::encode_bytes_to_hex(&tx_id),
+                    user_public_key: Self::encode_bytes_to_hex(&sender),
+                    amount_sompi: row.get::<i64, _>("amount").max(0) as u64,
+                    timestamp: row.get::<i64, _>("block_time").max(0) as u64,
+                    row_id: row.get::<i64, _>("id"),
+                }
+            })
+            .collect();
+
+        let has_more = tippers.len() > limit as usize;
+        if has_more {
+            tippers.pop();
+        }
+        let pagination = self.create_compound_pagination_metadata(&tippers, limit as u32, has_more);
+        Ok(PaginatedResult {
+            items: tippers,
             pagination,
         })
     }
@@ -2731,6 +2903,7 @@ impl DatabaseInterface for PostgresDbManager {
                     mentioned_pubkeys,
                     content_type: None,
                     edited_at: None,
+                    tips_count: None,
                     poll: None,
                     replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                     quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -2777,6 +2950,7 @@ impl DatabaseInterface for PostgresDbManager {
                     mentioned_pubkeys,
                     content_type: None,
                     edited_at: None,
+                    tips_count: None,
                     replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                     quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
                     up_votes_count: Some(row.get::<i64, _>("up_votes_count") as u64),
@@ -2802,6 +2976,8 @@ impl DatabaseInterface for PostgresDbManager {
         match &mut content_record {
             ContentRecord::Post(r) => {
                 let _ = self.enrich_edited_at(std::slice::from_mut(r)).await;
+                // §5.11: fill tipsCount (non-fatal).
+                let _ = self.enrich_tips_count(std::slice::from_mut(r)).await;
                 // §5.9: a poll fetched by id (get-post / get-thread) carries its poll object.
                 let _ = self
                     .enrich_polls(std::slice::from_mut(r), &requester_pubkey_bytes)
@@ -2809,6 +2985,8 @@ impl DatabaseInterface for PostgresDbManager {
             }
             ContentRecord::Reply(r) => {
                 let _ = self.enrich_edited_at(std::slice::from_mut(r)).await;
+                // §5.11: fill tipsCount (non-fatal).
+                let _ = self.enrich_tips_count(std::slice::from_mut(r)).await;
             }
             ContentRecord::Vote(_) => {}
         }
@@ -3024,6 +3202,7 @@ impl DatabaseInterface for PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
                 edited_at: None,
+                tips_count: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -3040,6 +3219,8 @@ impl DatabaseInterface for PostgresDbManager {
 
         // §5.7: fill editedAt for this page (non-fatal).
         let _ = self.enrich_edited_at(&mut replies).await;
+        // §5.11: fill tipsCount (non-fatal).
+        let _ = self.enrich_tips_count(&mut replies).await;
         let pagination = self.create_compound_pagination_metadata(&replies, limit as u32, has_more);
 
         Ok(PaginatedResult {
@@ -3256,6 +3437,7 @@ impl DatabaseInterface for PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
                 edited_at: None,
+                tips_count: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
                 quotes_count: Some(row.get::<i64, _>("quotes_count") as u64),
@@ -3272,6 +3454,8 @@ impl DatabaseInterface for PostgresDbManager {
 
         // §5.7: fill editedAt for this page (non-fatal).
         let _ = self.enrich_edited_at(&mut replies).await;
+        // §5.11: fill tipsCount (non-fatal).
+        let _ = self.enrich_tips_count(&mut replies).await;
         let pagination = self.create_compound_pagination_metadata(&replies, limit as u32, has_more);
 
         Ok(PaginatedResult {
@@ -3506,6 +3690,7 @@ impl DatabaseInterface for PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_array,
                 edited_at: None,
+                tips_count: None,
                 poll: None,
                 content_type: None,
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
@@ -3528,6 +3713,8 @@ impl DatabaseInterface for PostgresDbManager {
 
         // §5.7: fill editedAt for this page (non-fatal).
         let _ = self.enrich_edited_at(&mut posts).await;
+        // §5.11: fill tipsCount (non-fatal).
+        let _ = self.enrich_tips_count(&mut posts).await;
         // §5.9: attach poll data + content_type="poll" for any poll rows on this page.
         let _ = self.enrich_polls(&mut posts, &requester_pubkey_bytes).await;
         let pagination = self.create_compound_pagination_metadata(&posts, limit as u32, has_more);
@@ -3803,6 +3990,7 @@ impl DatabaseInterface for PostgresDbManager {
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys: Vec::new(),
                     edited_at: None,
+                    tips_count: None,
                     poll: None,
                     content_type: None,
                     up_votes_count: None,
@@ -3840,6 +4028,7 @@ impl DatabaseInterface for PostgresDbManager {
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys: Vec::new(),
                     edited_at: None,
+                    tips_count: None,
                     poll: None,
                     content_type: None,
                     up_votes_count: None,
@@ -3874,6 +4063,7 @@ impl DatabaseInterface for PostgresDbManager {
                     base64_encoded_message: row.get("base64_encoded_message"),
                     mentioned_pubkeys: Vec::new(),
                     edited_at: None,
+                    tips_count: None,
                     content_type: None,
                     replies_count: None,
                     quotes_count: None,
@@ -4228,6 +4418,7 @@ impl DatabaseInterface for PostgresDbManager {
                 base64_encoded_message: row.get("base64_encoded_message"),
                 mentioned_pubkeys: mentioned_pubkeys_raw,
                 edited_at: None,
+                tips_count: None,
                 poll: None,
                 content_type: row.try_get("content_type").ok(),
                 replies_count: Some(row.get::<i64, _>("replies_count") as u64),
@@ -4251,6 +4442,8 @@ impl DatabaseInterface for PostgresDbManager {
         // Build pagination metadata
         // §5.7: fill editedAt for this page (non-fatal).
         let _ = self.enrich_edited_at(&mut items).await;
+        // §5.11: fill tipsCount (non-fatal).
+        let _ = self.enrich_tips_count(&mut items).await;
         let pagination = if items.is_empty() {
             PaginationMetadata {
                 has_more: false,

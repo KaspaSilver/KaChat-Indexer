@@ -29,7 +29,8 @@ use crate::models::{
     ApiError, BroadcastChannelsResponse, BroadcastsResponse, ChessLeaderboardResponse, ChessPlayerRow, ChessTournamentRow,
     ChessTournamentsResponse, GetThreadResponse, PaginatedEngagementResponse,
     PaginatedNotificationsResponse, PaginatedPostsResponse, PaginatedRepliesResponse,
-    PaginatedUsersResponse, PollData, PostDetailsResponse, ServerUserPost, TrendingHashtagsResponse,
+    PaginatedTippersResponse, PaginatedUsersResponse, PollData, PostDetailsResponse, ServerUserPost,
+    TrendingHashtagsResponse,
 };
 
 #[derive(Debug, Clone)]
@@ -176,6 +177,14 @@ struct GetPostEngagementQuery {
     limit: Option<u32>,
     before: Option<String>,
     after: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetPostTippersQuery {
+    #[serde(rename = "postId")]
+    post_id: Option<String>,
+    limit: Option<u32>,
+    before: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -510,6 +519,8 @@ impl WebServer {
                 )
                 .route("/get-replies", get(handle_get_replies))
                 .route("/get-post-engagement", get(handle_get_post_engagement))
+                // §5.11: who tipped a post (newest first, compound cursor).
+                .route("/get-post-tippers", get(handle_get_post_tippers))
                 .route("/get-broadcasts", get(handle_get_broadcasts))
                 .route("/broadcast-channels", get(handle_broadcast_channels))
                 .route("/get-mentions", get(handle_get_mentions))
@@ -2345,6 +2356,68 @@ async fn handle_get_post_engagement(
                 Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)))
             }
         },
+    }
+}
+
+/// §5.11: `GET /get-post-tippers?postId=<txid>&limit=&before=` ->
+/// `{tippers: [{id, userPublicKey, amountSompi, timestamp}], pagination: {hasMore, nextCursor}}`,
+/// newest first. `id` is the tip's txid; `before` is the previous page's `nextCursor`.
+async fn handle_get_post_tippers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<GetPostTippersQuery>,
+) -> Result<Json<PaginatedTippersResponse>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+
+    let bad_request = |error: &str, code: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: error.to_string(),
+                code: code.to_string(),
+            }),
+        )
+    };
+    let Some(post_id) = params.post_id else {
+        return Err(bad_request("Missing required parameter: postId", "MISSING_PARAMETER"));
+    };
+    let post_id = post_id.trim().to_lowercase();
+    if post_id.len() != 64 || !post_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(bad_request(
+            "Invalid post id. Must be 64 hex characters.",
+            "INVALID_POST_ID",
+        ));
+    }
+    // limit defaults to 50 and is capped at 100 (same as get-post-engagement).
+    let limit = params.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(bad_request(
+            "Limit parameter must be between 1 and 100",
+            "INVALID_LIMIT",
+        ));
+    }
+
+    let options = crate::database_trait::QueryOptions {
+        limit: Some(limit as u64),
+        before: params.before.filter(|c| !c.trim().is_empty()),
+        after: None,
+        sort_descending: true,
+    };
+    match app_state.db.get_post_tippers(&post_id, options).await {
+        Ok(result) => Ok(Json(PaginatedTippersResponse {
+            tippers: result.items,
+            pagination: result.pagination,
+        })),
+        Err(err) => {
+            log_error!("Database error while querying tippers for post {}: {}", post_id, err);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "Internal server error".to_string(),
+                    code: "INTERNAL_ERROR".to_string(),
+                }),
+            ))
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::models::{
     BroadcastMessage, ContentRecord, EngagementActor, KBroadcastRecord, KPostRecord, KReplyRecord,
-    NotificationContentRecord, PaginationMetadata,
+    NotificationContentRecord, PaginationMetadata, Tipper,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -197,6 +197,13 @@ pub trait DatabaseInterface: Send + Sync {
         engagement_type: &str,
         options: QueryOptions,
     ) -> DatabaseResult<PaginatedResult<EngagementActor>>;
+
+    // §5.11: who tipped a post (or reply), newest first; `before` is a compound cursor.
+    async fn get_post_tippers(
+        &self,
+        post_id: &str,
+        options: QueryOptions,
+    ) -> DatabaseResult<PaginatedResult<Tipper>>;
 
     // Fork addition: KaChat broadcasts for a tracked channel, newest-first. Returns the page
     // of messages plus whether more older rows exist. `before` filters block_time (ms).
