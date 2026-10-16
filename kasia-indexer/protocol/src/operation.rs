@@ -73,6 +73,16 @@ pub struct SealedPaymentV1<'a> {
     pub sealed_hex: &'a [u8],
 }
 
+/// Whether a stored payment's sealed record came from a KaPosts tip (`kchat:1:tip:`,
+/// KAPOSTS_INDEXER.md 5.11): a tip carries it as lowercase hex text, a `kchat:1:pay:` as raw
+/// encrypted bytes (which are never all lowercase hex digits). A tip's author is notified by the
+/// KaPosts push ("tipped your post"), so no second "Received KAS" push goes out for it.
+pub fn is_tip_sealed(sealed: &[u8]) -> bool {
+    !sealed.is_empty()
+        && sealed.len() % 2 == 0
+        && sealed.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SealedHandshakeV2<'a> {
     pub sealed_hex: &'a [u8],
@@ -193,6 +203,13 @@ mod tests {
                 sealed_hex: b"abc123",
             }))
         );
+    }
+
+    #[test]
+    fn test_is_tip_sealed() {
+        assert!(super::is_tip_sealed(b"0a1b2c"));
+        assert!(!super::is_tip_sealed(&[0x00, 0xff, 0x10, 0x7a]));
+        assert!(!super::is_tip_sealed(b""));
     }
 
     #[test]

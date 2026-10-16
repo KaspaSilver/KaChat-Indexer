@@ -881,7 +881,8 @@ impl BlockProcessor {
             trace!(sender = ?sender, "Inserting payment by sender");
             self.payment_by_sender_partition
                 .insert_wtx(wtx, &by_sender_key);
-            if sender != receiver {
+            // A tip's author already gets the KaPosts "tipped your post" push.
+            if sender != receiver && !protocol::operation::is_tip_sealed(pm.sealed_hex) {
                 self.emit_push(PushEvent {
                     kind: PushEventKind::Payment,
                     watched_address: receiver,
