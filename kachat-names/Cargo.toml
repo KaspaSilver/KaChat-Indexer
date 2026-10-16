@@ -11,6 +11,9 @@ edition.workspace = true
 blake3 = "1"
 blake2b_simd = "1"
 hex = "0.4"
+# Offer markers name a buyer and seller key; one that is not a valid x-only key can never sign
+# (kachat-audits DOM-039). Same version as the rest of the workspace.
+secp256k1 = "0.29"
 # Profile records (kchat:1:profile:<json>, §C / 2026-10-02 format).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

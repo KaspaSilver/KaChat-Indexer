@@ -228,6 +228,34 @@ fn offer_marker_tracks_the_offer() {
 }
 
 #[test]
+fn an_offer_no_real_key_can_use_is_ignored() {
+    // DOM-039: a zero or off-curve buyer can never withdraw (nor accept) the offer; planted with
+    // refundAfter 0 it would sit first in /offers/refundable forever.
+    let t = templates();
+    let key = name_key(b"alice");
+    // All 0xff is above the field prime, so no point has that x.
+    let off_curve = [0xffu8; 32];
+    assert!(secp256k1::XOnlyPublicKey::from_slice(&off_curve).is_err(), "test key must be off the curve");
+    for buyer in [[0u8; 32], off_curve] {
+        let offer = OfferState { key, buyer, seller: None, refund_after: 0 };
+        let payload = format!("kchat:1:offer:{}:{}:{}", hex::encode(key), hex::encode(buyer), offer.refund_after);
+        let tx = Tx {
+            id: [0x56; 32],
+            inputs: vec![],
+            outputs: vec![out(t.offer.spk(&offer.encode()), BOND)],
+            payload: payload.into_bytes(),
+            accepting_block: [0xbb; 32],
+            accepting_daa: 1,
+            block_time: NOW,
+        };
+        let mut reg = Registry::new();
+        let events = reg.apply(&t, &tx);
+        assert!(reg.utxos.is_empty(), "offer with buyer {} must not be tracked", hex::encode(buyer));
+        assert!(!events.iter().any(|e| e.op == "offer"));
+    }
+}
+
+#[test]
 fn release_exit_merges_gaps_and_removes_name() {
     let t = templates();
     let mut reg = Registry::new();

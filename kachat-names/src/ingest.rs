@@ -799,6 +799,13 @@ impl Registry {
         if offer.refund_after < 0 {
             return;
         }
+        // An offer only a real key can use: its buyer withdraws it, its seller accepts it. A zero
+        // or off-curve key can never sign, so such an offer could never be withdrawn or accepted,
+        // and planted with refundAfter 0 it would sit first in /offers/refundable forever
+        // (kachat-audits DOM-039). Every offer the apps and the CLI make has two real keys.
+        if !usable_key(&offer.buyer) || offer.seller.is_some_and(|s| !usable_key(&s)) {
+            return;
+        }
         let spk = templates.offer_spk(&offer);
         for (i, o) in tx.outputs.iter().enumerate() {
             if o.script_public_key == spk && o.covenant.is_none() {
@@ -845,6 +852,12 @@ impl Registry {
             from: None, to: None, price: None, years: None, fee: tx.fee(),
         }
     }
+}
+
+/// A key that can sign: non-zero and a valid x-only secp256k1 key (the CLI's
+/// `parse_owner_address` rule).
+fn usable_key(k: &[u8; 32]) -> bool {
+    *k != [0u8; 32] && secp256k1::XOnlyPublicKey::from_slice(k).is_ok()
 }
 
 fn decode32(s: &str) -> Result<[u8; 32], ()> {
