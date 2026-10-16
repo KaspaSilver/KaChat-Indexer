@@ -1038,7 +1038,7 @@ static NAMES_STATS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time
 /// overview: names by status (active / in grace / lapsed) and distinct owners, the market now
 /// (names listed for sale, cheapest listing, open offers and the KAS they hold), and activity
 /// from the history (registrations, renewals, sales, offers made, listings, transfers: all time,
-/// last 24 h, last 7 days, one per transaction), fixed-price sales volume, and the fees .kachat
+/// last 24 h, last 7 days, one per transaction; `transactions` = every op), fixed-price sales volume, and the fees .kachat
 /// activity paid miners (all time / 24 h / 7 d; the registry's price is paid as fee). Amounts are sompi
 /// decimal strings. Cached for a minute, like `/stats`. Not under `/names/` so it never hides a
 /// name called "stats".
@@ -1118,6 +1118,15 @@ async fn compute_names_stats(c: &Ctx) -> Result<Value, sqlx::Error> {
             json!({ "total": h.get::<i64, _>("t"), "last24h": h.get::<i64, _>("d1"), "last7d": h.get::<i64, _>("d7") }),
         );
     }
+    // Every .kachat transaction, whatever it did, once each (a tx touching two names counts once).
+    let all = sqlx::query(
+        "SELECT count(DISTINCT tx_id) AS t, count(DISTINCT tx_id) FILTER (WHERE at > $1) AS d1, \
+         count(DISTINCT tx_id) FILTER (WHERE at > $2) AS d7 FROM names_history",
+    )
+    .bind(d1)
+    .bind(d7)
+    .fetch_one(&c.pool)
+    .await?;
     let vol: i64 = sqlx::query("SELECT COALESCE(sum(price), 0)::BIGINT AS v FROM names_history WHERE op = 'sale'")
         .fetch_one(&c.pool)
         .await?
@@ -1155,6 +1164,11 @@ async fn compute_names_stats(c: &Ctx) -> Result<Value, sqlx::Error> {
             "openOfferValue": r.get::<i64, _>("offer_value").to_string(),
         },
         "activity": activity,
+        "transactions": {
+            "total": all.get::<i64, _>("t"),
+            "last24h": all.get::<i64, _>("d1"),
+            "last7d": all.get::<i64, _>("d7"),
+        },
         "salesVolume": vol.to_string(),
         "fees": fees.map(|(t, d1, d7, n)| json!({
             "total": t.to_string(),
