@@ -1010,11 +1010,8 @@ impl VirtualProcessor {
                             key,
                             Some(sender),
                         )?;
-                        // A tip's author already gets the KaPosts "tipped your post" push.
-                        let is_tip = payment
-                            .as_ref()
-                            .is_some_and(|data| protocol::operation::is_tip_sealed(data.sealed_hex()));
-                        if sender != key.receiver && !is_tip {
+                        // A tip is pushed like any payment; see block_processor (IDX-028).
+                        if sender != key.receiver {
                             push_events.borrow_mut().push(PushEvent {
                                 kind: PushEventKind::Payment,
                                 watched_address: key.receiver,

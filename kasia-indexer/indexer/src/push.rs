@@ -3078,9 +3078,18 @@ impl PushDispatcher {
             data.insert("enc_payload".to_string(), enc.clone());
         }
 
-        // Chat pushes are already deduped server-side (sent_cache), so no collapse id is needed.
-        // Data-only (fcm_notification=false) so the Android handler runs and decrypts.
-        self.deliver(tokens, &payload, &data, None, false).await;
+        // Chat pushes are already deduped server-side (sent_cache), so no collapse id is needed -
+        // except a KaPosts tip's payment push (its sealed record is hex text, `is_tip_sealed`):
+        // it shares the tip's tx id with the KaPosts "tipped your post" push, so the phone keeps
+        // one notification, and the payment one still shows when the KaPosts one never comes
+        // (IDX-028). Data-only (fcm_notification=false) so the Android handler runs and decrypts.
+        let tip_collapse = (matches!(event.kind, PushEventKind::Payment)
+            && payload
+                .payload
+                .as_deref()
+                .is_some_and(|p| protocol::operation::is_tip_sealed(p.as_bytes())))
+        .then(|| payload.tx_id.clone());
+        self.deliver(tokens, &payload, &data, tip_collapse.as_deref(), false).await;
 
         Ok(())
     }

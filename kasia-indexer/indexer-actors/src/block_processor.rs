@@ -881,8 +881,10 @@ impl BlockProcessor {
             trace!(sender = ?sender, "Inserting payment by sender");
             self.payment_by_sender_partition
                 .insert_wtx(wtx, &by_sender_key);
-            // A tip's author already gets the KaPosts "tipped your post" push.
-            if sender != receiver && !protocol::operation::is_tip_sealed(pm.sealed_hex) {
+            // A tip is pushed like any payment (KAPOSTS_INDEXER.md 5.11): the push service
+            // gives it the tip's tx id as collapse id, so the KaPosts "tipped your post" push
+            // replaces it on the phone, and it still arrives when that one never does (IDX-028).
+            if sender != receiver {
                 self.emit_push(PushEvent {
                     kind: PushEventKind::Payment,
                     watched_address: receiver,
