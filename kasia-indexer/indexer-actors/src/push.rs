@@ -43,6 +43,21 @@ pub enum ExtensionPushEvent {
         /// Action txid — APNs collapse-id.
         tx_id: String,
     },
+    /// A new top-level KaPosts post (or poll) by `author_pubkey` (PUSH_EXTENSIONS.md §3a). Pushed
+    /// to every device whose `kaposts_watch_authors` holds the author (x-only), except devices
+    /// registered as the author. Not filtered by the per-kind KaPosts switches.
+    KaPostsNewPost {
+        /// The post's author (66-hex compressed; matched on the x-only key).
+        author_pubkey: String,
+        /// Author display (short address), as for the other KaPosts pushes.
+        subtitle: String,
+        /// `posted: <snippet>`.
+        body: String,
+        /// The new post's txid (top-level `postId`; also the APNs collapse-id).
+        post_id: String,
+        /// The post's txid (dedup key).
+        tx_id: String,
+    },
     /// VoIP call ring: a caller (`sender`) is ringing every device registered under callee
     /// `to_address`. Rides the extension channel; the dispatcher looks up the callee's VoIP tokens
     /// and sends a `voip` APNs push. No dedup (each ring is intentional).

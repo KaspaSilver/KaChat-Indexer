@@ -103,6 +103,7 @@ impl PushApi {
         Router::new()
             .route("/broadcast", post(internal_broadcast_push))
             .route("/kaposts", post(internal_kaposts_push))
+            .route("/kaposts-new-post", post(internal_kaposts_new_post_push))
             .route("/names", post(internal_names_push))
             .route("/submit-tx", post(internal_submit_tx))
     }
@@ -153,6 +154,11 @@ pub struct PushRegistrationRequest {
     pub kaposts_notify_reposts: Option<bool>,
     #[serde(default)]
     pub kaposts_notify_follows: Option<bool>,
+    // KaPosts new-post bell (PUSH_EXTENSIONS.md §3a): authors' pubkeys (66-hex compressed) whose
+    // new top-level posts this device wants pushed. Absent/empty = none. Out of the auth preimage.
+    #[serde(default)]
+    #[serde(rename = "kaposts_watch_authors")]
+    pub kaposts_watch_authors: Vec<String>,
     // Address Activity: the device's own receive addresses to be notified about incoming KAS.
     // Absent = feature off for this device. Kept out of the auth preimage, like other optional
     // fields added after LegacyV1.
@@ -213,6 +219,11 @@ pub struct PushUpdateRequest {
     pub kaposts_notify_reposts: Option<bool>,
     #[serde(default)]
     pub kaposts_notify_follows: Option<bool>,
+    // KaPosts new-post bell (PUSH_EXTENSIONS.md §3a): authors' pubkeys (66-hex compressed) whose
+    // new top-level posts this device wants pushed. Absent/empty = none. Out of the auth preimage.
+    #[serde(default)]
+    #[serde(rename = "kaposts_watch_authors")]
+    pub kaposts_watch_authors: Vec<String>,
     // Address Activity: the device's own receive addresses to be notified about incoming KAS.
     // Absent = feature off for this device. Kept out of the auth preimage, like other optional
     // fields added after LegacyV1.
@@ -319,6 +330,20 @@ pub struct InternalKaPostsPush {
     pub body: String,
     #[serde(default)]
     pub post_id: Option<String>,
+    pub tx_id: String,
+}
+
+/// A new top-level KaPosts post (or poll), posted by the K-processor (PUSH_EXTENSIONS.md §3a).
+#[derive(Debug, Deserialize)]
+pub struct InternalKaPostsNewPostPush {
+    pub author_pubkey: String,
+    // Author display (short address). Absent = a shortened pubkey.
+    #[serde(default)]
+    pub subtitle: String,
+    pub body: String,
+    pub post_id: String,
+    // The post's own txid (equal to post_id). Absent = post_id.
+    #[serde(default)]
     pub tx_id: String,
 }
 
@@ -603,6 +628,43 @@ async fn internal_kaposts_push(
     (StatusCode::OK, "ok")
 }
 
+async fn internal_kaposts_new_post_push(
+    State(state): State<PushApi>,
+    headers: HeaderMap,
+    Json(payload): Json<InternalKaPostsNewPostPush>,
+) -> impl IntoResponse {
+    if !state.internal_authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let post_id = payload.post_id.trim().to_lowercase();
+    if post_id.is_empty() || payload.author_pubkey.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "author_pubkey and post_id are required");
+    }
+    let subtitle = if payload.subtitle.trim().is_empty() {
+        let pk = payload.author_pubkey.trim();
+        if pk.len() > 12 {
+            format!("{}…{}", &pk[..6], &pk[pk.len() - 4..])
+        } else {
+            pk.to_string()
+        }
+    } else {
+        payload.subtitle
+    };
+    let tx_id = if payload.tx_id.trim().is_empty() {
+        post_id.clone()
+    } else {
+        payload.tx_id
+    };
+    let _ = state.ext_push_tx.try_send(ExtensionPushEvent::KaPostsNewPost {
+        author_pubkey: payload.author_pubkey,
+        subtitle,
+        body: payload.body,
+        post_id,
+        tx_id,
+    });
+    (StatusCode::OK, "ok")
+}
+
 #[derive(Debug, Deserialize, ToSchema, Clone)]
 pub struct PushDeviceAuthRequest {
     pub scheme: String,
@@ -726,7 +788,7 @@ async fn register_device(
     let token_suffix = dt.get(dt.len().saturating_sub(10)..).unwrap_or(dt.as_str());
     let watched_sample: Vec<&String> = payload.watched_addresses.iter().take(4).collect();
     tracing::info!(
-        "[Push] register platform={} token=...{} watched={} watched_sample={:?} groups={} bcast_channels={:?} kaposts_pubkey={} primary={} auth={}",
+        "[Push] register platform={} token=...{} watched={} watched_sample={:?} groups={} bcast_channels={:?} kaposts_pubkey={} kaposts_watch_authors={} primary={} auth={}",
         payload.platform,
         token_suffix,
         payload.watched_addresses.len(),
@@ -734,6 +796,7 @@ async fn register_device(
         payload.watched_group_ids.as_ref().map(|g| g.len()).unwrap_or(0),
         payload.watched_broadcast_channels,
         payload.kaposts_pubkey.is_some(),
+        payload.kaposts_watch_authors.len(),
         payload.primary_address.is_some(),
         payload.auth.is_some(),
     );
@@ -785,6 +848,7 @@ async fn register_device(
             payload.hidden_broadcast_senders,
             payload.kaposts_pubkey,
             kaposts_notify,
+            payload.kaposts_watch_authors,
             payload.watch_only_addresses,
             payload.apns_environment,
             payload.voip_token,
@@ -862,6 +926,7 @@ async fn update_registration(
             payload.hidden_broadcast_senders,
             payload.kaposts_pubkey,
             kaposts_notify,
+            payload.kaposts_watch_authors,
             payload.watch_only_addresses,
             payload.apns_environment,
             payload.voip_token,

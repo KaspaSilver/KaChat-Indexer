@@ -30,6 +30,8 @@ const MAX_ALIASES: usize = 256;
 /// Address Activity: cap on a device's watch-only address set (its own receive addresses). Bounded
 /// so a single registration can't blow up the global gate set or the per-event device scan.
 const MAX_WATCH_ONLY_ADDRESSES: usize = 200;
+/// Cap on `kaposts_watch_authors` (the KaPosts new-post bell list) per device.
+const MAX_KAPOSTS_WATCH_AUTHORS: usize = 500;
 const MAX_ALIAS_LEN_BYTES: usize = 64;
 const MAX_ADDRESS_LEN_BYTES: usize = 128;
 const MAX_PLATFORM_LEN_BYTES: usize = 16;
@@ -110,6 +112,7 @@ impl PushRegistry {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        kaposts_watch_authors: Vec<String>,
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
@@ -139,6 +142,7 @@ impl PushRegistry {
         let normalized_broadcast_channels = normalize_broadcast_channels(watched_broadcast_channels);
         let normalized_hidden_senders = normalize_hidden_broadcast_senders(hidden_broadcast_senders);
         let normalized_kaposts_pubkey = normalize_kaposts_pubkey(kaposts_pubkey);
+        let normalized_kaposts_watch_authors = normalize_kaposts_watch_authors(kaposts_watch_authors);
         let (normalized_watch_only, _) = normalize_watch_only_addresses(watch_only_addresses);
         let requested_apns_environment = normalize_apns_environment(apns_environment);
         let requested_voip_token = normalize_voip_token(voip_token);
@@ -223,6 +227,7 @@ impl PushRegistry {
                     && reg.hidden_broadcast_senders == normalized_hidden_senders
                     && reg.kaposts_pubkey == normalized_kaposts_pubkey
                     && reg.kaposts_notify == kaposts_notify
+                    && reg.kaposts_watch_authors == normalized_kaposts_watch_authors
                     && reg.watch_only_addresses == normalized_watch_only
                     && reg.apns_environment == normalized_apns_environment
                     && reg.voip_token == normalized_voip_token
@@ -268,6 +273,7 @@ impl PushRegistry {
             hidden_broadcast_senders: normalized_hidden_senders,
             kaposts_pubkey: normalized_kaposts_pubkey,
             kaposts_notify,
+            kaposts_watch_authors: normalized_kaposts_watch_authors,
             watch_only_addresses: normalized_watch_only,
             apns_environment: normalized_apns_environment,
             voip_token: normalized_voip_token,
@@ -417,6 +423,7 @@ impl PushRegistry {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        kaposts_watch_authors: Vec<String>,
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
@@ -445,6 +452,7 @@ impl PushRegistry {
         let normalized_broadcast_channels = normalize_broadcast_channels(watched_broadcast_channels);
         let normalized_hidden_senders = normalize_hidden_broadcast_senders(hidden_broadcast_senders);
         let normalized_kaposts_pubkey = normalize_kaposts_pubkey(kaposts_pubkey);
+        let normalized_kaposts_watch_authors = normalize_kaposts_watch_authors(kaposts_watch_authors);
         let (normalized_watch_only, _) = normalize_watch_only_addresses(watch_only_addresses);
         let requested_apns_environment = normalize_apns_environment(apns_environment);
         let requested_voip_token = normalize_voip_token(voip_token);
@@ -529,6 +537,7 @@ impl PushRegistry {
                     && reg.hidden_broadcast_senders == normalized_hidden_senders
                     && reg.kaposts_pubkey == normalized_kaposts_pubkey
                     && reg.kaposts_notify == kaposts_notify
+                    && reg.kaposts_watch_authors == normalized_kaposts_watch_authors
                     && reg.watch_only_addresses == normalized_watch_only
                     && reg.apns_environment == normalized_apns_environment
                     && reg.voip_token == normalized_voip_token
@@ -572,6 +581,7 @@ impl PushRegistry {
             hidden_broadcast_senders: normalized_hidden_senders,
             kaposts_pubkey: normalized_kaposts_pubkey,
             kaposts_notify,
+            kaposts_watch_authors: normalized_kaposts_watch_authors,
             watch_only_addresses: normalized_watch_only,
             apns_environment: normalized_apns_environment,
             voip_token: normalized_voip_token,
@@ -947,6 +957,34 @@ impl PushRegistry {
             };
             let pk = kaposts_xonly(pk);
             if pk == target && pk != actor {
+                tokens.push(reg.device_token);
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// KaChat fork (PUSH_EXTENSIONS.md §3a): devices to push a new top-level post by `author_pubkey`
+    /// to — those whose `kaposts_watch_authors` holds the author, skipping the author's own devices
+    /// (registered with `kaposts_pubkey` = the author). Both compared on the x-only key.
+    pub fn tokens_for_kaposts_watchers(&self, author_pubkey: &str) -> anyhow::Result<Vec<String>> {
+        let author = kaposts_xonly(author_pubkey);
+        if author.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rtx = self.tx_keyspace.read_tx();
+        let mut tokens = Vec::new();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let value = entry?;
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            if reg.kaposts_watch_authors.is_empty() {
+                continue;
+            }
+            if reg.kaposts_pubkey.as_deref().map(kaposts_xonly).as_deref() == Some(author.as_str()) {
+                continue;
+            }
+            if reg.kaposts_watch_authors.iter().any(|a| kaposts_xonly(a) == author) {
                 tokens.push(reg.device_token);
             }
         }
@@ -1416,6 +1454,7 @@ enum PushRegistryCommand {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        kaposts_watch_authors: Vec<String>,
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
@@ -1434,6 +1473,7 @@ enum PushRegistryCommand {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        kaposts_watch_authors: Vec<String>,
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
@@ -1480,6 +1520,11 @@ enum PushRegistryCommand {
     MatchKaPostsTokens {
         target_pubkey: String,
         actor_pubkey: String,
+        response: RegistryResponse<Vec<String>>,
+    },
+    /// Devices watching `author_pubkey` for new top-level posts (§3a), minus the author's own.
+    MatchKaPostsWatcherTokens {
+        author_pubkey: String,
         response: RegistryResponse<Vec<String>>,
     },
     PlatformsForTokens {
@@ -1559,6 +1604,7 @@ impl PushRegistryActor {
                     hidden_broadcast_senders,
                     kaposts_pubkey,
                     kaposts_notify,
+                    kaposts_watch_authors,
                     watch_only_addresses,
                     apns_environment,
                     voip_token,
@@ -1578,6 +1624,7 @@ impl PushRegistryActor {
                         hidden_broadcast_senders,
                         kaposts_pubkey,
                         kaposts_notify,
+                        kaposts_watch_authors,
                         watch_only_addresses,
                         apns_environment,
                         voip_token,
@@ -1597,6 +1644,7 @@ impl PushRegistryActor {
                     hidden_broadcast_senders,
                     kaposts_pubkey,
                     kaposts_notify,
+                    kaposts_watch_authors,
                     watch_only_addresses,
                     apns_environment,
                     voip_token,
@@ -1615,6 +1663,7 @@ impl PushRegistryActor {
                         hidden_broadcast_senders,
                         kaposts_pubkey,
                         kaposts_notify,
+                        kaposts_watch_authors,
                         watch_only_addresses,
                         apns_environment,
                         voip_token,
@@ -1688,6 +1737,13 @@ impl PushRegistryActor {
                     response,
                 } => {
                     let result = self.registry.tokens_for_kaposts(&target_pubkey, &actor_pubkey);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::MatchKaPostsWatcherTokens {
+                    author_pubkey,
+                    response,
+                } => {
+                    let result = self.registry.tokens_for_kaposts_watchers(&author_pubkey);
                     let _ = response.send(result);
                 }
                 PushRegistryCommand::PlatformsForTokens { tokens, response } => {
@@ -1779,6 +1835,7 @@ impl PushRegistryHandle {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        kaposts_watch_authors: Vec<String>,
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
@@ -1797,6 +1854,7 @@ impl PushRegistryHandle {
             hidden_broadcast_senders,
             kaposts_pubkey,
             kaposts_notify,
+            kaposts_watch_authors,
             watch_only_addresses,
             apns_environment,
             voip_token,
@@ -1820,6 +1878,7 @@ impl PushRegistryHandle {
         hidden_broadcast_senders: std::collections::HashMap<String, Vec<String>>,
         kaposts_pubkey: Option<String>,
         kaposts_notify: Option<KaPostsNotify>,
+        kaposts_watch_authors: Vec<String>,
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
@@ -1837,6 +1896,7 @@ impl PushRegistryHandle {
             hidden_broadcast_senders,
             kaposts_pubkey,
             kaposts_notify,
+            kaposts_watch_authors,
             watch_only_addresses,
             apns_environment,
             voip_token,
@@ -1934,6 +1994,18 @@ impl PushRegistryHandle {
         self.request(|response| PushRegistryCommand::MatchKaPostsTokens {
             target_pubkey,
             actor_pubkey,
+            response,
+        })
+        .await
+    }
+
+    /// Devices watching `author_pubkey` for new top-level posts (§3a), minus the author's own.
+    pub async fn matching_tokens_for_kaposts_watchers(
+        &self,
+        author_pubkey: String,
+    ) -> anyhow::Result<Vec<String>> {
+        self.request(|response| PushRegistryCommand::MatchKaPostsWatcherTokens {
+            author_pubkey,
             response,
         })
         .await
@@ -2106,6 +2178,10 @@ pub struct DeviceRegistration {
     // Per-action-type KaPosts push toggles; absent = all enabled.
     #[serde(default)]
     pub kaposts_notify: Option<KaPostsNotify>,
+    // KaPosts authors whose new top-level posts this device asked to hear about (the bell,
+    // PUSH_EXTENSIONS.md §3a). Lowercase hex, unique by x-only key, sorted, capped. Value only.
+    #[serde(default)]
+    pub kaposts_watch_authors: Vec<String>,
     // Address Activity: the device's own/watch-only addresses to be notified on incoming KAS.
     // Normalized canonical bech32; stored on the value only (feeds the in-memory watch-only index).
     #[serde(default)]
@@ -2278,6 +2354,7 @@ impl PushDispatcher {
                 target_pubkey,
                 ..
             } => Some(format!("{tx_id}:kaposts:{}", kaposts_xonly(target_pubkey))),
+            ExtensionPushEvent::KaPostsNewPost { tx_id, .. } => Some(format!("{tx_id}:kaposts-post")),
             ExtensionPushEvent::Ring { .. } => None,
             ExtensionPushEvent::Name { dedup, .. } => Some(format!("name:{dedup}")),
         };
@@ -2402,6 +2479,55 @@ impl PushDispatcher {
                     data.insert("kaposts_kind".to_string(), kaposts_kind);
                 }
                 self.deliver(tokens, &payload, &data, Some(&tx_id), true).await;
+                Ok(())
+            }
+            ExtensionPushEvent::KaPostsNewPost {
+                author_pubkey,
+                subtitle,
+                body,
+                post_id,
+                tx_id,
+            } => {
+                // PUSH_EXTENSIONS.md §3a: every device whose bell list holds the author, except the
+                // author's own devices. Not filtered by the per-kind switches (the bell is the switch).
+                let mut tokens = self
+                    .registry
+                    .matching_tokens_for_kaposts_watchers(author_pubkey)
+                    .await?;
+                tokens.sort_unstable();
+                tokens.dedup();
+                if tokens.is_empty() {
+                    return Ok(());
+                }
+                if tokens.len() > MAX_PUSH_FANOUT {
+                    tokens.truncate(MAX_PUSH_FANOUT);
+                }
+                let payload = ExtensionPayload {
+                    aps: ExtensionAps {
+                        alert: ExtensionAlert {
+                            title: "KaPosts".to_string(),
+                            subtitle: Some(subtitle.clone()),
+                            body: body.clone(),
+                        },
+                        sound: "default",
+                        thread_id: "kaposts".to_string(),
+                        // Same as every KaPosts push (§4): let the extension run.
+                        mutable_content: Some(1),
+                    },
+                    post_id: Some(post_id.clone()),
+                    kaposts_kind: Some("post".to_string()),
+                };
+                let mut data = BTreeMap::new();
+                data.insert("type".to_string(), "kaposts".to_string());
+                data.insert("title".to_string(), "KaPosts".to_string());
+                data.insert("subtitle".to_string(), subtitle);
+                data.insert("body".to_string(), body);
+                data.insert("thread_id".to_string(), "kaposts".to_string());
+                data.insert("tx_id".to_string(), tx_id);
+                data.insert("post_id".to_string(), post_id.clone());
+                data.insert("kaposts_kind".to_string(), "post".to_string());
+                // apns-collapse-id = the post's txid.
+                self.deliver(tokens, &payload, &data, Some(&post_id), true).await;
                 Ok(())
             }
             ExtensionPushEvent::Name {
@@ -3917,6 +4043,29 @@ fn kaposts_xonly(pubkey: &str) -> String {
     if pk.len() == 66 { pk[2..].to_string() } else { pk }
 }
 
+/// The bell list (PUSH_EXTENSIONS.md §3a): keep 66-hex (or 64-hex x-only) keys, lowercased, one
+/// per x-only key, at most MAX_KAPOSTS_WATCH_AUTHORS, sorted so the fast-path comparison is
+/// stable. Anything else is dropped (the list is a preference, never a reason to fail a register).
+fn normalize_kaposts_watch_authors(authors: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for author in authors {
+        let pk = author.trim().to_lowercase();
+        if !(pk.len() == 66 || pk.len() == 64) || !pk.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        if !seen.insert(kaposts_xonly(&pk)) {
+            continue;
+        }
+        out.push(pk);
+        if out.len() >= MAX_KAPOSTS_WATCH_AUTHORS {
+            break;
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 fn normalize_kaposts_pubkey(pubkey: Option<String>) -> Option<String> {
     let pk = pubkey?.trim().to_lowercase();
     if pk.is_empty() {
@@ -4135,6 +4284,7 @@ mod tests {
             hidden_broadcast_senders: Default::default(),
             kaposts_pubkey: None,
             kaposts_notify: None,
+            kaposts_watch_authors: vec![],
             watch_only_addresses: vec![],
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
@@ -4201,6 +4351,7 @@ mod tests {
                 None,
                 None,
                 vec![],
+                vec![],
                 None,
                 None,
                 None,
@@ -4245,6 +4396,7 @@ mod tests {
                 Default::default(),
                 None,
                 None,
+                vec![],
                 vec![],
                 None,
                 None,
@@ -4320,6 +4472,7 @@ mod tests {
                     Default::default(),
                     None,
                     None,
+                    vec![],
                     vec![],
                     None,
                     None,
@@ -4401,5 +4554,119 @@ mod name_push_tests {
                 "amount": "3500000000", "dedup": "ab:sold"
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod kaposts_watch_tests {
+    use super::{
+        MAX_KAPOSTS_WATCH_AUTHORS, PushRegistry, PushRegistryActor, normalize_kaposts_watch_authors,
+    };
+    use indexer_actors::metrics::create_shared_metrics;
+    use indexer_db::push::{
+        DeviceRegistrationPartition, PrimaryAddressPartition, WatchedAddressPartition,
+        WatchedGroupIdPartition,
+    };
+    use kaspa_addresses::{Address, Prefix, Version};
+
+    #[test]
+    fn watch_authors_are_normalized_deduped_by_xonly_and_capped() {
+        let x = "ab".repeat(32);
+        let list = vec![
+            format!("02{}", x.to_uppercase()),
+            format!(" 03{x} "), // same person (x-only), dropped
+            x.clone(),          // x-only form of the same key, dropped
+            "not-a-key".to_string(),
+            String::new(),
+            format!("02{}", "cd".repeat(32)),
+        ];
+        assert_eq!(
+            normalize_kaposts_watch_authors(list),
+            vec![format!("02{x}"), format!("02{}", "cd".repeat(32))]
+        );
+        let many: Vec<String> = (0..MAX_KAPOSTS_WATCH_AUTHORS + 50)
+            .map(|i| format!("02{:064x}", i))
+            .collect();
+        assert_eq!(normalize_kaposts_watch_authors(many).len(), MAX_KAPOSTS_WATCH_AUTHORS);
+    }
+
+    #[tokio::test]
+    async fn new_post_reaches_watchers_but_not_the_authors_own_devices() {
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let registry = PushRegistry::new(
+            tx_keyspace.clone(),
+            DeviceRegistrationPartition::new(&tx_keyspace).expect("device partition"),
+            WatchedAddressPartition::new(&tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(&tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(&tx_keyspace).expect("primary partition"),
+            create_shared_metrics(),
+        );
+        let (actor, handle) = PushRegistryActor::new(registry, 8);
+        let actor_thread = std::thread::spawn(move || actor.process());
+
+        let author_x = "ee".repeat(32);
+        let author = format!("03{author_x}");
+        // watcher: registered `02+x` (address-derived) for the author, who posts as `03+x`.
+        // author_device: the author's own phone, which also has the author on its list.
+        // bystander: watches someone else.
+        let devices = [
+            ("aa".repeat(32), [1u8; 32], None, vec![format!("02{author_x}")]),
+            ("bb".repeat(32), [2u8; 32], Some(author.clone()), vec![author.clone()]),
+            ("cc".repeat(32), [3u8; 32], None, vec![format!("02{}", "dd".repeat(32))]),
+        ];
+        for (token, addr, kaposts_pubkey, watch) in devices.iter().cloned() {
+            let address = Address::new(Prefix::Mainnet, Version::PubKey, &addr).to_string();
+            handle
+                .register(
+                    token,
+                    "ios".to_string(),
+                    vec![address.clone()],
+                    vec![],
+                    vec![],
+                    Some(address),
+                    vec![],
+                    vec![],
+                    Default::default(),
+                    kaposts_pubkey,
+                    None,
+                    watch,
+                    vec![],
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("registration succeeds");
+        }
+
+        assert_eq!(
+            handle
+                .matching_tokens_for_kaposts_watchers(author.clone())
+                .await
+                .expect("watcher match"),
+            vec!["aa".repeat(32)],
+        );
+        // The stored list is normalized on the registration.
+        let stored = handle
+            .registration_for_token("aa".repeat(32))
+            .await
+            .expect("lookup")
+            .expect("registered");
+        assert_eq!(stored.kaposts_watch_authors, vec![format!("02{author_x}")]);
+        // Nobody watches this author.
+        assert!(
+            handle
+                .matching_tokens_for_kaposts_watchers(format!("02{}", "77".repeat(32)))
+                .await
+                .expect("watcher match")
+                .is_empty()
+        );
+
+        drop(handle);
+        actor_thread.join().expect("actor exits cleanly");
     }
 }
