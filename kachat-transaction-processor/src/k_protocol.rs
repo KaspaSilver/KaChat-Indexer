@@ -322,6 +322,9 @@ pub enum KActionType {
     Poll(KPoll),
     /// A vote in a poll (fork addition, §5.9). Payload: pollvote:pubkey:sig:poll_id:option_index
     PollVote(KPollVote),
+    /// A tip: a payment to a post's author that names the post (fork addition, §5.11).
+    /// Payload: tip:pubkey:sig:post_id:author_pubkey:sealed_hex
+    Tip(crate::tips::KTip),
     Unknown(String),
 }
 
@@ -341,6 +344,7 @@ fn action_sender_pubkey(action: &KActionType) -> Option<&str> {
         KActionType::Delete(k) => Some(&k.sender_pubkey),
         KActionType::Poll(k) => Some(&k.sender_pubkey),
         KActionType::PollVote(k) => Some(&k.sender_pubkey),
+        KActionType::Tip(k) => Some(&k.sender_pubkey),
         KActionType::Unknown(_) => None,
     }
 }
@@ -994,6 +998,10 @@ impl KProtocolProcessor {
                     option_index,
                 }))
             }
+            "tip" => {
+                // Expected: tip:pubkey:sig:post_id:author_pubkey:sealed_hex (§5.11)
+                crate::tips::parse_tip_parts(&parts).map(KActionType::Tip)
+            }
             _ => Ok(KActionType::Unknown(action.to_string())),
         }
     }
@@ -1116,6 +1124,9 @@ impl KProtocolProcessor {
                 KActionType::PollVote(k_pollvote) => {
                     self.process_k_pollvote_in_database(transaction, k_pollvote)
                         .await?;
+                }
+                KActionType::Tip(k_tip) => {
+                    self.process_k_tip_in_database(transaction, k_tip).await?;
                 }
                 KActionType::Unknown(action) => {
                     warn!(
@@ -1455,6 +1466,10 @@ impl KProtocolProcessor {
         // Extract hashtags from the message
         let hashtags = extract_hashtags_from_base64(&k_post.base64_encoded_message);
 
+        // Whether this call stored the post (false for a re-delivered tx): only a NEW post
+        // notifies the people who asked to hear about this author (PUSH_EXTENSIONS.md §3a).
+        let inserted;
+
         // Single query to insert post and all mentions/hashtags using CTE
         if k_post.mentioned_pubkeys.is_empty() {
             // No mentions - check if we have hashtags
@@ -1477,6 +1492,7 @@ impl KProtocolProcessor {
                 .execute(&self.db_pool)
                 .await?;
 
+                inserted = result.rows_affected() > 0;
                 if result.rows_affected() == 0 {
                     info!(
                         "Post transaction {} already exists, skipping",
@@ -1511,6 +1527,7 @@ impl KProtocolProcessor {
                 .execute(&self.db_pool)
                 .await?;
 
+                inserted = result.rows_affected() > 0;
                 if result.rows_affected() == 0 {
                     info!(
                         "Post transaction {} already exists, skipping",
@@ -1571,6 +1588,7 @@ impl KProtocolProcessor {
                 .execute(&self.db_pool)
                 .await?;
 
+                inserted = result.rows_affected() > 0;
                 if result.rows_affected() == 0 {
                     info!(
                         "Post transaction {} already exists, skipping",
@@ -1612,6 +1630,7 @@ impl KProtocolProcessor {
                 .execute(&self.db_pool)
                 .await?;
 
+                inserted = result.rows_affected() > 0;
                 if result.rows_affected() == 0 {
                     info!(
                         "Post transaction {} already exists, skipping",
@@ -1634,6 +1653,14 @@ impl KProtocolProcessor {
             &k_post.base64_encoded_message,
             transaction_id,
         );
+        // §3a: a new top-level post notifies the devices watching this author (the bell).
+        if inserted {
+            crate::push_notify::notify_kaposts_new_post(
+                &k_post.sender_pubkey,
+                &k_post.base64_encoded_message,
+                transaction_id,
+            );
+        }
         Ok(())
     }
 
@@ -2764,6 +2791,13 @@ impl KProtocolProcessor {
         }
 
         info!("Saved poll {} with {} options", transaction_id, decoded_options.len());
+        // §3a: a poll is a top-level post too; notify the devices watching this author. (A
+        // duplicate delivery returned above, so this fires once per poll.)
+        crate::push_notify::notify_kaposts_new_post(
+            &k_poll.sender_pubkey,
+            &k_poll.base64_encoded_question,
+            transaction_id,
+        );
         Ok(())
     }
 
@@ -2842,6 +2876,161 @@ impl KProtocolProcessor {
         .await?;
 
         info!("Recorded pollvote {} on poll {}", transaction_id, k_vote.poll_id);
+        Ok(())
+    }
+
+    /// Process a tip (§5.11). Accepted only when the signature verifies, the tipped content is
+    /// indexed with `sender_pubkey = <author_pubkey>`, the tipper is not the author (x-only), and
+    /// the transaction's outputs pay the author's p2pk address more than 0 (read from the node,
+    /// see tips.rs). Stored once per signature in `k_tips`; a new tip pushes the author.
+    pub async fn process_k_tip_in_database(
+        &self,
+        transaction: &Transaction,
+        k_tip: crate::tips::KTip,
+    ) -> Result<()> {
+        let transaction_id = &transaction.transaction_id;
+
+        // Signature is over "tip:<post_id>:<author_pubkey>:<sealed_hex>".
+        if !self.verify_kaspa_signature(
+            &k_tip.signing_string(),
+            &k_tip.sender_signature,
+            &k_tip.sender_pubkey,
+        ) {
+            error!("Invalid signature for tip {}, skipping", transaction_id);
+            return Ok(());
+        }
+
+        let (Some(tipper_x), Some(author_x)) = (
+            crate::tips::xonly_bytes(&k_tip.sender_pubkey),
+            crate::tips::xonly_bytes(&k_tip.author_pubkey),
+        ) else {
+            info!("Tip {} has a malformed tipper/author key, skipping", transaction_id);
+            return Ok(());
+        };
+        if tipper_x == author_x {
+            info!("Tip {} tips the tipper's own content, skipping", transaction_id);
+            return Ok(());
+        }
+
+        // The tipped content must be indexed and authored by <author_pubkey> (same bytes as
+        // k_contents.sender_pubkey, which stores the author's key as the payload carried it).
+        let post_id_bytes = hex::decode(&k_tip.post_id)?;
+        let author_pubkey_bytes = hex::decode(&k_tip.author_pubkey)?;
+        let target_ok = sqlx::query(
+            "SELECT 1 FROM k_contents WHERE transaction_id = $1 AND sender_pubkey = $2 LIMIT 1",
+        )
+        .bind(&post_id_bytes)
+        .bind(&author_pubkey_bytes)
+        .fetch_optional(&self.db_pool)
+        .await?
+        .is_some();
+        if !target_ok {
+            info!(
+                "Tip {} targets {} which is not indexed content by {}, skipping",
+                transaction_id, k_tip.post_id, k_tip.author_pubkey
+            );
+            return Ok(());
+        }
+
+        // The amount: what the outputs pay the author's address. Output amounts are not in the
+        // ingest database, so ask the node for the block that holds this tx.
+        let transaction_id_bytes = hex::decode(transaction_id)?;
+        let block_hash: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT block_hash FROM transactions WHERE transaction_id = $1",
+        )
+        .bind(&transaction_id_bytes)
+        .fetch_optional(&self.db_pool)
+        .await?
+        .flatten();
+        let Some(block_hash) = block_hash else {
+            info!("Tip {} has no block hash, skipping", transaction_id);
+            return Ok(());
+        };
+        if !crate::bcast_sender::configured() {
+            warn!(
+                "Tip {} dropped: no node wRPC URL to read its outputs (--node-url / KASPA_NODE_WBORSH_URL)",
+                transaction_id
+            );
+            return Ok(());
+        }
+        let payload = hex::decode(transaction.payload.as_deref().unwrap_or_default())?;
+        let mut outputs = None;
+        // The block is already known to the node (the ingester got it from there), so one call
+        // normally answers; retry only while the connection is (re)establishing.
+        for attempt in 0..10u32 {
+            match crate::tips::fetch_tx_outputs(&transaction_id_bytes, &block_hash, &payload).await {
+                Ok(found) => {
+                    outputs = Some(found);
+                    break;
+                }
+                Err(e) if attempt == 0 => debug!("Tip {} outputs lookup failed: {e}", transaction_id),
+                Err(_) => {}
+            }
+            if attempt + 1 < 10 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            }
+        }
+        let outputs = match outputs {
+            Some(Some(outputs)) => outputs,
+            Some(None) => {
+                info!("Tip {} not found in its block on the node, skipping", transaction_id);
+                return Ok(());
+            }
+            None => {
+                warn!("Tip {} dropped: node did not answer for its outputs", transaction_id);
+                return Ok(());
+            }
+        };
+        let amount = crate::tips::amount_paid_to(&outputs, &author_x);
+        if amount == 0 {
+            info!("Tip {} pays the author nothing, skipping", transaction_id);
+            return Ok(());
+        }
+        let Ok(amount_i64) = i64::try_from(amount) else {
+            info!("Tip {} amount out of range, skipping", transaction_id);
+            return Ok(());
+        };
+
+        let block_time = transaction.block_time.unwrap_or(0);
+        let sender_pubkey_bytes = hex::decode(&k_tip.sender_pubkey)?;
+        let sender_signature_bytes = hex::decode(&k_tip.sender_signature)?;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO k_tips (
+                transaction_id, block_time, sender_pubkey, sender_signature,
+                post_id, author_pubkey, amount
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(&transaction_id_bytes)
+        .bind(block_time)
+        .bind(&sender_pubkey_bytes)
+        .bind(&sender_signature_bytes)
+        .bind(&post_id_bytes)
+        .bind(&author_pubkey_bytes)
+        .bind(amount_i64)
+        .execute(&self.db_pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            info!("Tip {} already indexed, skipping", transaction_id);
+            return Ok(());
+        }
+        info!(
+            "Saved tip {}: {} sompi to {} for {}",
+            transaction_id, amount, k_tip.author_pubkey, k_tip.post_id
+        );
+
+        // KaPosts push to the author (PUSH_EXTENSIONS.md §3, kind "tip").
+        crate::push_notify::notify_kaposts(
+            &k_tip.author_pubkey,
+            &k_tip.sender_pubkey,
+            "tip",
+            "tip",
+            format!("tipped your post: {} KAS", crate::tips::format_kas(amount)),
+            Some(k_tip.post_id.clone()),
+            transaction_id,
+        );
         Ok(())
     }
 

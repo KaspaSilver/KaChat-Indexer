@@ -67,6 +67,12 @@ pub fn configured() -> bool {
     NODE.get().is_some()
 }
 
+/// The node client, when a URL was given. Shared with the KaPosts tip check (`tips.rs`), which
+/// reads a tip's output amounts from the node the same way.
+pub fn node() -> Option<&'static KaspaRpcClient> {
+    NODE.get()
+}
+
 /// The wRPC connection is up right now.
 pub fn is_connected() -> bool {
     NODE.get().is_some_and(|n| n.is_connected())

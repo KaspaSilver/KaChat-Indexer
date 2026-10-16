@@ -190,6 +190,9 @@ impl KDbClient {
         // Step 1h: idempotently ensure the scheduled-posts table (fork addition, §5.10) exists.
         self.create_scheduled_posts_schema().await?;
 
+        // Step 1i: idempotently ensure the tips table (fork addition, §5.11) exists.
+        self.create_tips_schema().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -391,6 +394,40 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// §5.11 Tips. One row per accepted tip (deduped on the signature): who tipped which content
+    /// of which author, how much (sompi, from the outputs paying the author) and when. `id` backs
+    /// the compound cursor of `get-post-tippers`. Not a k_contents row (its content_type CHECK
+    /// knows no tips). Index names are intentionally NOT `idx_k_%` so the schema verifier's
+    /// K-index count is unaffected.
+    async fn create_tips_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS k_tips (
+                id BIGSERIAL NOT NULL,
+                transaction_id BYTEA PRIMARY KEY,
+                block_time BIGINT NOT NULL,
+                sender_pubkey BYTEA NOT NULL,
+                sender_signature BYTEA UNIQUE NOT NULL,
+                post_id BYTEA NOT NULL,
+                author_pubkey BYTEA NOT NULL,
+                amount BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // tipsCount per post and the newest-first tippers list.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_tips_post_time ON k_tips(post_id, block_time DESC, id DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_tips_sender ON k_tips(sender_pubkey)")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

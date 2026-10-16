@@ -7,6 +7,7 @@ mod k_protocol;
 mod listener;
 mod push_notify;
 mod queue;
+mod tips;
 mod transaction_reindex_service;
 mod worker;
 

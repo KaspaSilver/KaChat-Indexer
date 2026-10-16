@@ -173,6 +173,46 @@ pub fn notify_broadcast(channel: &str, sender_address: &str, body: String, tx_id
     );
 }
 
+/// KaPosts push subtitle for an actor: their address (this network's prefix) shortened, else the
+/// pubkey shortened.
+fn actor_subtitle(actor_pubkey: &str) -> String {
+    address_from_pubkey_hex(actor_pubkey)
+        .map(|a| shorten_kaspa(&a))
+        .unwrap_or_else(|| {
+            let pk = actor_pubkey.trim();
+            if pk.len() > 12 {
+                format!("{}…{}", &pk[..6], &pk[pk.len() - 4..])
+            } else {
+                pk.to_string()
+            }
+        })
+}
+
+/// Body of the new-post push (PUSH_EXTENSIONS.md §3a): `posted: <snippet>` (marker-stripped,
+/// ~140 chars, like a reply's), or `posted` when the text cannot be decoded.
+fn new_post_body(base64_message: &str) -> String {
+    match kachat_snippet(base64_message) {
+        Some(snippet) if !snippet.is_empty() => format!("posted: {snippet}"),
+        _ => "posted".to_string(),
+    }
+}
+
+/// Notify the push service of a new TOP-LEVEL post or poll by `author_pubkey` (PUSH_EXTENSIONS.md
+/// §3a). The push service delivers it to every device whose `kaposts_watch_authors` holds the
+/// author (x-only), except the author's own devices. `tx_id` is the post itself (= `postId`).
+pub fn notify_kaposts_new_post(author_pubkey: &str, base64_message: &str, tx_id: &str) {
+    post(
+        "kaposts-new-post",
+        json!({
+            "author_pubkey": author_pubkey.trim().to_lowercase(),
+            "subtitle": actor_subtitle(author_pubkey),
+            "body": new_post_body(base64_message),
+            "post_id": tx_id,
+            "tx_id": tx_id,
+        }),
+    );
+}
+
 /// Notify the push service of a KaPosts action targeting `target_pubkey`'s content.
 /// `actor_pubkey` is the actor (skipped from delivery); `post_id` is the target content txid.
 /// `action` is the coarse machine-readable kind (`like`/`dislike`/`comment`/`repost`/`follow`) so
@@ -188,16 +228,7 @@ pub fn notify_kaposts(
     post_id: Option<String>,
     tx_id: &str,
 ) {
-    let subtitle = address_from_pubkey_hex(actor_pubkey)
-        .map(|a| shorten_kaspa(&a))
-        .unwrap_or_else(|| {
-            let pk = actor_pubkey.trim();
-            if pk.len() > 12 {
-                format!("{}…{}", &pk[..6], &pk[pk.len() - 4..])
-            } else {
-                pk.to_string()
-            }
-        });
+    let subtitle = actor_subtitle(actor_pubkey);
     post(
         "kaposts",
         json!({
@@ -224,6 +255,14 @@ mod tests {
         assert!(address_from_pubkey_hex(pk).unwrap().starts_with("kaspatest:"));
         set_network("mainnet");
         assert!(address_from_pubkey_hex(pk).unwrap().starts_with("kaspa:"));
+    }
+
+    #[test]
+    fn new_post_body_is_posted_plus_snippet() {
+        use base64::{Engine, engine::general_purpose};
+        let b64 = general_purpose::STANDARD.encode("\u{2060}gm kaspa".as_bytes());
+        assert_eq!(new_post_body(&b64), "posted: gm kaspa");
+        assert_eq!(new_post_body("%%%"), "posted");
     }
 
     #[test]
