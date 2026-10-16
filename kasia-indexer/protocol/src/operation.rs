@@ -196,6 +196,41 @@ mod tests {
     }
 
     #[test]
+    fn test_kaposts_tip_is_a_payment_of_its_sealed_part() {
+        let pk = format!("03{}", "a".repeat(64));
+        let author = format!("02{}", "b".repeat(64));
+        let post = "c".repeat(64);
+        let sig = "d".repeat(128);
+        let payload = format!("kchat:1:tip:{pk}:{sig}:{post}:{author}:0a1b2c");
+        assert_eq!(
+            parse_sealed_operation(payload.as_bytes()),
+            Some(SealedOperation::PaymentV1(SealedPaymentV1 {
+                sealed_hex: b"0a1b2c",
+            }))
+        );
+        // Malformed tips are not payments: uppercase/odd/empty sealed part, wrong field count,
+        // a post id that is not a txid, and the legacy root (tips are kchat:1: only).
+        for bad in [
+            format!("kchat:1:tip:{pk}:{sig}:{post}:{author}:0A1B"),
+            format!("kchat:1:tip:{pk}:{sig}:{post}:{author}:abc"),
+            format!("kchat:1:tip:{pk}:{sig}:{post}:{author}:"),
+            format!("kchat:1:tip:{pk}:{sig}:{post}:{author}"),
+            format!("kchat:1:tip:{pk}:{sig}:{post}:{author}:00:11"),
+            format!("kchat:1:tip:{pk}:{sig}:abcd:{author}:00"),
+            format!("ciph_msg:1:tip:{pk}:{sig}:{post}:{author}:0a1b2c"),
+        ] {
+            assert_eq!(parse_sealed_operation(bad.as_bytes()), None, "{bad}");
+        }
+        // `pay:` is unchanged.
+        assert_eq!(
+            parse_sealed_operation(b"kchat:1:pay:abc123"),
+            Some(SealedOperation::PaymentV1(SealedPaymentV1 {
+                sealed_hex: b"abc123",
+            }))
+        );
+    }
+
+    #[test]
     fn test_deserialize_sealed_contextual_message() {
         let payload = b"ciph_msg:1:comm:alias123:abc123";
         let result = parse_sealed_operation(payload);

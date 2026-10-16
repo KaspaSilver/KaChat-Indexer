@@ -18,11 +18,14 @@ const FOREIGN_KACHAT_OPS: &[&str] = &[
     "post", "reply", "vote", "upvote", "downvote", "quote", "unquote", "follow", "unfollow",
     "block", "unblock", "edit", "delete", "poll", "pollvote", "broadcast", "bcast", "profile",
     "name", "offer", "prices",
+    // `tip` is parsed above as a payment; a malformed (or legacy-prefixed) one lands here.
+    "tip",
 ];
 
 pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_>> {
     // Dual-read: accept the canonical `kchat:` prefix and the legacy `ciph_msg:` prefix (same
     // payload grammar after the prefix), so old on-chain content still parses.
+    let is_kchat = payload_bytes.starts_with(PROTOCOL_PREFIX.as_bytes());
     let payload_without_protocol = payload_bytes
         .strip_prefix(PROTOCOL_PREFIX.as_bytes())
         .or_else(|| payload_bytes.strip_prefix(LEGACY_PROTOCOL_PREFIX.as_bytes()))?;
@@ -53,6 +56,26 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
                 sealed_hex @ ..,
             ],
         ) => Some(SealedOperation::PaymentV1(SealedPaymentV1 { sealed_hex })),
+        // KaPosts tip (KAPOSTS_INDEXER.md §5.11, kchat:1: only):
+        // `tip:<pubkey>:<signature>:<post_id>:<author_pubkey>:<sealed_hex>`. Also a chat payment to
+        // the receiver: `<sealed_hex>` is the same sealed payment record a `pay:` carries, so it is
+        // indexed and pushed exactly like one (the KaPosts processor separately checks the
+        // signature, the post and the amount for the tip counter). Malformed => not a payment.
+        Some([b't', b'i', b'p', b':', remaining @ ..]) if is_kchat => {
+            let fields: Vec<&[u8]> = remaining.split(|byte| *byte == b':').collect();
+            let [pubkey, signature, post_id, author_pubkey, sealed_hex] = fields.as_slice() else {
+                return None;
+            };
+            if pubkey.is_empty()
+                || signature.is_empty()
+                || !is_fixed_hex(post_id, 32)
+                || !(is_fixed_hex(author_pubkey, 33) || is_fixed_hex(author_pubkey, 32))
+                || !is_nonempty_lowercase_hex(sealed_hex)
+            {
+                return None;
+            }
+            Some(SealedOperation::PaymentV1(SealedPaymentV1 { sealed_hex }))
+        }
         Some(
             [
                 b'h',
@@ -222,6 +245,15 @@ fn is_fixed_hex(value: &[u8], byte_len: usize) -> bool {
 /// (NO_HANDSHAKE_MESSAGING.md §1), and the recipient matches it byte-for-byte, so `AB` ≠ `ab`.
 fn is_lowercase_hex(value: &[u8], byte_len: usize) -> bool {
     value.len() == byte_len * 2
+        && value
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+/// Non-empty, even-length, lowercase hex (a tip's sealed part is specified lowercase).
+fn is_nonempty_lowercase_hex(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value.len().is_multiple_of(2)
         && value
             .iter()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
