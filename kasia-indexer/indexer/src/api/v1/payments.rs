@@ -164,7 +164,7 @@ async fn get_payments_by_sender(
                     receiver: receiver_address,
                     block_time: key.block_time.into(),
                     amount: payment_data.amount(),
-                    message: faster_hex::hex_string(payment_data.sealed_hex()),
+                    message: sealed_message(payment_data.sealed_hex()),
                     accepting_block,
                     accepting_daa_score,
                 })
@@ -284,7 +284,7 @@ async fn get_payments_by_receiver(
                     receiver: receiver_address,
                     block_time: key.block_time.into(),
                     amount: payment_data.amount(),
-                    message: faster_hex::hex_string(payment_data.sealed_hex()),
+                    message: sealed_message(payment_data.sealed_hex()),
                     accepting_block,
                     accepting_daa_score,
                 })
@@ -313,5 +313,31 @@ async fn get_payments_by_receiver(
                 error: format!("Task error: {join_err}"),
             }),
         )),
+    }
+}
+
+/// The payment's sealed record as the hex the apps decrypt. A `kchat:1:pay:` carries it as raw
+/// bytes (hex-encode them); a KaPosts tip (`kchat:1:tip:`, KAPOSTS_INDEXER.md 5.11) already
+/// carries it as lowercase hex text, which is passed through - hex-encoding it again gave the
+/// apps a record they could not decrypt.
+fn sealed_message(sealed: &[u8]) -> String {
+    let already_hex = !sealed.is_empty()
+        && sealed.len() % 2 == 0
+        && sealed.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
+    if already_hex {
+        String::from_utf8_lossy(sealed).into_owned()
+    } else {
+        faster_hex::hex_string(sealed)
+    }
+}
+
+#[cfg(test)]
+mod sealed_message_tests {
+    use super::sealed_message;
+
+    #[test]
+    fn raw_bytes_are_hex_encoded_and_tip_hex_passes_through() {
+        assert_eq!(sealed_message(&[0x00, 0xff, 0x10]), "00ff10");
+        assert_eq!(sealed_message(b"0a1b2c"), "0a1b2c");
     }
 }
