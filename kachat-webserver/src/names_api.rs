@@ -442,7 +442,9 @@ pub async fn expiring(
 /// `GET /names/all?cursor=` — every registered name UTXO, whatever its status (active, grace
 /// and lapsed alike: a lapsed name is on chain until someone reclaims it), ordered by key so
 /// pages are stable. For kachat-domains' `verify --live` completeness proof
-/// (docs/KACHAT_NAMES_ALL.md). Same shape and paging as `/names/expiring`.
+/// (docs/KACHAT_NAMES_ALL.md) and the refund keeper. Keyset-paged on (key, outpoint), so it has
+/// no depth cap (an offset cap of 10,000 rows would break both past ~10,050 names: kachat-audits
+/// DOM-036); `next` is an opaque cursor ("keyHex:txidHex:index").
 pub async fn all(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -455,16 +457,39 @@ pub async fn all(
         Ok(c) => c,
         Err(e) => return e,
     };
-    let (len, off) = match offset_cursor(&q.cursor) {
-        Ok(off) => (page_len(&q), off),
-        Err(e) => return e,
+    let len = page_len(&q);
+    let after = match q.cursor.as_deref().filter(|s| !s.is_empty()) {
+        None => (Vec::new(), Vec::new(), -1),
+        Some(cur) => {
+            let parts: Vec<&str> = cur.split(':').collect();
+            let parsed = (parts.len() == 3)
+                .then(|| Some((hex::decode(parts[0]).ok()?, hex::decode(parts[1]).ok()?, parts[2].parse::<i32>().ok()?)))
+                .flatten();
+            match parsed {
+                Some(p) => p,
+                None => return err(StatusCode::BAD_REQUEST, "invalid_cursor", "use the next value of the previous page"),
+            }
+        }
     };
-    let sql = format!("{NAME_SELECT} ORDER BY u.key ASC LIMIT $1 OFFSET $2");
-    match sqlx::query(&sql).bind(len + 1).bind(off).fetch_all(&c.pool).await {
+    let sql = format!("{NAME_SELECT} AND (u.key, u.txid, u.idx) > ($2, $3, $4) ORDER BY u.key, u.txid, u.idx LIMIT $1");
+    match sqlx::query(&sql).bind(len + 1).bind(&after.0).bind(&after.1).bind(after.2).fetch_all(&c.pool).await {
         Ok(rows) => {
             let more = rows.len() as i64 > len;
-            let names: Vec<Value> = rows.iter().take(len as usize).map(|r| name_json(&c, r)).collect();
-            Json(json!({ "names": names, "next": more.then(|| (off + len).to_string()) })).into_response()
+            let page = &rows[..rows.len().min(len as usize)];
+            let next = if more {
+                page.last().map(|r| {
+                    format!(
+                        "{}:{}:{}",
+                        hex::encode(r.get::<Option<Vec<u8>>, _>("key").unwrap_or_default()),
+                        hex::encode(r.get::<Vec<u8>, _>("txid")),
+                        r.get::<i32, _>("idx")
+                    )
+                })
+            } else {
+                None
+            };
+            let names: Vec<Value> = page.iter().map(|r| name_json(&c, r)).collect();
+            Json(json!({ "names": names, "next": next })).into_response()
         }
         Err(e) => internal(e),
     }
@@ -565,6 +590,90 @@ pub async fn offers_by_buyer(
             let offers: Vec<Value> =
                 rows.iter().map(|r| offer_json(&c, r, r.get::<Option<String>, _>("offer_name"))).collect();
             Json(json!({ "offers": offers })).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+/// `GET /offers/refundable?cursor=&length=` — every open offer whose `refundAfter` has passed
+/// (`refund_after < indexed_daa`: a refund's lock time is only final once the DAA is past it),
+/// whether or not its name is registered now (a released or reclaimed name keeps its offers, and
+/// they are acceptable again if the seller registers it once more: kachat-audits DOM-037). For the
+/// refund keeper: one paged walk instead of `/names/all` plus a call per name (DOM-036). Each
+/// offer carries the name's `key` (hex) so the keeper can rebuild the state without the name, and
+/// `name` when one is known. Keyset-paged by (refundAfter, outpoint); `next` is the cursor.
+pub async fn offers_refundable(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<PageQuery>,
+) -> Response {
+    if let Err(e) = limit(&state, addr, 1).await {
+        return e;
+    }
+    let c = match ctx(&state).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let len = page_len(&q);
+    // Cursor "refundAfter:txidHex:index" = the last row of the previous page.
+    let after = match q.cursor.as_deref().filter(|s| !s.is_empty()) {
+        None => (i64::MIN, Vec::new(), -1),
+        Some(cur) => {
+            let parts: Vec<&str> = cur.split(':').collect();
+            let parsed = (parts.len() == 3)
+                .then(|| Some((parts[0].parse::<i64>().ok()?, hex::decode(parts[1]).ok()?, parts[2].parse::<i32>().ok()?)))
+                .flatten();
+            match parsed {
+                Some(p) => p,
+                None => return err(StatusCode::BAD_REQUEST, "invalid_cursor", "use the next value of the previous page"),
+            }
+        }
+    };
+    let sql = r#"
+        SELECT o.*, COALESCE(
+            (SELECT n.name FROM names_utxos n WHERE n.kind = 'name' AND n.key = o.key LIMIT 1),
+            (SELECT h.name FROM names_history h WHERE h.key = o.key AND h.name IS NOT NULL ORDER BY h.id DESC LIMIT 1)
+        ) AS offer_name
+        FROM names_utxos o
+        WHERE o.kind = 'offer' AND NOT o.refuted AND COALESCE(o.refund_after, 0) < $1
+          AND (COALESCE(o.refund_after, 0), o.txid, o.idx) > ($2, $3, $4)
+        ORDER BY COALESCE(o.refund_after, 0), o.txid, o.idx
+        LIMIT $5"#;
+    match sqlx::query(sql)
+        .bind(c.indexed_daa)
+        .bind(after.0)
+        .bind(&after.1)
+        .bind(after.2)
+        .bind(len + 1)
+        .fetch_all(&c.pool)
+        .await
+    {
+        Ok(rows) => {
+            let more = rows.len() as i64 > len;
+            let page = &rows[..rows.len().min(len as usize)];
+            let next = if more {
+                page.last().map(|r| {
+                    format!(
+                        "{}:{}:{}",
+                        r.get::<Option<i64>, _>("refund_after").unwrap_or(0),
+                        hex::encode(r.get::<Vec<u8>, _>("txid")),
+                        r.get::<i32, _>("idx")
+                    )
+                })
+            } else {
+                None
+            };
+            let offers: Vec<Value> = page
+                .iter()
+                .map(|r| {
+                    let mut v = offer_json(&c, r, r.get::<Option<String>, _>("offer_name"));
+                    if let Some(k) = r.get::<Option<Vec<u8>>, _>("key") {
+                        v.as_object_mut().unwrap().insert("key".into(), json!(hex::encode(k)));
+                    }
+                    v
+                })
+                .collect();
+            Json(json!({ "offers": offers, "indexedDaa": c.indexed_daa, "next": next })).into_response()
         }
         Err(e) => internal(e),
     }

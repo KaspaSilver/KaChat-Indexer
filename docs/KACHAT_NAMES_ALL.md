@@ -14,15 +14,17 @@ section 2.1). It needs one endpoint that lists every name.
 
 `GET /names/all?cursor=` returns **every** registered name UTXO, whatever its status: active, in
 grace and lapsed alike (a lapsed name is still on chain until someone reclaims it). That's
-`NAME_SELECT` with no status filter, **ordered by key** so pages are stable:
+`NAME_SELECT` with no status filter, **keyset-paged by key** so pages are stable and have no
+depth cap (since 2026-10-16; it was offset-paged with a 10,000-row cap, which would have broken the
+proof and the refund keeper past ~10,050 names: kachat-audits DOM-036):
 
 ```rust
-let sql = format!("{NAME_SELECT} ORDER BY u.key ASC LIMIT $1 OFFSET $2");
-// .bind(len + 1).bind(off)
+let sql = format!("{NAME_SELECT} AND (u.key, u.txid, u.idx) > ($2, $3, $4) ORDER BY u.key, u.txid, u.idx LIMIT $1");
 ```
 
-The response has the same shape and paging as `/names/expiring`:
-`{"names": [<name_json>...], "next": <cursor or null>}`.
+The response is `{"names": [<name_json>...], "next": <cursor or null>}`. `next` is opaque
+(`keyHex:txidHex:index` today): send it back as `cursor` unchanged. `length` is 1-200 (default 50).
+The refund keeper's offers come from `GET /offers/refundable` (KACHAT_NAMES_INDEXER.md).
 
 The verifier reads, from each `name_json`:
 - `name` and `key` (it checks `key == blake3(name)`);

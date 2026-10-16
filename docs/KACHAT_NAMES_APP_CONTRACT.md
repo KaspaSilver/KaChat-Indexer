@@ -86,6 +86,7 @@ Used by `/names/{name}` and as each element of `names` and `listings`:
 |---|---|
 | `GET /names/{name}/offers` | `{"offers": [<offer>]}` |
 | `GET /offers/by-buyer/{address}` | `{"offers": [<offer>]}` |
+| `GET /offers/refundable?cursor=&length=` | `{"offers": [<offer> + `key`], "indexedDaa", "next"}`: every open offer past its `refundAfter`, registered name or not (the refund keeper; kachat-audits DOM-037) |
 
 Offer object:
 ```json

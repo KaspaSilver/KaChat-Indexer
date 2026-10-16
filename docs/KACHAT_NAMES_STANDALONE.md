@@ -22,7 +22,7 @@ There's no block ingester, chat indexer, KaPosts processor or admin. The image b
   `/names/grace`, `/names/activity`;
 - `/names/by-owner/:address`, `/names/gap/:key`, `/names/:name`, `/names/:name/offers`,
   `/names/:name/history`;
-- `/offers/by-buyer/:address`, `/market/listings`, `/market/activity`;
+- `/offers/by-buyer/:address`, `/offers/refundable`, `/market/listings`, `/market/activity`;
 - `/profiles/stats`, `/profiles/history`, `/profiles/:address`;
 - `POST /identity/batch`, `/identity/:address`.
 

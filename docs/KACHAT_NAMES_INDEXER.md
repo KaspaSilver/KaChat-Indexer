@@ -333,6 +333,7 @@ If the name is invalid (fails the charset or length rules): `400 {"error": "inva
 | `GET /names/{name}/history?cursor=` | `{"events": [{"txId","op","at","daa","from","to","price","years"}], "next": cursor\|null}`. `op` ∈ `register, transfer, list, delist, sale, renew, release, reclaim, offer_accepted` |
 | `GET /names/{name}/offers` | open offers: `{"offers": [{"outpoint","buyer","amount","refundAfter","createdAt","refundable": bool}]}` |
 | `GET /offers/by-buyer/{address}` | the buyer's open offers, same shape plus `name` |
+| `GET /offers/refundable?cursor=&length=` | every open offer whose `refundAfter` has passed, whether its name is registered now or not (released / reclaimed names keep their offers, DOM-037): the offer shape plus `key` (hex) and `name` when known; keyset-paged by (refundAfter, outpoint), `next` = cursor; for the refund keeper |
 | `GET /market/listings?sort=recent\|price_asc\|price_desc&length=&cursor=` | listed `active` names: `{"listings": [<name object>], "next"}` |
 | `GET /market/activity?cursor=` | recent sales, listings and offers across the registry: `{"events": [...], "next"}` |
 | `GET /names/expiring?cursor=` | `lapsed` names awaiting reclaim, oldest first |

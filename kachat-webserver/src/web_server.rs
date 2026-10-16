@@ -464,6 +464,7 @@ impl WebServer {
             .route("/names/:name/offers", get(crate::names_api::name_offers))
             .route("/names/:name/history", get(crate::names_api::name_history))
             .route("/offers/by-buyer/:address", get(crate::names_api::offers_by_buyer))
+            .route("/offers/refundable", get(crate::names_api::offers_refundable))
             .route("/market/listings", get(crate::names_api::listings))
             .route("/market/activity", get(crate::names_api::market_activity))
             .route("/names/activity", get(crate::names_api::names_activity))
