@@ -468,6 +468,10 @@ impl WebServer {
             .route("/market/activity", get(crate::names_api::market_activity))
             .route("/names/activity", get(crate::names_api::names_activity))
             .route("/stats/names", get(crate::names_api::names_stats))
+            // The same figures under /names/: a proxy that sends /names/* to a names-only server
+            // and /stats/* to the main one (whose module may be off) still reaches them. Not
+            // /names/stats, which is the name "stats".
+            .route("/names/activity/stats", get(crate::names_api::names_stats))
             .route("/profiles/stats", get(crate::names_api::profile_stats))
             .route("/profiles/history", get(crate::names_api::profile_history))
             .route("/profiles/:address", get(crate::names_api::profile))
