@@ -212,6 +212,13 @@ impl FcmClient {
             priority: "high",
             // FCM caps collapse_key length; tx ids are well under it.
             collapse_key: collapse_key.map(|c| c.to_string()),
+            // collapse_key only collapses messages FCM still holds for an offline device. A
+            // notification the OS already shows is replaced only by one with the same tag, so an
+            // OS-displayed push carries its collapse id as tag too - e.g. a KaPosts tip push
+            // replaces the app's own "Received X KAS" banner posted with tag = tx id (IDX-030).
+            notification: (include_notification && collapse_key.is_some()).then(|| AndroidNotification {
+                tag: collapse_key.map(|c| c.to_string()),
+            }),
         };
         // Optional `notification` block. Included for public, display-ready content
         // (broadcast/KaPosts) so the OS shows it even when the app is dead. OMITTED for encrypted
@@ -329,6 +336,36 @@ struct AndroidConfig {
     priority: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     collapse_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notification: Option<AndroidNotification>,
+}
+
+/// `android.notification` (FCM v1): only the tag, which makes a later notification with the
+/// same tag replace this one on the device.
+#[derive(Serialize)]
+struct AndroidNotification {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
+}
+
+#[cfg(test)]
+mod android_tag_tests {
+    use super::*;
+
+    #[test]
+    fn an_os_displayed_push_with_a_collapse_id_carries_it_as_tag() {
+        let with = AndroidConfig {
+            priority: "high",
+            collapse_key: Some("ab12".into()),
+            notification: Some(AndroidNotification { tag: Some("ab12".into()) }),
+        };
+        assert_eq!(
+            serde_json::to_value(&with).unwrap(),
+            serde_json::json!({"priority": "high", "collapse_key": "ab12", "notification": {"tag": "ab12"}})
+        );
+        let without = AndroidConfig { priority: "high", collapse_key: None, notification: None };
+        assert_eq!(serde_json::to_value(&without).unwrap(), serde_json::json!({"priority": "high"}));
+    }
 }
 
 fn load_service_account_json(config: &IndexerConfig) -> anyhow::Result<Option<String>> {
