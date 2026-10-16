@@ -180,6 +180,8 @@ pub struct NotificationContentRecord {
     /// Reply rows only: the mentioned pubkey is NOT the parent post's author, i.e. this is an
     /// @mention inside a comment — surfaced to clients as contentType "mention" instead of "reply".
     pub is_reply_mention: bool,
+    /// Tip rows only (k_mentions content_type 'tip', §5.11): the sompi the tip paid the author.
+    pub tip_amount_sompi: Option<u64>,
 }
 
 // Referenced content data for quotes (only the original content being quoted)
@@ -514,7 +516,10 @@ pub struct NotificationPost {
     pub content_id: Option<String>,      // The ID of the content being voted on
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_id: Option<String>, // The post ID that the vote refers to
-    pub voted_content: Option<String>,   // Content of the post/reply being voted on
+    pub voted_content: Option<String>,   // Content of the post/reply being voted on (or tipped)
+    // Tip-specific (contentType "tip", §5.11): the sompi the tip paid
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip_amount_sompi: Option<u64>,
 }
 
 impl NotificationPost {
@@ -546,6 +551,7 @@ impl NotificationPost {
             content_id: None,
             post_id: None,
             voted_content: None,
+            tip_amount_sompi: None,
         }
     }
 
@@ -568,6 +574,7 @@ impl NotificationPost {
             content_id: None,
             post_id: None,
             voted_content: None,
+            tip_amount_sompi: None,
         }
     }
 
@@ -593,6 +600,7 @@ impl NotificationPost {
             content_id: Some(vote_record.post_id.clone()),
             post_id: None,
             voted_content: Some(voted_content),
+            tip_amount_sompi: None,
         }
     }
 }

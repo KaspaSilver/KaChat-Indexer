@@ -428,6 +428,20 @@ impl KDbClient {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_tips_sender ON k_tips(sender_pubkey)")
             .execute(&self.pool)
             .await?;
+        // Tips indexed before they were notifications get their k_mentions row once (cheap: a
+        // tip is matched by its own tx id, and the NOT EXISTS makes this a no-op afterwards).
+        sqlx::query(
+            r#"
+            INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey)
+            SELECT t.transaction_id, 'tip', t.author_pubkey, t.block_time, t.sender_pubkey
+            FROM k_tips t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM k_mentions km WHERE km.content_id = t.transaction_id AND km.content_type = 'tip'
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

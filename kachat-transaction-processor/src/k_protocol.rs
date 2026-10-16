@@ -2994,13 +2994,22 @@ impl KProtocolProcessor {
         let block_time = transaction.block_time.unwrap_or(0);
         let sender_pubkey_bytes = hex::decode(&k_tip.sender_pubkey)?;
         let sender_signature_bytes = hex::decode(&k_tip.sender_signature)?;
+        // The k_mentions row (content_type 'tip', content_id = the tip tx) lists the tip in the
+        // author's KaPosts notifications (get-notifications); written in the same statement so a
+        // tip and its notification exist together or not at all.
         let result = sqlx::query(
             r#"
-            INSERT INTO k_tips (
-                transaction_id, block_time, sender_pubkey, sender_signature,
-                post_id, author_pubkey, amount
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT DO NOTHING
+            WITH tip_insert AS (
+                INSERT INTO k_tips (
+                    transaction_id, block_time, sender_pubkey, sender_signature,
+                    post_id, author_pubkey, amount
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT DO NOTHING
+                RETURNING transaction_id, block_time, sender_pubkey, author_pubkey
+            )
+            INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey)
+            SELECT ti.transaction_id, 'tip', ti.author_pubkey, ti.block_time, ti.sender_pubkey
+            FROM tip_insert ti
             "#,
         )
         .bind(&transaction_id_bytes)

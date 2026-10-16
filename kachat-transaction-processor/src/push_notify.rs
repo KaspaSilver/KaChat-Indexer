@@ -43,12 +43,25 @@ fn enabled() -> bool {
 }
 
 fn post(path: &'static str, body: serde_json::Value) {
+    post_inner(path, body, None);
+}
+
+/// Like `post`, but the subtitle is the actor's .kachat name when they hold one (looked up in the
+/// spawned task, so indexing never waits), else their short address.
+fn post_with_actor(path: &'static str, body: serde_json::Value, actor_pubkey: &str) {
+    post_inner(path, body, Some(actor_pubkey.trim().to_string()));
+}
+
+fn post_inner(path: &'static str, mut body: serde_json::Value, actor_pubkey: Option<String>) {
     if !enabled() {
         return;
     }
     let url = format!("{}/{}", base_url().trim_end_matches('/'), path);
     let secret = secret();
     tokio::spawn(async move {
+        if let Some(actor) = actor_pubkey {
+            body["subtitle"] = serde_json::Value::String(actor_display(&actor).await);
+        }
         let mut req = CLIENT.post(&url).json(&body);
         if let Some(secret) = secret {
             req = req.header("x-internal-secret", secret);
@@ -188,6 +201,53 @@ fn actor_subtitle(actor_pubkey: &str) -> String {
         })
 }
 
+/// This stack's webserver (same container), whose `/identity/{address}` gives an address's
+/// .kachat label. Override with KACHAT_IDENTITY_URL (the base, without `/identity`); empty = off.
+fn identity_base_url() -> Option<String> {
+    match std::env::var("KACHAT_IDENTITY_URL") {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(v.trim().trim_end_matches('/').to_string()),
+        Err(_) => Some(format!(
+            "http://127.0.0.1:{}",
+            std::env::var("WEBSERVER_PORT")
+                .ok()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "3080".to_string())
+        )),
+    }
+}
+
+/// The `label` of an `/identity/{address}` answer as a display name (`alice.kachat`), if any.
+fn label_display(identity: &serde_json::Value) -> Option<String> {
+    let label = identity.get("label")?.as_str()?.trim();
+    let label = label.strip_suffix(".kachat").unwrap_or(label);
+    (!label.is_empty()).then(|| format!("{label}.kachat"))
+}
+
+/// KaPosts push subtitle for an actor: their .kachat name when they hold one, else
+/// `actor_subtitle`. The lookup is short (2 s) and any failure falls back to the address.
+async fn actor_display(actor_pubkey: &str) -> String {
+    let fallback = actor_subtitle(actor_pubkey);
+    let (Some(base), Some(address)) = (identity_base_url(), address_from_pubkey_hex(actor_pubkey))
+    else {
+        return fallback;
+    };
+    let lookup = async {
+        let resp = CLIENT
+            .get(format!("{base}/identity/{address}"))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        label_display(&resp.json::<serde_json::Value>().await.ok()?)
+    };
+    lookup.await.unwrap_or(fallback)
+}
+
 /// Body of the new-post push (PUSH_EXTENSIONS.md §3a): `posted: <snippet>` (marker-stripped,
 /// ~140 chars, like a reply's), or `posted` when the text cannot be decoded.
 fn new_post_body(base64_message: &str) -> String {
@@ -201,7 +261,7 @@ fn new_post_body(base64_message: &str) -> String {
 /// §3a). The push service delivers it to every device whose `kaposts_watch_authors` holds the
 /// author (x-only), except the author's own devices. `tx_id` is the post itself (= `postId`).
 pub fn notify_kaposts_new_post(author_pubkey: &str, base64_message: &str, tx_id: &str) {
-    post(
+    post_with_actor(
         "kaposts-new-post",
         json!({
             "author_pubkey": author_pubkey.trim().to_lowercase(),
@@ -210,6 +270,7 @@ pub fn notify_kaposts_new_post(author_pubkey: &str, base64_message: &str, tx_id:
             "post_id": tx_id,
             "tx_id": tx_id,
         }),
+        author_pubkey,
     );
 }
 
@@ -229,7 +290,7 @@ pub fn notify_kaposts(
     tx_id: &str,
 ) {
     let subtitle = actor_subtitle(actor_pubkey);
-    post(
+    post_with_actor(
         "kaposts",
         json!({
             "target_pubkey": target_pubkey.trim().to_lowercase(),
@@ -241,6 +302,7 @@ pub fn notify_kaposts(
             "post_id": post_id,
             "tx_id": tx_id,
         }),
+        actor_pubkey,
     );
 }
 
@@ -255,6 +317,15 @@ mod tests {
         assert!(address_from_pubkey_hex(pk).unwrap().starts_with("kaspatest:"));
         set_network("mainnet");
         assert!(address_from_pubkey_hex(pk).unwrap().starts_with("kaspa:"));
+    }
+
+    #[test]
+    fn identity_label_becomes_a_kachat_name() {
+        assert_eq!(label_display(&json!({"label": "alice"})).as_deref(), Some("alice.kachat"));
+        assert_eq!(label_display(&json!({"label": "alice.kachat"})).as_deref(), Some("alice.kachat"));
+        assert_eq!(label_display(&json!({"label": null})), None);
+        assert_eq!(label_display(&json!({"label": "  "})), None);
+        assert_eq!(label_display(&json!({})), None);
     }
 
     #[test]

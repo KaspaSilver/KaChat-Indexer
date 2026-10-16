@@ -3884,6 +3884,7 @@ impl DatabaseInterface for PostgresDbManager {
                         WHEN 'reply' THEN c.id
                         WHEN 'quote' THEN c.id
                         WHEN 'vote' THEN v.id
+                        WHEN 'tip' THEN t.id
                     END as id,
                     fn.content_id as transaction_id,
                     fn.block_time,
@@ -3893,6 +3894,7 @@ impl DatabaseInterface for PostgresDbManager {
                         WHEN 'reply' THEN c.base64_encoded_message
                         WHEN 'quote' THEN c.base64_encoded_message
                         WHEN 'vote' THEN ''
+                        WHEN 'tip' THEN ''
                     END as base64_encoded_message,
                     fn.notification_id,
                     COALESCE(b.base64_encoded_nickname, '') as user_nickname,
@@ -3903,14 +3905,25 @@ impl DatabaseInterface for PostgresDbManager {
                     -- Vote-specific fields
                     CASE WHEN fn.content_type = 'vote' THEN v.vote ELSE NULL END as vote_type,
                     CASE WHEN fn.content_type = 'vote' THEN v.block_time ELSE NULL END as vote_block_time,
-                    CASE WHEN fn.content_type = 'vote' THEN encode(v.post_id, 'hex') ELSE NULL END as content_id,
-                    CASE WHEN fn.content_type = 'vote' THEN COALESCE(vc.base64_encoded_message, '') ELSE NULL END as voted_content,
+                    CASE fn.content_type
+                        WHEN 'vote' THEN encode(v.post_id, 'hex')
+                        WHEN 'tip' THEN encode(t.post_id, 'hex')
+                    END as content_id,
+                    CASE fn.content_type
+                        WHEN 'vote' THEN COALESCE(vc.base64_encoded_message, '')
+                        WHEN 'tip' THEN COALESCE(tc.base64_encoded_message, '')
+                    END as voted_content,
+                    -- Tip-specific: what the tip paid the author, in sompi (§5.11)
+                    CASE WHEN fn.content_type = 'tip' THEN t.amount ELSE NULL END as tip_amount,
                     -- Quote-specific fields: the original content that was quoted
                     encode(fn.referenced_content_id, 'hex') as quoted_content_id,
                     CASE WHEN fn.notification_type = 'quote' THEN original.base64_encoded_message ELSE NULL END as quoted_content_message
                 FROM filtered_notifications fn
                 LEFT JOIN k_contents c ON fn.content_type IN ('post', 'reply', 'quote') AND fn.content_id = c.transaction_id AND c.content_type = fn.content_type
                 LEFT JOIN k_votes v ON fn.content_type = 'vote' AND fn.content_id = v.transaction_id
+                -- Tips: k_mentions.content_id is the tip tx; the tipped content comes from k_tips
+                LEFT JOIN k_tips t ON fn.content_type = 'tip' AND fn.content_id = t.transaction_id
+                LEFT JOIN k_contents tc ON fn.content_type = 'tip' AND t.post_id = tc.transaction_id
                 -- Get user profile for sender
                 LEFT JOIN LATERAL (
                     SELECT base64_encoded_nickname, base64_encoded_profile_image
@@ -4013,6 +4026,7 @@ impl DatabaseInterface for PostgresDbManager {
                     mention_id: notification_id,
                     mention_block_time: block_time as u64,
                     is_reply_mention: false,
+                    tip_amount_sompi: None,
                 });
             } else if content_type == "quote" {
                 // Handle quote notifications - someone quoted my content
@@ -4051,6 +4065,7 @@ impl DatabaseInterface for PostgresDbManager {
                     mention_id: notification_id,
                     mention_block_time: block_time as u64,
                     is_reply_mention: false,
+                    tip_amount_sompi: None,
                 });
             } else if content_type == "reply" {
                 let reply_record = KReplyRecord {
@@ -4084,8 +4099,9 @@ impl DatabaseInterface for PostgresDbManager {
                         .ok()
                         .flatten()
                         .unwrap_or(false),
+                    tip_amount_sompi: None,
                 });
-            } else if content_type == "vote" {
+            } else if content_type == "vote" || content_type == "tip" {
                 let vote_record = KVoteRecord {
                     id: row.get::<i64, _>("id"),
                     transaction_id: Self::encode_bytes_to_hex(&transaction_id),
@@ -4109,6 +4125,16 @@ impl DatabaseInterface for PostgresDbManager {
                     mention_id: notification_id,
                     mention_block_time: block_time as u64,
                     is_reply_mention: false,
+                    // A tip rides the vote shape (who, which post, its content) plus its amount;
+                    // the handler surfaces it as contentType "tip".
+                    tip_amount_sompi: if content_type == "tip" {
+                        row.try_get::<Option<i64>, _>("tip_amount")
+                            .ok()
+                            .flatten()
+                            .map(|a| a.max(0) as u64)
+                    } else {
+                        None
+                    },
                 });
             }
         }

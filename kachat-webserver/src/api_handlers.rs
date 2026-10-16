@@ -1116,14 +1116,21 @@ impl ApiHandlers {
                 }
                 ContentRecord::Vote(vote_record) => {
                     // For votes, we now have enriched vote record with all necessary data
-                    NotificationPost::from_k_vote_record_with_mention_cursor(
+                    let mut post = NotificationPost::from_k_vote_record_with_mention_cursor(
                         &vote_record,
                         notification_record.mention_id,
                         notification_record.mention_block_time,
                         vote_record.voted_content.clone().unwrap_or_default(),
                         vote_record.user_nickname.clone(),
                         vote_record.user_profile_image.clone(),
-                    )
+                    );
+                    // A tip (§5.11): same shape, contentId = the tipped content, plus the amount.
+                    if let Some(amount) = notification_record.tip_amount_sompi {
+                        post.content_type = "tip".to_string();
+                        post.vote_type = None;
+                        post.tip_amount_sompi = Some(amount);
+                    }
+                    post
                 }
             })
             .collect();
