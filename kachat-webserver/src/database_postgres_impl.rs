@@ -97,6 +97,27 @@ impl PostgresDbManager {
         }
     }
 
+    /// Both forms of a K identity key: 02 and 03 + the x-only key (from a 33-byte compressed or
+    /// a 32-byte x-only key), for matching a person whatever parity byte the request carries -
+    /// `= ANY(...)` keeps the sender_pubkey indexes in use (kachat-audits XP-034). Anything else
+    /// is matched as given.
+    fn pubkey_variants(key: &[u8]) -> Vec<Vec<u8>> {
+        let x_only: &[u8] = match key.len() {
+            33 if key[0] == 0x02 || key[0] == 0x03 => &key[1..],
+            32 => key,
+            _ => return vec![key.to_vec()],
+        };
+        [0x02u8, 0x03u8]
+            .iter()
+            .map(|prefix| {
+                let mut v = Vec::with_capacity(33);
+                v.push(*prefix);
+                v.extend_from_slice(x_only);
+                v
+            })
+            .collect()
+    }
+
     fn decode_hex_to_bytes(hex_str: &str) -> DatabaseResult<Vec<u8>> {
         hex::decode(hex_str)
             .map_err(|e| DatabaseError::InvalidInput(format!("Invalid hex string: {}", e)))
@@ -1332,6 +1353,9 @@ impl DatabaseInterface for PostgresDbManager {
         requester_pubkey: &str,
     ) -> DatabaseResult<Option<(KBroadcastRecord, bool, bool, i64, i64, i64)>> {
         let user_pubkey_bytes = Self::decode_hex_to_bytes(user_public_key)?;
+        // the person by either form of their key (02/03 + x-only): a key derived from an
+        // address may carry the other parity byte (kachat-audits XP-034)
+        let user_pubkey_variants = Self::pubkey_variants(&user_pubkey_bytes);
         let requester_pubkey_bytes = Self::decode_hex_to_bytes(requester_pubkey)?;
 
         // Single query to get broadcast data + block/follow status + follower counts
@@ -1347,22 +1371,22 @@ impl DatabaseInterface for PostgresDbManager {
                 b.base64_encoded_message,
                 EXISTS (
                     SELECT 1 FROM k_blocks kb
-                    WHERE kb.sender_pubkey = $2 AND kb.blocked_user_pubkey = $1
+                    WHERE kb.sender_pubkey = $2 AND kb.blocked_user_pubkey = ANY($1)
                 ) as is_blocked,
                 EXISTS (
                     SELECT 1 FROM k_follows kf
-                    WHERE kf.sender_pubkey = $2 AND kf.followed_user_pubkey = $1
+                    WHERE kf.sender_pubkey = $2 AND kf.followed_user_pubkey = ANY($1)
                 ) as is_followed,
-                (SELECT COUNT(*) FROM k_follows WHERE followed_user_pubkey = $1) as followers_count,
-                (SELECT COUNT(*) FROM k_follows WHERE sender_pubkey = $1) as following_count,
-                (SELECT COUNT(*) FROM k_blocks WHERE sender_pubkey = $1) as blocked_count
+                (SELECT COUNT(*) FROM k_follows WHERE followed_user_pubkey = ANY($1)) as followers_count,
+                (SELECT COUNT(*) FROM k_follows WHERE sender_pubkey = ANY($1)) as following_count,
+                (SELECT COUNT(*) FROM k_blocks WHERE sender_pubkey = ANY($1)) as blocked_count
             FROM k_broadcasts b
-            WHERE b.sender_pubkey = $1
+            WHERE b.sender_pubkey = ANY($1)
             LIMIT 1
         "#;
 
         let row_opt = sqlx::query(query)
-            .bind(&user_pubkey_bytes)
+            .bind(&user_pubkey_variants)
             .bind(&requester_pubkey_bytes)
             .fetch_optional(&self.pool)
             .await
@@ -1406,19 +1430,19 @@ impl DatabaseInterface for PostgresDbManager {
                 SELECT
                     EXISTS (
                         SELECT 1 FROM k_blocks kb
-                        WHERE kb.sender_pubkey = $2 AND kb.blocked_user_pubkey = $1
+                        WHERE kb.sender_pubkey = $2 AND kb.blocked_user_pubkey = ANY($1)
                     ) as is_blocked,
                     EXISTS (
                         SELECT 1 FROM k_follows kf
-                        WHERE kf.sender_pubkey = $2 AND kf.followed_user_pubkey = $1
+                        WHERE kf.sender_pubkey = $2 AND kf.followed_user_pubkey = ANY($1)
                     ) as is_followed,
-                    (SELECT COUNT(*) FROM k_follows WHERE followed_user_pubkey = $1) as followers_count,
-                    (SELECT COUNT(*) FROM k_follows WHERE sender_pubkey = $1) as following_count,
-                    (SELECT COUNT(*) FROM k_blocks WHERE sender_pubkey = $1) as blocked_count
+                    (SELECT COUNT(*) FROM k_follows WHERE followed_user_pubkey = ANY($1)) as followers_count,
+                    (SELECT COUNT(*) FROM k_follows WHERE sender_pubkey = ANY($1)) as following_count,
+                    (SELECT COUNT(*) FROM k_blocks WHERE sender_pubkey = ANY($1)) as blocked_count
             "#;
 
             let status_row = sqlx::query(status_query)
-                .bind(&user_pubkey_bytes)
+                .bind(&user_pubkey_variants)
                 .bind(&requester_pubkey_bytes)
                 .fetch_one(&self.pool)
                 .await
@@ -1683,6 +1707,9 @@ impl DatabaseInterface for PostgresDbManager {
         options: QueryOptions,
     ) -> DatabaseResult<PaginatedResult<(KBroadcastRecord, bool)>> {
         let user_pubkey_bytes = Self::decode_hex_to_bytes(user_pubkey)?;
+        // the person by either form of their key (02/03 + x-only): a key derived from an
+        // address may carry the other parity byte (kachat-audits XP-034)
+        let user_pubkey_variants = Self::pubkey_variants(&user_pubkey_bytes);
         let requester_pubkey_bytes = Self::decode_hex_to_bytes(requester_pubkey)?;
         let limit = options.limit.unwrap_or(20) as i64;
         let offset_limit = limit + 1;
@@ -1697,7 +1724,7 @@ impl DatabaseInterface for PostgresDbManager {
             FROM k_follows kf
             LEFT JOIN k_broadcasts b ON b.sender_pubkey = kf.followed_user_pubkey
             LEFT JOIN k_follows kf2 ON kf2.sender_pubkey = $2 AND kf2.followed_user_pubkey = kf.followed_user_pubkey
-            WHERE kf.sender_pubkey = $1
+            WHERE kf.sender_pubkey = ANY($1)
             "#,
         );
 
@@ -1738,7 +1765,7 @@ impl DatabaseInterface for PostgresDbManager {
 
         let mut query_builder = sqlx::query(&query);
         query_builder = query_builder
-            .bind(&user_pubkey_bytes)
+            .bind(&user_pubkey_variants)
             .bind(&requester_pubkey_bytes);
 
         if let Some(before_cursor) = &options.before {
@@ -1806,6 +1833,9 @@ impl DatabaseInterface for PostgresDbManager {
         options: QueryOptions,
     ) -> DatabaseResult<PaginatedResult<(KBroadcastRecord, bool)>> {
         let user_pubkey_bytes = Self::decode_hex_to_bytes(user_pubkey)?;
+        // the person by either form of their key (02/03 + x-only): a key derived from an
+        // address may carry the other parity byte (kachat-audits XP-034)
+        let user_pubkey_variants = Self::pubkey_variants(&user_pubkey_bytes);
         let requester_pubkey_bytes = Self::decode_hex_to_bytes(requester_pubkey)?;
         let limit = options.limit.unwrap_or(20) as i64;
         let offset_limit = limit + 1;
@@ -1820,7 +1850,7 @@ impl DatabaseInterface for PostgresDbManager {
             FROM k_follows kf
             LEFT JOIN k_broadcasts b ON b.sender_pubkey = kf.sender_pubkey
             LEFT JOIN k_follows kf2 ON kf2.sender_pubkey = $2 AND kf2.followed_user_pubkey = kf.sender_pubkey
-            WHERE kf.followed_user_pubkey = $1
+            WHERE kf.followed_user_pubkey = ANY($1)
             "#,
         );
 
@@ -1861,7 +1891,7 @@ impl DatabaseInterface for PostgresDbManager {
 
         let mut query_builder = sqlx::query(&query);
         query_builder = query_builder
-            .bind(&user_pubkey_bytes)
+            .bind(&user_pubkey_variants)
             .bind(&requester_pubkey_bytes);
 
         if let Some(before_cursor) = &options.before {
@@ -3236,6 +3266,9 @@ impl DatabaseInterface for PostgresDbManager {
         options: QueryOptions,
     ) -> DatabaseResult<PaginatedResult<KReplyRecord>> {
         let user_pubkey_bytes = Self::decode_hex_to_bytes(user_public_key)?;
+        // the person by either form of their key (02/03 + x-only): a key derived from an
+        // address may carry the other parity byte (kachat-audits XP-034)
+        let user_pubkey_variants = Self::pubkey_variants(&user_pubkey_bytes);
         let requester_pubkey_bytes = Self::decode_hex_to_bytes(requester_pubkey)?;
         let limit = options.limit.unwrap_or(20) as i64;
         let offset_limit = limit + 1; // Get one extra to check if there are more
@@ -3289,7 +3322,7 @@ impl DatabaseInterface for PostgresDbManager {
                 FROM k_contents c
                 LEFT JOIN k_blocks kb ON kb.sender_pubkey = ${requester_param} AND kb.blocked_user_pubkey = c.sender_pubkey
                 WHERE c.content_type = 'reply'
-                  AND c.sender_pubkey = $1
+                  AND c.sender_pubkey = ANY($1)
                   AND kb.blocked_user_pubkey IS NULL{cursor_conditions}
                 {order_clause}
                 LIMIT ${limit_param}
@@ -3388,7 +3421,7 @@ impl DatabaseInterface for PostgresDbManager {
         );
 
         // Build query with parameter binding
-        let mut query_builder = sqlx::query(&query).bind(&user_pubkey_bytes);
+        let mut query_builder = sqlx::query(&query).bind(&user_pubkey_variants);
 
         // Add cursor parameters if present
         if let Some(before_cursor) = &options.before {
@@ -3471,6 +3504,9 @@ impl DatabaseInterface for PostgresDbManager {
         options: QueryOptions,
     ) -> DatabaseResult<PaginatedResult<KPostRecord>> {
         let user_pubkey_bytes = Self::decode_hex_to_bytes(user_public_key)?;
+        // the person by either form of their key (02/03 + x-only): a key derived from an
+        // address may carry the other parity byte (kachat-audits XP-034)
+        let user_pubkey_variants = Self::pubkey_variants(&user_pubkey_bytes);
         let requester_pubkey_bytes = Self::decode_hex_to_bytes(requester_pubkey)?;
         let limit = options.limit.unwrap_or(20) as i64;
         let offset_limit = limit + 1; // Get one extra to check if there are more
@@ -3523,7 +3559,7 @@ impl DatabaseInterface for PostgresDbManager {
                        c.sender_signature, c.base64_encoded_message, c.content_type,
                        c.referenced_content_id
                 FROM k_contents c
-                WHERE c.content_type IN ('post', 'quote', 'poll') AND c.sender_pubkey = $1{cursor_conditions}
+                WHERE c.content_type IN ('post', 'quote', 'poll') AND c.sender_pubkey = ANY($1){cursor_conditions}
                 {order_clause}
                 LIMIT ${limit_param}
             ),
@@ -3643,7 +3679,7 @@ impl DatabaseInterface for PostgresDbManager {
         );
 
         // Build query with parameter binding
-        let mut query_builder = sqlx::query(&query).bind(&user_pubkey_bytes);
+        let mut query_builder = sqlx::query(&query).bind(&user_pubkey_variants);
 
         // Add cursor parameters if present
         if let Some(before_cursor) = &options.before {
@@ -4593,5 +4629,23 @@ impl DatabaseInterface for PostgresDbManager {
         .await
         .map_err(|e| DatabaseError::QueryError(format!("Failed to insert translation: {}", e)))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pubkey_variant_tests {
+    use super::PostgresDbManager;
+
+    #[test]
+    fn a_key_matches_in_both_parities() {
+        let x = [7u8; 32];
+        let mut odd = vec![0x03u8];
+        odd.extend_from_slice(&x);
+        let mut even = vec![0x02u8];
+        even.extend_from_slice(&x);
+        assert_eq!(PostgresDbManager::pubkey_variants(&odd), vec![even.clone(), odd.clone()]);
+        assert_eq!(PostgresDbManager::pubkey_variants(&even), vec![even.clone(), odd.clone()]);
+        assert_eq!(PostgresDbManager::pubkey_variants(&x), vec![even, odd]);
+        assert_eq!(PostgresDbManager::pubkey_variants(&[1, 2, 3]), vec![vec![1, 2, 3]]);
     }
 }
