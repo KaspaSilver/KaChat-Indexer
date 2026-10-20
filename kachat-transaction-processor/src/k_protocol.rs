@@ -2133,7 +2133,7 @@ impl KProtocolProcessor {
             r#"
             WITH deleted AS (
                 DELETE FROM k_broadcasts
-                WHERE sender_pubkey = $3 AND transaction_id != $1
+                WHERE substring(sender_pubkey from 2) = substring($3 from 2) AND transaction_id != $1
                 RETURNING transaction_id
             )
             INSERT INTO k_broadcasts (
@@ -3166,7 +3166,7 @@ impl KProtocolProcessor {
                         transaction_id, block_time, sender_pubkey, sender_signature,
                         blocking_action, blocked_user_pubkey
                     ) VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (sender_pubkey, blocked_user_pubkey)
+                    ON CONFLICT (sender_pubkey, (substring(blocked_user_pubkey from 2)))
                     DO NOTHING
                     "#,
                 )
@@ -3211,7 +3211,7 @@ impl KProtocolProcessor {
                     r#"
                     DELETE FROM k_blocks
                     WHERE sender_pubkey = $1
-                    AND blocked_user_pubkey = $2
+                    AND substring(blocked_user_pubkey from 2) = substring($2 from 2)
                     AND blocking_action = 'block'
                     "#,
                 )
@@ -3319,7 +3319,7 @@ impl KProtocolProcessor {
                         transaction_id, block_time, sender_pubkey, sender_signature,
                         following_action, followed_user_pubkey
                     ) VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (sender_pubkey, followed_user_pubkey)
+                    ON CONFLICT (sender_pubkey, (substring(followed_user_pubkey from 2)))
                     DO NOTHING
                     "#,
                 )
@@ -3362,7 +3362,7 @@ impl KProtocolProcessor {
                     r#"
                     DELETE FROM k_follows
                     WHERE sender_pubkey = $1
-                    AND followed_user_pubkey = $2
+                    AND substring(followed_user_pubkey from 2) = substring($2 from 2)
                     AND following_action = 'follow'
                     "#,
                 )

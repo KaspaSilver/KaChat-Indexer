@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 pub type DbPool = PgPool;
 
 // Schema version management
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// kachat-transaction-processor Database Client
 /// Similar to KaspaDbClient in Simply Kaspa Indexer
@@ -129,6 +129,14 @@ impl KDbClient {
                             execute_ddl(MIGRATION_V1_TO_V2_SQL, &self.pool).await?;
                             current_version = 2;
                             info!("Migration v1 -> v2 completed successfully");
+                        }
+
+                        // v2 -> v3: one person per x-only key (profiles/follows/blocks; IDX-031/032)
+                        if current_version == 2 {
+                            info!("Applying migration v2 -> v3 (x-only identity for profiles, follows, blocks)");
+                            execute_ddl(MIGRATION_V2_TO_V3_SQL, &self.pool).await?;
+                            current_version = 3;
+                            info!("Migration v2 -> v3 completed successfully");
                         }
 
                         info!(
@@ -672,6 +680,7 @@ impl KDbClient {
 const SCHEMA_UP_SQL: &str = include_str!("migrations/schema/up.sql");
 const SCHEMA_DOWN_SQL: &str = include_str!("migrations/schema/down.sql");
 const MIGRATION_V0_TO_V1_SQL: &str = include_str!("migrations/schema/v0_to_v1.sql");
+const MIGRATION_V2_TO_V3_SQL: &str = include_str!("migrations/schema/v2_to_v3.sql");
 const MIGRATION_V1_TO_V2_SQL: &str = include_str!("migrations/schema/v1_to_v2.sql");
 
 pub async fn create_pool(config: &AppConfig) -> Result<DbPool> {
@@ -882,7 +891,7 @@ async fn verify_schema_setup(pool: &DbPool) -> Result<()> {
         "idx_k_mentions_mentioned_pubkey",
         // k_blocks indexes
         "idx_k_blocks_sender_signature_unique",
-        "idx_k_blocks_sender_blocked_user_unique",
+        "idx_k_blocks_sender_blocked_xonly_unique",
         "idx_k_blocks_sender_pubkey",
         "idx_k_blocks_blocked_user_pubkey",
         "idx_k_blocks_block_time",
@@ -899,7 +908,7 @@ async fn verify_schema_setup(pool: &DbPool) -> Result<()> {
         "idx_k_contents_sender_content_type",
         // k_follows indexes
         "idx_k_follows_sender_signature_unique",
-        "idx_k_follows_sender_followed_user_unique",
+        "idx_k_follows_sender_followed_xonly_unique",
         "idx_k_follows_followed_user_pubkey",
         "idx_k_follows_sender_pubkey",
         "idx_k_follows_block_time",

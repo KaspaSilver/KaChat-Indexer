@@ -233,7 +233,7 @@ impl PostgresDbManager {
                        c.sender_signature, c.base64_encoded_message, c.content_type,
                        c.referenced_content_id
                 FROM k_contents c
-                LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = c.sender_pubkey
+                LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(c.sender_pubkey from 2)
                 WHERE c.content_type IN ('post', 'quote', 'poll')
                   AND kb.blocked_user_pubkey IS NULL{cursor_conditions}{content_conditions}
                 {order_clause}
@@ -796,7 +796,7 @@ impl DatabaseInterface for PostgresDbManager {
                     ELSE false
                 END as is_followed
             FROM k_broadcasts b
-            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = b.sender_pubkey
+            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(b.sender_pubkey from 2)
             LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND kf.followed_user_pubkey = b.sender_pubkey
             WHERE 1=1
             "#,
@@ -934,7 +934,7 @@ impl DatabaseInterface for PostgresDbManager {
                 END as is_followed
             FROM k_broadcasts b
             INNER JOIN user_content_counts ucc ON ucc.sender_pubkey = b.sender_pubkey
-            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = b.sender_pubkey
+            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(b.sender_pubkey from 2)
             LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND kf.followed_user_pubkey = b.sender_pubkey
             WHERE 1=1
             "#,
@@ -1080,7 +1080,7 @@ impl DatabaseInterface for PostgresDbManager {
                     ELSE false
                 END as is_followed
             FROM k_broadcasts b
-            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = b.sender_pubkey
+            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(b.sender_pubkey from 2)
             LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND kf.followed_user_pubkey = b.sender_pubkey
             WHERE 1=1
             "#,
@@ -1237,7 +1237,7 @@ impl DatabaseInterface for PostgresDbManager {
                 CASE WHEN kf.followed_user_pubkey IS NOT NULL THEN true ELSE false END as is_followed,
                 pc.post_count
             FROM k_broadcasts b
-            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = b.sender_pubkey
+            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(b.sender_pubkey from 2)
             LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND kf.followed_user_pubkey = b.sender_pubkey
             INNER JOIN (
                 SELECT sender_pubkey, COUNT(*) as post_count
@@ -1382,6 +1382,7 @@ impl DatabaseInterface for PostgresDbManager {
                 (SELECT COUNT(*) FROM k_blocks WHERE sender_pubkey = ANY($1)) as blocked_count
             FROM k_broadcasts b
             WHERE b.sender_pubkey = ANY($1)
+            ORDER BY b.block_time DESC
             LIMIT 1
         "#;
 
@@ -2029,7 +2030,7 @@ impl DatabaseInterface for PostgresDbManager {
                        c.referenced_content_id
                 FROM k_contents c
                 INNER JOIN k_follows kf ON kf.followed_user_pubkey = c.sender_pubkey
-                LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = c.sender_pubkey
+                LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(c.sender_pubkey from 2)
                 WHERE kf.sender_pubkey = $1
                   AND c.content_type IN ('post', 'reply', 'quote', 'poll')
                   AND kb.blocked_user_pubkey IS NULL{cursor_conditions}
@@ -2284,7 +2285,7 @@ impl DatabaseInterface for PostgresDbManager {
                 SELECT c.content_type, c.id, c.transaction_id, c.block_time, c.sender_pubkey,
                        c.sender_signature, c.base64_encoded_message, c.referenced_content_id
                 FROM k_contents c
-                LEFT JOIN k_blocks kb ON kb.sender_pubkey = ${requester_param} AND kb.blocked_user_pubkey = c.sender_pubkey
+                LEFT JOIN k_blocks kb ON kb.sender_pubkey = ${requester_param} AND substring(kb.blocked_user_pubkey from 2) = substring(c.sender_pubkey from 2)
                 WHERE EXISTS (
                     SELECT 1
                     FROM k_mentions m
@@ -2896,7 +2897,7 @@ impl DatabaseInterface for PostgresDbManager {
                 WHERE sender_pubkey = ref_c.sender_pubkey
                 LIMIT 1
             ) ref_b ON ref_c.sender_pubkey IS NOT NULL
-            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $2 AND kb.blocked_user_pubkey = c.sender_pubkey
+            LEFT JOIN k_blocks kb ON kb.sender_pubkey = $2 AND substring(kb.blocked_user_pubkey from 2) = substring(c.sender_pubkey from 2)
             WHERE c.transaction_id = $1
             LIMIT 1
         "#;
@@ -3082,7 +3083,7 @@ impl DatabaseInterface for PostgresDbManager {
                 SELECT c.id, c.transaction_id, c.block_time, c.sender_pubkey,
                        c.sender_signature, c.referenced_content_id, c.base64_encoded_message
                 FROM k_contents c
-                LEFT JOIN k_blocks kb ON kb.sender_pubkey = ${requester_param} AND kb.blocked_user_pubkey = c.sender_pubkey
+                LEFT JOIN k_blocks kb ON kb.sender_pubkey = ${requester_param} AND substring(kb.blocked_user_pubkey from 2) = substring(c.sender_pubkey from 2)
                 WHERE c.content_type = 'reply'
                   AND c.referenced_content_id = $1
                   AND kb.blocked_user_pubkey IS NULL{cursor_conditions}
@@ -3320,7 +3321,7 @@ impl DatabaseInterface for PostgresDbManager {
                 SELECT c.id, c.transaction_id, c.block_time, c.sender_pubkey,
                        c.sender_signature, c.referenced_content_id, c.base64_encoded_message
                 FROM k_contents c
-                LEFT JOIN k_blocks kb ON kb.sender_pubkey = ${requester_param} AND kb.blocked_user_pubkey = c.sender_pubkey
+                LEFT JOIN k_blocks kb ON kb.sender_pubkey = ${requester_param} AND substring(kb.blocked_user_pubkey from 2) = substring(c.sender_pubkey from 2)
                 WHERE c.content_type = 'reply'
                   AND c.sender_pubkey = ANY($1)
                   AND kb.blocked_user_pubkey IS NULL{cursor_conditions}
@@ -3667,7 +3668,7 @@ impl DatabaseInterface for PostgresDbManager {
                 WHERE sender_pubkey = ref_c.sender_pubkey
                 LIMIT 1
             ) ref_b ON ref_c.sender_pubkey IS NOT NULL
-            LEFT JOIN k_blocks kb ON kb.sender_pubkey = ${requester_param} AND kb.blocked_user_pubkey = ps.sender_pubkey
+            LEFT JOIN k_blocks kb ON kb.sender_pubkey = ${requester_param} AND substring(kb.blocked_user_pubkey from 2) = substring(ps.sender_pubkey from 2)
             WHERE kb.blocked_user_pubkey IS NULL
             {final_order_clause}
             "#,
@@ -3783,7 +3784,7 @@ impl DatabaseInterface for PostgresDbManager {
                           AND (km.block_time > $2 OR (km.block_time = $2 AND km.id > $3))
                           AND NOT EXISTS (
                               SELECT 1 FROM k_blocks kb
-                              WHERE kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = km.sender_pubkey
+                              WHERE kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(km.sender_pubkey from 2)
                           )
                         ORDER BY block_time DESC, id DESC
                         LIMIT 31
@@ -4343,7 +4344,7 @@ impl DatabaseInterface for PostgresDbManager {
                        c.referenced_content_id
                 FROM k_contents c
                 INNER JOIN k_hashtags h ON h.content_id = c.transaction_id
-                LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = c.sender_pubkey
+                LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(c.sender_pubkey from 2)
                 WHERE h.hashtag = $2
                   AND c.content_type IN ('post', 'reply', 'quote')
                   AND kb.blocked_user_pubkey IS NULL{cursor_conditions}

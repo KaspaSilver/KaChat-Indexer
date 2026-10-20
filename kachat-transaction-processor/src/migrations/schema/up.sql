@@ -73,7 +73,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_k_votes_sender_signature_unique ON k_votes
 CREATE UNIQUE INDEX IF NOT EXISTS idx_k_blocks_sender_signature_unique ON k_blocks(sender_signature);
 
 -- Create indexes for efficient blocking queries
-CREATE UNIQUE INDEX IF NOT EXISTS idx_k_blocks_sender_blocked_user_unique ON k_blocks(sender_pubkey, blocked_user_pubkey);
+-- One block per person, on the x-only key (IDX-032, like k_follows).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_k_blocks_sender_blocked_xonly_unique ON k_blocks(sender_pubkey, (substring(blocked_user_pubkey from 2)));
 CREATE INDEX IF NOT EXISTS idx_k_blocks_sender_pubkey ON k_blocks(sender_pubkey);
 CREATE INDEX IF NOT EXISTS idx_k_blocks_blocked_user_pubkey ON k_blocks(blocked_user_pubkey);
 CREATE INDEX IF NOT EXISTS idx_k_blocks_block_time ON k_blocks(block_time);
@@ -109,7 +110,9 @@ CREATE TABLE IF NOT EXISTS k_follows (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_k_follows_sender_signature_unique ON k_follows(sender_signature);
 
 -- Unique constraint: one follow record per sender-followed pair (prevents duplicates)
-CREATE UNIQUE INDEX IF NOT EXISTS idx_k_follows_sender_followed_user_unique ON k_follows(sender_pubkey, followed_user_pubkey);
+-- One follow per person: the target is compared on the x-only key, since 02<x> and 03<x> are
+-- the same person (IDX-032).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_k_follows_sender_followed_xonly_unique ON k_follows(sender_pubkey, (substring(followed_user_pubkey from 2)));
 
 -- Index for queries: "who is following user X?"
 CREATE INDEX IF NOT EXISTS idx_k_follows_followed_user_pubkey ON k_follows(followed_user_pubkey, block_time DESC);
