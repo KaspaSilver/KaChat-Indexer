@@ -201,6 +201,9 @@ impl KDbClient {
         // Step 1i: idempotently ensure the tips table (fork addition, §5.11) exists.
         self.create_tips_schema().await?;
 
+        // Step 1j: the K broadcast signature ledger (kachat-audits IDX-031).
+        self.create_broadcast_signature_ledger().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -211,6 +214,35 @@ impl KDbClient {
         verify_schema_setup(&self.pool).await?;
 
         info!("Schema creation/upgrade process completed");
+        Ok(())
+    }
+
+    /// kachat-audits IDX-031: every K `broadcast` (profile) signature ever accepted, with the
+    /// transaction that carried it. A profile update DELETES the person's previous k_broadcasts
+    /// row, so that table can't refuse a replay of an older broadcast under a fresh txid (same or
+    /// flipped parity byte - the signature is x-only either way); this ledger can, and the
+    /// processor checks it before replacing a profile. Backfilled from the live rows on every
+    /// start (idempotent); a broadcast already replaced before the ledger existed can still be
+    /// replayed once, after which its signature is here too. Its primary-key index is named
+    /// `..._pkey`, clear of the schema verifier's `idx_k_%` pattern.
+    async fn create_broadcast_signature_ledger(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_broadcast_signatures (
+                sender_signature BYTEA PRIMARY KEY,
+                transaction_id BYTEA NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO kachat_broadcast_signatures (sender_signature, transaction_id) \
+             SELECT sender_signature, transaction_id FROM k_broadcasts \
+             ON CONFLICT (sender_signature) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

@@ -797,7 +797,7 @@ impl DatabaseInterface for PostgresDbManager {
                 END as is_followed
             FROM k_broadcasts b
             LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(b.sender_pubkey from 2)
-            LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND kf.followed_user_pubkey = b.sender_pubkey
+            LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND substring(kf.followed_user_pubkey from 2) = substring(b.sender_pubkey from 2)
             WHERE 1=1
             "#,
         );
@@ -935,7 +935,7 @@ impl DatabaseInterface for PostgresDbManager {
             FROM k_broadcasts b
             INNER JOIN user_content_counts ucc ON ucc.sender_pubkey = b.sender_pubkey
             LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(b.sender_pubkey from 2)
-            LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND kf.followed_user_pubkey = b.sender_pubkey
+            LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND substring(kf.followed_user_pubkey from 2) = substring(b.sender_pubkey from 2)
             WHERE 1=1
             "#,
         );
@@ -1081,7 +1081,7 @@ impl DatabaseInterface for PostgresDbManager {
                 END as is_followed
             FROM k_broadcasts b
             LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(b.sender_pubkey from 2)
-            LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND kf.followed_user_pubkey = b.sender_pubkey
+            LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND substring(kf.followed_user_pubkey from 2) = substring(b.sender_pubkey from 2)
             WHERE 1=1
             "#,
         );
@@ -1238,7 +1238,7 @@ impl DatabaseInterface for PostgresDbManager {
                 pc.post_count
             FROM k_broadcasts b
             LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(b.sender_pubkey from 2)
-            LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND kf.followed_user_pubkey = b.sender_pubkey
+            LEFT JOIN k_follows kf ON kf.sender_pubkey = $1 AND substring(kf.followed_user_pubkey from 2) = substring(b.sender_pubkey from 2)
             INNER JOIN (
                 SELECT sender_pubkey, COUNT(*) as post_count
                 FROM k_contents
@@ -1605,7 +1605,7 @@ impl DatabaseInterface for PostgresDbManager {
                    b.base64_encoded_profile_image,
                    COALESCE(b.base64_encoded_message, '') as base64_encoded_message
             FROM k_follows kf
-            LEFT JOIN k_broadcasts b ON b.sender_pubkey = kf.followed_user_pubkey
+            LEFT JOIN k_broadcasts b ON substring(b.sender_pubkey from 2) = substring(kf.followed_user_pubkey from 2)
             WHERE kf.sender_pubkey = $1
             "#,
         );
@@ -1723,8 +1723,8 @@ impl DatabaseInterface for PostgresDbManager {
                    COALESCE(b.base64_encoded_message, '') as base64_encoded_message,
                    CASE WHEN kf2.id IS NOT NULL THEN true ELSE false END as is_followed_by_requester
             FROM k_follows kf
-            LEFT JOIN k_broadcasts b ON b.sender_pubkey = kf.followed_user_pubkey
-            LEFT JOIN k_follows kf2 ON kf2.sender_pubkey = $2 AND kf2.followed_user_pubkey = kf.followed_user_pubkey
+            LEFT JOIN k_broadcasts b ON substring(b.sender_pubkey from 2) = substring(kf.followed_user_pubkey from 2)
+            LEFT JOIN k_follows kf2 ON kf2.sender_pubkey = $2 AND substring(kf2.followed_user_pubkey from 2) = substring(kf.followed_user_pubkey from 2)
             WHERE kf.sender_pubkey = ANY($1)
             "#,
         );
@@ -1850,7 +1850,7 @@ impl DatabaseInterface for PostgresDbManager {
                    CASE WHEN kf2.id IS NOT NULL THEN true ELSE false END as is_followed_by_requester
             FROM k_follows kf
             LEFT JOIN k_broadcasts b ON b.sender_pubkey = kf.sender_pubkey
-            LEFT JOIN k_follows kf2 ON kf2.sender_pubkey = $2 AND kf2.followed_user_pubkey = kf.sender_pubkey
+            LEFT JOIN k_follows kf2 ON kf2.sender_pubkey = $2 AND substring(kf2.followed_user_pubkey from 2) = substring(kf.sender_pubkey from 2)
             WHERE kf.followed_user_pubkey = ANY($1)
             "#,
         );
@@ -2029,7 +2029,7 @@ impl DatabaseInterface for PostgresDbManager {
                        c.sender_signature, c.base64_encoded_message, c.content_type,
                        c.referenced_content_id
                 FROM k_contents c
-                INNER JOIN k_follows kf ON kf.followed_user_pubkey = c.sender_pubkey
+                INNER JOIN k_follows kf ON substring(kf.followed_user_pubkey from 2) = substring(c.sender_pubkey from 2)
                 LEFT JOIN k_blocks kb ON kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(c.sender_pubkey from 2)
                 WHERE kf.sender_pubkey = $1
                   AND c.content_type IN ('post', 'reply', 'quote', 'poll')
@@ -3814,7 +3814,7 @@ impl DatabaseInterface for PostgresDbManager {
                       AND substr(km.sender_pubkey, 2) != substr($1, 2)
                       AND NOT EXISTS (
                           SELECT 1 FROM k_blocks kb
-                          WHERE kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = km.sender_pubkey
+                          WHERE kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(km.sender_pubkey from 2)
                       )
                     ORDER BY block_time DESC, id DESC
                     LIMIT 31
@@ -3907,7 +3907,7 @@ impl DatabaseInterface for PostgresDbManager {
                   AND substr(km.sender_pubkey, 2) != substr($1, 2)
                   AND NOT EXISTS (
                       SELECT 1 FROM k_blocks kb
-                      WHERE kb.sender_pubkey = $1 AND kb.blocked_user_pubkey = km.sender_pubkey
+                      WHERE kb.sender_pubkey = $1 AND substring(kb.blocked_user_pubkey from 2) = substring(km.sender_pubkey from 2)
                   )
                 {cursor_conditions}
                 {final_order_clause}

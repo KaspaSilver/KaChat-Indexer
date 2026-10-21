@@ -2128,6 +2128,33 @@ impl KProtocolProcessor {
         let sender_pubkey_bytes = hex::decode(&k_broadcast.sender_pubkey)?;
         let sender_signature_bytes = hex::decode(&k_broadcast.sender_signature)?;
 
+        // kachat-audits IDX-031: a broadcast signature is accepted once. Recording it and
+        // replacing the profile happen in one transaction; a signature already recorded for a
+        // DIFFERENT transaction is a replay (anyone can re-post an old broadcast of someone's,
+        // which would revert their profile) and is refused. Re-processing the same transaction
+        // stays a no-op, as before.
+        let mut db_tx = self.db_pool.begin().await?;
+        let first_use = sqlx::query(
+            r#"
+            INSERT INTO kachat_broadcast_signatures (sender_signature, transaction_id)
+            VALUES ($1, $2)
+            ON CONFLICT (sender_signature) DO UPDATE SET transaction_id = EXCLUDED.transaction_id
+            WHERE kachat_broadcast_signatures.transaction_id = EXCLUDED.transaction_id
+            "#,
+        )
+        .bind(&sender_signature_bytes)
+        .bind(&transaction_id_bytes)
+        .execute(&mut *db_tx)
+        .await?;
+        if first_use.rows_affected() == 0 {
+            db_tx.commit().await?;
+            info!(
+                "Broadcast {} reuses a signature already accepted for another transaction (replay), refused",
+                transaction_id
+            );
+            return Ok(());
+        }
+
         // Use a single query to delete existing records and insert the new one atomically (skip if transaction already exists)
         let result = sqlx::query(
             r#"
@@ -2151,8 +2178,9 @@ impl KProtocolProcessor {
         .bind(k_broadcast.base64_encoded_nickname)
         .bind(k_broadcast.base64_encoded_profile_image)
         .bind(k_broadcast.base64_encoded_message)
-        .execute(&self.db_pool)
+        .execute(&mut *db_tx)
         .await?;
+        db_tx.commit().await?;
 
         if result.rows_affected() == 0 {
             info!(
