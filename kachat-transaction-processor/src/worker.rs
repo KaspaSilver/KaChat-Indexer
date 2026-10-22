@@ -62,20 +62,22 @@ impl Worker {
                                 let quiet = transaction.block_time.is_some_and(|t| {
                                     crate::bcast_pending::now_ms() - t > crate::bcast_pending::PUSH_MAX_AGE_MS
                                 });
-                                if let Err(k_err) = crate::push_notify::QUIET
+                                match crate::push_notify::QUIET
                                     .scope(quiet, self.k_processor.process_k_transaction(&transaction))
                                     .await
                                 {
-                                    error!(
+                                    Ok(()) => self.mark_recovered_consumed(&transaction_id).await,
+                                    Err(k_err) => error!(
                                         "Worker {} - Error processing K protocol transaction {}: {}",
                                         self.id, transaction_id, k_err
-                                    );
+                                    ),
                                 }
                             } else {
                                 info!(
                                     "Worker {} - Transaction {} does not contain K protocol data",
                                     self.id, transaction_id
                                 );
+                                self.mark_recovered_consumed(&transaction_id).await;
                             }
                         }
                     }
@@ -100,6 +102,23 @@ impl Worker {
                     );
                 }
             }
+        }
+    }
+
+    /// A reindex-recovered row is done once processed without error: the next start does not
+    /// queue it again, and the prune may drop it (kachat-audits IDX-038). Live transactions
+    /// have no such row; the update touches nothing.
+    async fn mark_recovered_consumed(&self, transaction_id: &str) {
+        let Ok(id) = hex::decode(transaction_id) else { return };
+        if let Err(e) = sqlx::query(
+            "UPDATE kachat_recovered_transactions SET consumed_at = $2 WHERE transaction_id = $1 AND consumed_at IS NULL",
+        )
+        .bind(&id)
+        .bind(crate::bcast_pending::now_ms())
+        .execute(&self.db_pool)
+        .await
+        {
+            warn!("Worker {} - could not mark recovered transaction {} processed: {}", self.id, transaction_id, e);
         }
     }
 
@@ -165,13 +184,12 @@ impl Worker {
                                     || payload_str.starts_with("ciph_msg:1:bcast:")
                                 {
                                     //info!("Worker {} - Processing K protocol / broadcast transaction on retry: {}", self.id, transaction_id);
-                                    if let Err(k_err) =
-                                        self.k_processor.process_k_transaction(&transaction).await
-                                    {
-                                        error!(
+                                    match self.k_processor.process_k_transaction(&transaction).await {
+                                        Ok(()) => self.mark_recovered_consumed(transaction_id).await,
+                                        Err(k_err) => error!(
                                             "Worker {} - Error processing K protocol transaction on retry {}: {}",
                                             self.id, transaction_id, k_err
-                                        );
+                                        ),
                                     }
                                 }
                             }

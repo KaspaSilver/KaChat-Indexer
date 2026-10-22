@@ -116,9 +116,35 @@ async fn reset_stale_status(pool: &DbPool) {
     warn!("reindex: a walk was running when the processor last stopped; marked failed");
 }
 
+/// Recovered rows no worker has consumed yet - a restart while the queue (memory only) was still
+/// draining - are queued again at every start, oldest first (kachat-audits IDX-038). Processing
+/// is idempotent, so a row consumed just before the restart is a no-op.
+async fn requeue_unconsumed(pool: &DbPool, queue: &mpsc::UnboundedSender<String>) {
+    let rows = sqlx::query(
+        "SELECT transaction_id FROM kachat_recovered_transactions WHERE consumed_at IS NULL ORDER BY block_time",
+    )
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) if !rows.is_empty() => {
+            let n = rows.len();
+            for r in rows {
+                let id: Vec<u8> = r.get("transaction_id");
+                if queue.send(hex::encode(id)).is_err() {
+                    return;
+                }
+            }
+            info!("reindex: {n} recovered transaction(s) not yet processed, queued again");
+        }
+        Ok(_) => {}
+        Err(e) => warn!("reindex: could not read unprocessed recovered transactions: {e}"),
+    }
+}
+
 /// Waits for a request, runs it, records how it went; for the life of the processor.
 pub async fn run(pool: DbPool, queue: mpsc::UnboundedSender<String>) {
     reset_stale_status(&pool).await;
+    requeue_unconsumed(&pool, &queue).await;
     loop {
         tokio::time::sleep(POLL).await;
         let Some(req) = get_var(&pool, REQUEST_KEY).await else { continue };
@@ -145,9 +171,11 @@ pub async fn run(pool: DbPool, queue: mpsc::UnboundedSender<String>) {
 }
 
 /// Already in one of the processor's tables under this transaction id: indexed, nothing to do.
+/// A recovered row counts only once a worker consumed it - an unconsumed one is queued again
+/// (IDX-038). A delete counts once its tombstone exists (IDX-039).
 async fn already_indexed(pool: &DbPool, tx_id: &[u8]) -> Result<bool> {
     let hit: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM k_contents WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_votes WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_follows WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_blocks WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_recovered_transactions WHERE transaction_id = $1          LIMIT 1",
+        "SELECT 1 FROM k_contents WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_votes WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_follows WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_blocks WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_recovered_transactions WHERE transaction_id = $1 AND consumed_at IS NOT NULL          UNION ALL SELECT 1 FROM kachat_delete_tombstones WHERE transaction_id = $1          LIMIT 1",
     )
     .bind(tx_id)
     .fetch_optional(pool)
@@ -186,14 +214,17 @@ async fn walk(pool: &DbPool, queue: &mpsc::UnboundedSender<String>, from_ms: Opt
                 let Some(v) = &tx.verbose_data else { continue };
                 st.found += 1;
                 let id = v.transaction_id.as_bytes().to_vec();
-                // Edits, deletes, tips, polls and unfollows leave rows the check does not look
-                // at (or none at all): those are queued again, which the guards make harmless.
+                // Edits, tips, polls and unfollows leave rows the check does not look at (or none
+                // at all): those are queued again, which the guards make harmless.
                 if already_indexed(pool, &id).await? {
                     continue;
                 }
+                // A row stored by an earlier walk but never consumed (a restart mid-drain) is
+                // queued again and its prune clock restarted (IDX-038).
                 let r = sqlx::query(
                     "INSERT INTO kachat_recovered_transactions (transaction_id, payload, block_time, block_hash, inserted_at) \
-                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (transaction_id) DO NOTHING",
+                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (transaction_id) DO UPDATE SET inserted_at = EXCLUDED.inserted_at \
+                     WHERE kachat_recovered_transactions.consumed_at IS NULL",
                 )
                 .bind(&id)
                 .bind(tx.payload.clone())

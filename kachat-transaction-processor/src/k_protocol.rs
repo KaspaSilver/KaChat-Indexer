@@ -1086,10 +1086,20 @@ impl KProtocolProcessor {
                         .await?;
                 }
                 KActionType::Post(k_post) => {
+                    let author = k_post.sender_pubkey.clone();
+                    if self.deleted_by_author(transaction, &author).await? {
+                        return Ok(());
+                    }
                     self.save_k_post_to_database(transaction, k_post).await?;
+                    self.drop_if_deleted(transaction, &author).await?;
                 }
                 KActionType::Reply(k_reply) => {
+                    let author = k_reply.sender_pubkey.clone();
+                    if self.deleted_by_author(transaction, &author).await? {
+                        return Ok(());
+                    }
                     self.save_k_reply_to_database(transaction, k_reply).await?;
+                    self.drop_if_deleted(transaction, &author).await?;
                 }
                 KActionType::Vote(k_vote) => {
                     self.save_k_vote_to_database(transaction, k_vote).await?;
@@ -1099,7 +1109,12 @@ impl KProtocolProcessor {
                         .await?;
                 }
                 KActionType::Quote(k_quote) => {
+                    let author = k_quote.sender_pubkey.clone();
+                    if self.deleted_by_author(transaction, &author).await? {
+                        return Ok(());
+                    }
                     self.save_k_quote_to_database(transaction, k_quote).await?;
+                    self.drop_if_deleted(transaction, &author).await?;
                 }
                 KActionType::Follow(k_follow) => {
                     self.process_k_follow_in_database(transaction, k_follow)
@@ -1118,8 +1133,13 @@ impl KProtocolProcessor {
                         .await?;
                 }
                 KActionType::Poll(k_poll) => {
+                    let author = k_poll.sender_pubkey.clone();
+                    if self.deleted_by_author(transaction, &author).await? {
+                        return Ok(());
+                    }
                     self.process_k_poll_in_database(transaction, k_poll)
                         .await?;
+                    self.drop_if_deleted(transaction, &author).await?;
                 }
                 KActionType::PollVote(k_pollvote) => {
                     self.process_k_pollvote_in_database(transaction, k_pollvote)
@@ -2586,7 +2606,9 @@ impl KProtocolProcessor {
     /// disappears from every read path; parent replies/quotes counts recompute live, votes on it
     /// are removed, and a quote whose target is gone renders without its embed. Accepted only when
     /// the signature verifies and the target is indexed and authored by the same pubkey (an
-    /// unindexed target is skipped, since ownership can't be verified — rejecting forged deletes).
+    /// unindexed target can't be checked, so nothing is removed now - rejecting forged deletes).
+    /// Every signed delete first leaves a tombstone keyed by (post id, signer): if the post is
+    /// indexed later (a reindex replaying it after its delete), its save drops it then (IDX-039).
     /// No time window. Hard-delete is idempotent (a re-seen delete tx removes nothing).
     pub async fn process_k_delete_in_database(
         &self,
@@ -2611,6 +2633,20 @@ impl KProtocolProcessor {
         let sender_pubkey_bytes = hex::decode(&k_delete.sender_pubkey)?;
         let post_id_bytes = hex::decode(&k_delete.post_id)?;
 
+        // The tombstone first, whether or not the post is indexed yet (IDX-039): a reindex can
+        // process the post AFTER its delete, and the post's save then finds this and drops it.
+        // Keyed by the signer, so a forged delete only matches the forger's own posts.
+        sqlx::query(
+            "INSERT INTO kachat_delete_tombstones (post_id, sender_pubkey, transaction_id, block_time) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(&post_id_bytes)
+        .bind(&sender_pubkey_bytes)
+        .bind(&transaction_id_bytes)
+        .bind(block_time)
+        .execute(&self.db_pool)
+        .await?;
+
         // The target must be indexed and authored by the deleter. Without the original row we can't
         // verify ownership, so an unindexed target is skipped (rejects a forged delete of another's
         // post).
@@ -2624,7 +2660,7 @@ impl KProtocolProcessor {
             Some(row) => row,
             None => {
                 info!(
-                    "Delete {} targets content {} that is not indexed, skipping",
+                    "Delete {} targets content {} that is not indexed yet; its tombstone drops it if it comes",
                     transaction_id, k_delete.post_id
                 );
                 return Ok(());
@@ -2654,10 +2690,21 @@ impl KProtocolProcessor {
         .execute(&self.db_pool)
         .await?;
 
-        // Hard-delete the content row plus its votes and mentions in one statement. Replies TO the
-        // post and quotes OF it are left in place (their authors own them); their counts recompute
-        // live and a quote whose target is gone renders without the embed. k_hashtags cascade on
-        // the k_contents delete. Data-modifying CTEs all execute regardless of reference.
+        let mentions = self.hard_delete_content(&post_id_bytes, &sender_pubkey_bytes).await?;
+
+        info!(
+            "Applied K delete: {} deleted {} (removed content + votes + {} mention rows)",
+            transaction_id, k_delete.post_id, mentions
+        );
+        Ok(())
+    }
+
+    /// Hard-delete the content row plus its votes and mentions in one statement. Replies TO the
+    /// post and quotes OF it are left in place (their authors own them); their counts recompute
+    /// live and a quote whose target is gone renders without the embed. k_hashtags cascade on
+    /// the k_contents delete. Data-modifying CTEs all execute regardless of reference. Returns the
+    /// mention rows removed.
+    async fn hard_delete_content(&self, post_id: &[u8], author: &[u8]) -> Result<u64> {
         let deleted = sqlx::query(
             r#"
             WITH del_content AS (
@@ -2671,17 +2718,39 @@ impl KProtocolProcessor {
             DELETE FROM k_mentions WHERE content_id = $1
             "#,
         )
-        .bind(&post_id_bytes)
-        .bind(&sender_pubkey_bytes)
+        .bind(post_id)
+        .bind(author)
         .execute(&self.db_pool)
         .await?;
+        Ok(deleted.rows_affected())
+    }
 
-        info!(
-            "Applied K delete: {} deleted {} (removed content + votes + {} mention rows)",
-            transaction_id,
-            k_delete.post_id,
-            deleted.rows_affected()
-        );
+    /// Whether this content's own author has signed a delete for it (IDX-039).
+    async fn deleted_by_author(&self, transaction: &Transaction, author_hex: &str) -> Result<bool> {
+        let post_id = hex::decode(&transaction.transaction_id)?;
+        let Ok(author) = hex::decode(author_hex) else { return Ok(false) };
+        let hit: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM kachat_delete_tombstones WHERE post_id = $1 AND sender_pubkey = $2 LIMIT 1",
+        )
+        .bind(&post_id)
+        .bind(&author)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        if hit.is_some() {
+            info!("Content {} was deleted by its author; not indexed", transaction.transaction_id);
+        }
+        Ok(hit.is_some())
+    }
+
+    /// Asked again AFTER saving: a delete processed at the same moment on another worker may
+    /// have looked for the post before it was saved. One of the two always sees the other's
+    /// write (each writes, then reads), so the post never survives its own author's delete.
+    async fn drop_if_deleted(&self, transaction: &Transaction, author_hex: &str) -> Result<()> {
+        if self.deleted_by_author(transaction, author_hex).await? {
+            let post_id = hex::decode(&transaction.transaction_id)?;
+            let author = hex::decode(author_hex)?;
+            self.hard_delete_content(&post_id, &author).await?;
+        }
         Ok(())
     }
 

@@ -257,6 +257,12 @@ impl KDbClient {
     /// `kachat_relation_last` is the newest follow/unfollow (kind follow) or block/unblock (kind
     /// block) seen per sender and x-only target, so a replayed older action never undoes a newer
     /// one: last write by block time wins, whatever order transactions are processed in.
+    /// IDX-038: `consumed_at` marks a recovered row a worker has processed; at start every row
+    /// without it is queued again, and the prune only drops consumed rows (or very old ones).
+    /// IDX-039: `kachat_delete_tombstones` holds every signed delete by (post id, signer), written
+    /// whether or not the post is indexed yet, so a post and its delete can be processed in either
+    /// order: a post whose own author left a tombstone for it is never kept. Keyed by the signer,
+    /// a forged delete only ever matches the forger's own posts.
     async fn create_recovery_schema(&self) -> Result<()> {
         sqlx::query(
             r#"
@@ -268,6 +274,35 @@ impl KDbClient {
                 inserted_at BIGINT NOT NULL
             )
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("ALTER TABLE kachat_recovered_transactions ADD COLUMN IF NOT EXISTS consumed_at BIGINT")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_delete_tombstones (
+                post_id BYTEA NOT NULL,
+                sender_pubkey BYTEA NOT NULL,
+                transaction_id BYTEA NOT NULL,
+                block_time BIGINT NOT NULL,
+                PRIMARY KEY (post_id, sender_pubkey)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS kachat_delete_tombstones_tx ON kachat_delete_tombstones(transaction_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Deletes applied before the tombstones existed.
+        sqlx::query(
+            "INSERT INTO kachat_delete_tombstones (post_id, sender_pubkey, transaction_id, block_time) \
+             SELECT post_id, sender_pubkey, transaction_id, block_time FROM k_deletes \
+             ON CONFLICT DO NOTHING",
         )
         .execute(&self.pool)
         .await?;

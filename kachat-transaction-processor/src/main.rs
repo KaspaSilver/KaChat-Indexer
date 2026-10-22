@@ -305,11 +305,17 @@ async fn main() -> Result<()> {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             let cutoff = now_ms - retention_ms;
-            // Recovered transactions (reindex.rs) are read once by a worker; a week is plenty.
-            let _ = sqlx::query("DELETE FROM kachat_recovered_transactions WHERE inserted_at < $1")
-                .bind(now_ms - 7 * 86_400_000)
-                .execute(&prune_pool)
-                .await;
+            // Recovered transactions (reindex.rs): a week after a worker consumed them. One never
+            // consumed (it keeps failing) goes after 30 days, so the table can't grow for ever;
+            // until then every start queues it again (IDX-038).
+            let _ = sqlx::query(
+                "DELETE FROM kachat_recovered_transactions \
+                 WHERE (consumed_at IS NOT NULL AND inserted_at < $1) OR inserted_at < $2",
+            )
+            .bind(now_ms - 7 * 86_400_000)
+            .bind(now_ms - 30 * 86_400_000)
+            .execute(&prune_pool)
+            .await;
             match sqlx::query("DELETE FROM kachat_broadcasts WHERE block_time < $1")
                 .bind(cutoff)
                 .execute(&prune_pool)
