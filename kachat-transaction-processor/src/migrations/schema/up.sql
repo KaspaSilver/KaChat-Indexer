@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS k_vars (
 );
 
 -- Insert initial schema version (v2 = complete K protocol schema with hashtags)
-INSERT INTO k_vars (key, value) VALUES ('schema_version', '2') ON CONFLICT (key) DO NOTHING;
+INSERT INTO k_vars (key, value) VALUES ('schema_version', '3') ON CONFLICT (key) DO NOTHING;
 
 -- NOTE: k_posts and k_replies tables removed in v6 (replaced by k_contents table in v4)
 -- Create K protocol tables

@@ -33,4 +33,8 @@ WHERE a.sender_pubkey = b.sender_pubkey
 DROP INDEX IF EXISTS idx_k_blocks_sender_blocked_user_unique;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_k_blocks_sender_blocked_xonly_unique
-    ON k_blocks(sender_pubkey, (substring(blocked_user_pubkey from 2)))
+    ON k_blocks(sender_pubkey, (substring(blocked_user_pubkey from 2)));
+
+-- Every statement above is a no-op the second time (DROP IF EXISTS, CREATE IF NOT EXISTS,
+-- deletes that find nothing), so a run that got this far once can safely run again.
+UPDATE k_vars SET value = '3' WHERE key = 'schema_version'
