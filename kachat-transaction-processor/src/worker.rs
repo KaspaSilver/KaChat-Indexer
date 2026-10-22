@@ -57,8 +57,14 @@ impl Worker {
                                 || payload_str.starts_with("ciph_msg:1:bcast:")
                             {
                                 //info!("Worker {} - Processing K protocol / broadcast transaction: {}", self.id, transaction_id);
-                                if let Err(k_err) =
-                                    self.k_processor.process_k_transaction(&transaction).await
+                                // No pushes for a transaction older than a few minutes: a
+                                // reindex or a catch-up after downtime is history, not news.
+                                let quiet = transaction.block_time.is_some_and(|t| {
+                                    crate::bcast_pending::now_ms() - t > crate::bcast_pending::PUSH_MAX_AGE_MS
+                                });
+                                if let Err(k_err) = crate::push_notify::QUIET
+                                    .scope(quiet, self.k_processor.process_k_transaction(&transaction))
+                                    .await
                                 {
                                     error!(
                                         "Worker {} - Error processing K protocol transaction {}: {}",

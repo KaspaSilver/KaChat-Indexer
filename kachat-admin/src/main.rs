@@ -203,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/settings", get(get_settings).post(post_settings))
         .route("/api/broadcasts/delete", post(post_broadcast_delete))
         .route("/api/kaposts/delete", post(post_content_delete))
+        .route("/api/kaposts/reindex", get(get_kaposts_reindex).post(post_kaposts_reindex))
         .route("/api/kaposts/denylist", get(get_denylist))
         .route("/api/kaposts/denylist/add", post(post_denylist_add))
         .route("/api/kaposts/denylist/remove", post(post_denylist_remove))
@@ -1676,6 +1677,62 @@ async fn post_content_delete(
         .rows_affected();
     info!("kachat-admin deleted {} content row(s) for tx {}", deleted, tx);
     Ok(Json(DeleteResult { deleted }))
+}
+
+// ---------------------------------------------------------------------------
+// /api/kaposts/reindex  (recover missed KaPosts: the processor walks the node's blocks)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct ReindexRequest {
+    /// Skip blocks older than this (unix ms); absent = everything the node still holds.
+    from_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ReindexView {
+    /// Asked for, not picked up by the processor yet (it looks every few seconds).
+    requested: bool,
+    /// The processor's `kaposts_reindex_status`: state running/done/failed, counts, times.
+    status: Option<serde_json::Value>,
+}
+
+async fn reindex_view(pool: &PgPool) -> Result<ReindexView, ApiError> {
+    let requested = sqlx::query_scalar::<_, String>("SELECT value FROM k_vars WHERE key = 'kaposts_reindex_request'")
+        .fetch_optional(pool)
+        .await
+        .map_err(ApiError::db)?
+        .is_some();
+    let status = sqlx::query_scalar::<_, String>("SELECT value FROM k_vars WHERE key = 'kaposts_reindex_status'")
+        .fetch_optional(pool)
+        .await
+        .map_err(ApiError::db)?
+        .and_then(|s| serde_json::from_str(&s).ok());
+    Ok(ReindexView { requested, status })
+}
+
+async fn get_kaposts_reindex(State(state): State<AppState>) -> Result<Json<ReindexView>, ApiError> {
+    Ok(Json(reindex_view(&state.pool).await?))
+}
+
+/// Asks the processor for a reindex. One at a time: refused while one runs or waits.
+async fn post_kaposts_reindex(
+    State(state): State<AppState>,
+    Json(req): Json<ReindexRequest>,
+) -> Result<Json<ReindexView>, ApiError> {
+    let view = reindex_view(&state.pool).await?;
+    let running = view.status.as_ref().and_then(|s| s["state"].as_str()) == Some("running");
+    if view.requested || running {
+        return Err(ApiError::bad_request("A reindex is already running or waiting to start."));
+    }
+    let value = serde_json::json!({ "requested_at": now_ms(), "from_ms": req.from_ms }).to_string();
+    sqlx::query("INSERT INTO k_vars (key, value) VALUES ('kaposts_reindex_request', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
+        .bind(value)
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::db)?;
+    info!("kachat-admin: KaPosts reindex requested{}", req.from_ms.map(|f| format!(" from {f}")).unwrap_or_default());
+    Ok(Json(reindex_view(&state.pool).await?))
 }
 
 // ---------------------------------------------------------------------------

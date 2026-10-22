@@ -7,6 +7,7 @@ mod k_protocol;
 mod listener;
 mod push_notify;
 mod queue;
+mod reindex;
 mod tips;
 mod transaction_reindex_service;
 mod worker;
@@ -179,6 +180,8 @@ async fn main() -> Result<()> {
     let (mut notification_queue, worker_receivers) =
         NotificationQueue::new(notification_receiver, config.workers.count);
 
+    // The startup catch-up feeds the same queue the LISTEN channel does.
+    let catch_up_sender = notification_sender.clone();
     let notification_listener = NotificationListener::new(config.clone(), notification_sender);
 
     let worker_pool = WorkerPool::new(worker_receivers, database.pool().clone(), config.clone());
@@ -279,6 +282,14 @@ async fn main() -> Result<()> {
     // not be resolved yet are retried here instead of dropped. Detached, loops forever.
     let pending_pool = database.pool().clone();
     let _bcast_pending_handle = tokio::spawn(bcast_pending::run(pending_pool));
+
+    // Missed KaPosts: a reindex of the node's blocks on request (the panel's Indexer tab), and
+    // once at start whatever landed in the last hour while nothing was listening (reindex.rs).
+    let _reindex_handle = tokio::spawn(reindex::run(database.pool().clone()));
+    let catch_up_pool = database.pool().clone();
+    let _catch_up_handle = tokio::spawn(async move {
+        reindex::startup_catch_up(&catch_up_pool, catch_up_sender).await;
+    });
 
     // Broadcast retention pruner: broadcasts are ephemeral channel chatter, so drop rows older
     // than the retention window (default 3 days). Runs immediately, then hourly. Detached — it

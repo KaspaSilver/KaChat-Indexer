@@ -42,6 +42,16 @@ fn enabled() -> bool {
     !std::env::var("PUSH_INTERNAL_URL").is_ok_and(|v| v.trim().is_empty())
 }
 
+tokio::task_local! {
+    /// True while a worker processes a transaction older than a few minutes (a reindex, a
+    /// catch-up after downtime): its pushes would be stale news, so none are sent.
+    pub static QUIET: bool;
+}
+
+fn quiet() -> bool {
+    QUIET.try_with(|q| *q).unwrap_or(false)
+}
+
 fn post(path: &'static str, body: serde_json::Value) {
     post_inner(path, body, None);
 }
@@ -53,7 +63,7 @@ fn post_with_actor(path: &'static str, body: serde_json::Value, actor_pubkey: &s
 }
 
 fn post_inner(path: &'static str, mut body: serde_json::Value, actor_pubkey: Option<String>) {
-    if !enabled() {
+    if !enabled() || quiet() {
         return;
     }
     let url = format!("{}/{}", base_url().trim_end_matches('/'), path);
