@@ -39,6 +39,9 @@ sha2.workspace = true
 rand.workspace = true
 base64.workspace = true
 ring.workspace = true
+p256.workspace = true
+hkdf.workspace = true
+aes-gcm.workspace = true
 
 indexer-db = { path = "../indexer-db" }
 indexer-actors = { path = "../indexer-actors", features = ["serde", "utoipa"] }

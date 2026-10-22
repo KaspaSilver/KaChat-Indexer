@@ -95,6 +95,7 @@ impl PushApi {
             .route("/unregister", delete(unregister_device))
             .route("/ring", post(ring_call))
             .route("/stats", get(get_push_stats))
+            .route("/web-config", get(get_web_config))
     }
 
     /// Internal-only routes (mounted at /internal/push, NOT publicly proxied). The broadcast +
@@ -174,8 +175,66 @@ pub struct PushRegistrationRequest {
     // Kept out of the auth preimage.
     #[serde(default)]
     pub voip_token: Option<String>,
+    // Web Push subscription (platform "web"): endpoint == device_token, plus the browser's
+    // P-256 key and auth secret. Required on register for platform "web"; an absent one on
+    // update keeps the stored subscription. Kept out of the auth preimage.
+    #[serde(default)]
+    pub web_push: Option<WebPushSubscriptionRequest>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
+}
+
+/// A browser PushSubscription as the web client sends it (KaChat-Desktop WEB_PUSH_SERVER.md).
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct WebPushSubscriptionRequest {
+    /// The push service URL; must equal `device_token`.
+    pub endpoint: String,
+    /// base64url of the subscriber's uncompressed P-256 public key (65 bytes, leading 0x04).
+    pub p256dh: String,
+    /// base64url of the 16-byte auth secret.
+    pub auth: String,
+}
+
+/// Check a `web_push` block and turn it into the stored form. `platform` is None on update,
+/// where the platform is whatever the registration already says; the block is validated
+/// whenever it is present, and required only on a register with platform "web".
+fn validate_web_push(
+    platform: Option<&str>,
+    device_token: &str,
+    web_push: Option<&WebPushSubscriptionRequest>,
+) -> Result<Option<crate::webpush::WebPushSubscription>, PushApiError> {
+    let Some(sub) = web_push else {
+        if platform == Some("web") {
+            return Err(PushApiError::bad_request(
+                "web_push is required for platform web".to_string(),
+            ));
+        }
+        return Ok(None);
+    };
+    if sub.endpoint.trim() != device_token.trim() {
+        return Err(PushApiError::bad_request(
+            "web_push.endpoint must equal device_token".to_string(),
+        ));
+    }
+    let p256dh = decode_base64_any(&sub.p256dh, "web_push.p256dh")?;
+    if p256dh.len() != 65 || p256dh[0] != 0x04 {
+        return Err(PushApiError::bad_request(
+            "web_push.p256dh must be a 65-byte uncompressed P-256 point".to_string(),
+        ));
+    }
+    let auth = decode_base64_any(&sub.auth, "web_push.auth")?;
+    if auth.len() != 16 {
+        return Err(PushApiError::bad_request(
+            "web_push.auth must be 16 bytes".to_string(),
+        ));
+    }
+    use base64::Engine as _;
+    Ok(Some(crate::webpush::WebPushSubscription {
+        endpoint: sub.endpoint.trim().to_string(),
+        // Canonical base64url-no-pad whatever variant arrived, so stored values compare equal.
+        p256dh: URL_SAFE_NO_PAD.encode(&p256dh),
+        auth: URL_SAFE_NO_PAD.encode(&auth),
+    }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -235,6 +294,9 @@ pub struct PushUpdateRequest {
     pub apns_environment: Option<String>,
     #[serde(default)]
     pub voip_token: Option<String>,
+    // Web Push subscription; absent keeps the stored one (see PushRegistrationRequest).
+    #[serde(default)]
+    pub web_push: Option<WebPushSubscriptionRequest>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -769,6 +831,25 @@ fn resolve_kaposts_notify(
     })
 }
 
+/// `GET /v1/push/web-config`: the VAPID public key the browser subscribes with, or 404 when
+/// this server has no Web Push. Public and cacheable; the client re-reads it every few hours
+/// and re-subscribes by itself after a key rotation.
+async fn get_web_config() -> axum::response::Response {
+    match crate::webpush::configured_public_key() {
+        Some(key) => (
+            StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "public, max-age=3600")],
+            Json(serde_json::json!({ "vapid_public_key": key })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "web push is not configured" })),
+        )
+            .into_response(),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/v1/push/register",
@@ -834,6 +915,15 @@ async fn register_device(
         );
     }
 
+    let web_push = match validate_web_push(
+        Some(payload.platform.trim().to_ascii_lowercase().as_str()),
+        &payload.device_token,
+        payload.web_push.as_ref(),
+    ) {
+        Ok(web_push) => web_push,
+        Err(err) => return Err(err.into_response()),
+    };
+
     let result = state
         .registry
         .register(
@@ -852,6 +942,7 @@ async fn register_device(
             payload.watch_only_addresses,
             payload.apns_environment,
             payload.voip_token,
+            web_push,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )
@@ -913,6 +1004,11 @@ async fn update_registration(
         payload.kaposts_notify_follows,
     );
 
+    let web_push = match validate_web_push(None, &payload.device_token, payload.web_push.as_ref()) {
+        Ok(web_push) => web_push,
+        Err(err) => return Err(err.into_response()),
+    };
+
     let result = state
         .registry
         .update(
@@ -930,6 +1026,7 @@ async fn update_registration(
             payload.watch_only_addresses,
             payload.apns_environment,
             payload.voip_token,
+            web_push,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )

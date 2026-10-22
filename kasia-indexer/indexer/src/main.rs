@@ -62,6 +62,7 @@ mod fcm;
 mod push;
 mod signals;
 mod stats_windows;
+mod webpush;
 
 /// Load the personal-mode address allowlist (KaChat fork). The admin dashboard writes one
 /// address per line to `KASIA_PERSONAL_FILE` (default `/app/data/personal_addresses.txt`) and

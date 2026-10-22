@@ -2,6 +2,7 @@ use crate::api::to_rpc_address;
 use crate::config::ApnsEnvironment;
 use crate::context::IndexerContext;
 use crate::fcm::{FcmClient, FcmError};
+use crate::webpush::{self, WebPushClient, WebPushConfig, WebPushSendResult, WebPushSubscription};
 use futures_util::{StreamExt, stream};
 use indexer_actors::metrics::SharedMetrics;
 use indexer_actors::push::{ExtensionPushEvent, FundsPushEvent, PushEvent, PushEventKind};
@@ -36,7 +37,7 @@ const MAX_ALIAS_LEN_BYTES: usize = 64;
 const MAX_ADDRESS_LEN_BYTES: usize = 128;
 const MAX_PLATFORM_LEN_BYTES: usize = 16;
 const WALLET_PUBKEY_HEX_LEN: usize = 64;
-const SUPPORTED_PLATFORMS: &[&str] = &["ios", "macos", "android"];
+const SUPPORTED_PLATFORMS: &[&str] = &["ios", "macos", "android", "web"];
 /// FCM registration tokens are case-sensitive and much longer than APNs hex tokens; these bound
 /// what we accept for `platform=android`.
 const MIN_FCM_TOKEN_LEN: usize = 64;
@@ -46,6 +47,7 @@ pub const PUSH_REGISTRY_COMMAND_CAPACITY: usize = 256;
 const MAX_PUSH_FANOUT: usize = 512;
 const APNS_SEND_CONCURRENCY: usize = 16;
 const FCM_SEND_CONCURRENCY: usize = 16;
+const WEB_SEND_CONCURRENCY: usize = 16;
 /// Address Activity: at most this many funds pushes per device within `WATCH_ONLY_RATE_WINDOW`.
 const WATCH_ONLY_RATE_MAX: usize = 30;
 const WATCH_ONLY_RATE_WINDOW: Duration = Duration::from_secs(3600);
@@ -116,6 +118,7 @@ impl PushRegistry {
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
+        web_push: Option<WebPushSubscription>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -156,6 +159,9 @@ impl PushRegistry {
             .or_else(|| existing.as_ref().and_then(|reg| reg.apns_environment.clone()));
         let normalized_voip_token = requested_voip_token
             .or_else(|| existing.as_ref().and_then(|reg| reg.voip_token.clone()));
+        // An absent web_push keeps the stored subscription (partial updates must not clobber).
+        let normalized_web_push =
+            web_push.or_else(|| existing.as_ref().and_then(|reg| reg.web_push.clone()));
         let effective_wallet_binding = resolve_wallet_binding(existing.as_ref(), wallet_binding)?;
         let effective_wallet_pubkey = effective_wallet_binding
             .as_ref()
@@ -231,6 +237,7 @@ impl PushRegistry {
                     && reg.watch_only_addresses == normalized_watch_only
                     && reg.apns_environment == normalized_apns_environment
                     && reg.voip_token == normalized_voip_token
+                    && reg.web_push == normalized_web_push
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -277,6 +284,7 @@ impl PushRegistry {
             watch_only_addresses: normalized_watch_only,
             apns_environment: normalized_apns_environment,
             voip_token: normalized_voip_token,
+            web_push: normalized_web_push,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -427,6 +435,7 @@ impl PushRegistry {
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
+        web_push: Option<WebPushSubscription>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -466,6 +475,9 @@ impl PushRegistry {
             .or_else(|| existing.as_ref().and_then(|reg| reg.apns_environment.clone()));
         let normalized_voip_token = requested_voip_token
             .or_else(|| existing.as_ref().and_then(|reg| reg.voip_token.clone()));
+        // An absent web_push keeps the stored subscription (partial updates must not clobber).
+        let normalized_web_push =
+            web_push.or_else(|| existing.as_ref().and_then(|reg| reg.web_push.clone()));
         let effective_wallet_binding = resolve_wallet_binding(existing.as_ref(), wallet_binding)?;
         let effective_wallet_pubkey = effective_wallet_binding
             .as_ref()
@@ -541,6 +553,7 @@ impl PushRegistry {
                     && reg.watch_only_addresses == normalized_watch_only
                     && reg.apns_environment == normalized_apns_environment
                     && reg.voip_token == normalized_voip_token
+                    && reg.web_push == normalized_web_push
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -585,6 +598,7 @@ impl PushRegistry {
             watch_only_addresses: normalized_watch_only,
             apns_environment: normalized_apns_environment,
             voip_token: normalized_voip_token,
+            web_push: normalized_web_push,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -1162,6 +1176,19 @@ impl PushRegistry {
     /// Each token's stored APNs environment ("sandbox"/"production"), or `None` when unknown. Used
     /// by the dispatcher to route each APNs push to the right host (and to skip the host-fallback
     /// probe for devices whose environment is already known).
+    fn web_push_for_tokens(
+        &self,
+        tokens: &[String],
+    ) -> anyhow::Result<HashMap<String, Option<WebPushSubscription>>> {
+        let mut map = HashMap::with_capacity(tokens.len());
+        for token in tokens {
+            if let Some(registration) = self.get_registration(token)? {
+                map.insert(token.clone(), registration.web_push);
+            }
+        }
+        Ok(map)
+    }
+
     fn apns_environment_for_tokens(
         &self,
         tokens: &[String],
@@ -1458,6 +1485,7 @@ enum PushRegistryCommand {
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
+        web_push: Option<WebPushSubscription>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1477,6 +1505,7 @@ enum PushRegistryCommand {
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
+        web_push: Option<WebPushSubscription>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1548,6 +1577,10 @@ enum PushRegistryCommand {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, Option<String>>>,
     },
+    WebPushForTokens {
+        tokens: Vec<String>,
+        response: RegistryResponse<HashMap<String, Option<WebPushSubscription>>>,
+    },
     SetApnsEnvironment {
         token: String,
         environment: String,
@@ -1608,6 +1641,7 @@ impl PushRegistryActor {
                     watch_only_addresses,
                     apns_environment,
                     voip_token,
+                    web_push,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1628,6 +1662,7 @@ impl PushRegistryActor {
                         watch_only_addresses,
                         apns_environment,
                         voip_token,
+                        web_push,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1648,6 +1683,7 @@ impl PushRegistryActor {
                     watch_only_addresses,
                     apns_environment,
                     voip_token,
+                    web_push,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1667,6 +1703,7 @@ impl PushRegistryActor {
                         watch_only_addresses,
                         apns_environment,
                         voip_token,
+                        web_push,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1770,6 +1807,10 @@ impl PushRegistryActor {
                     let result = self.registry.apns_environment_for_tokens(&tokens);
                     let _ = response.send(result);
                 }
+                PushRegistryCommand::WebPushForTokens { tokens, response } => {
+                    let result = self.registry.web_push_for_tokens(&tokens);
+                    let _ = response.send(result);
+                }
                 PushRegistryCommand::SetApnsEnvironment {
                     token,
                     environment,
@@ -1839,6 +1880,7 @@ impl PushRegistryHandle {
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
+        web_push: Option<WebPushSubscription>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1858,6 +1900,7 @@ impl PushRegistryHandle {
             watch_only_addresses,
             apns_environment,
             voip_token,
+            web_push,
             wallet_binding,
             device_key_binding,
             response,
@@ -1882,6 +1925,7 @@ impl PushRegistryHandle {
         watch_only_addresses: Vec<String>,
         apns_environment: Option<String>,
         voip_token: Option<String>,
+        web_push: Option<WebPushSubscription>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1900,6 +1944,7 @@ impl PushRegistryHandle {
             watch_only_addresses,
             apns_environment,
             voip_token,
+            web_push,
             wallet_binding,
             device_key_binding,
             response,
@@ -2061,6 +2106,15 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// Map each `web` token to its stored browser subscription (None if the record lacks one).
+    pub async fn web_push_for_tokens(
+        &self,
+        tokens: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, Option<WebPushSubscription>>> {
+        self.request(|response| PushRegistryCommand::WebPushForTokens { tokens, response })
+            .await
+    }
+
     /// Persist a discovered APNs environment ("sandbox"/"production") onto a device record.
     pub async fn set_apns_environment(
         &self,
@@ -2193,6 +2247,10 @@ pub struct DeviceRegistration {
     // VoIP (PushKit) push token for incoming-call rings. None = no VoIP capability. Value only.
     #[serde(default)]
     pub voip_token: Option<String>,
+    // Web Push (platform "web"): the browser subscription behind this endpoint token. Outside
+    // the auth preimage, like every optional field added after LegacyV1. Value only.
+    #[serde(default)]
+    pub web_push: Option<WebPushSubscription>,
     #[serde(default)]
     pub app_attest_key_id: Option<String>,
     #[serde(default)]
@@ -2235,6 +2293,7 @@ pub struct PushDispatcher {
     enabled: bool,
     apns: Option<ApnsClient>,
     fcm: Option<FcmClient>,
+    web: Option<WebPushClient>,
     network_type: RpcNetworkType,
     sent_cache: SentTxCache,
     invalid_token_counts: HashMap<String, u8>,
@@ -2272,6 +2331,22 @@ impl PushDispatcher {
                 None
             }
         };
+        let web = match WebPushConfig::from_env() {
+            Some(config) => match WebPushClient::new(config) {
+                Ok(client) => {
+                    info!("[Push] Web Push enabled (VAPID key loaded)");
+                    Some(client)
+                }
+                Err(err) => {
+                    warn!("[Push] Web Push disabled: {err:#}");
+                    None
+                }
+            },
+            None => {
+                info!("[Push] Web Push disabled: no VAPID key configured");
+                None
+            }
+        };
         // Master switch: absent (or any value other than a clear "off") means enabled, so
         // deployments that never set it keep working exactly as before.
         let enabled = std::env::var("KACHAT_PUSH_ENABLED")
@@ -2292,6 +2367,7 @@ impl PushDispatcher {
             enabled,
             apns,
             fcm,
+            web,
             network_type: context.network_type,
             // Dedup window across BOTH the block-processor (real-time) and virtual-chain
             // (acceptance) emits, plus any reprocessing. 60s was too short — if acceptance landed
@@ -2742,7 +2818,7 @@ impl PushDispatcher {
     }
 
     fn push_enabled(&self) -> bool {
-        self.enabled && (self.apns.is_some() || self.fcm.is_some())
+        self.enabled && (self.apns.is_some() || self.fcm.is_some() || self.web.is_some())
     }
 
     /// Route a fan-out set of tokens to the correct transport per registered platform: APNs for
@@ -2772,20 +2848,24 @@ impl PushDispatcher {
             .unwrap_or_default();
         let mut apns_tokens = Vec::new();
         let mut fcm_tokens = Vec::new();
+        let mut web_tokens = Vec::new();
         for token in tokens {
             match platforms.get(&token).map(String::as_str) {
                 Some("android") => fcm_tokens.push(token),
+                Some("web") => web_tokens.push(token),
                 // ios / macos / unknown => APNs (legacy default).
                 _ => apns_tokens.push(token),
             }
         }
 
         info!(
-            "[Push] deliver split: apns={} fcm={} (apns_configured={} fcm_configured={})",
+            "[Push] deliver split: apns={} fcm={} web={} (apns_configured={} fcm_configured={} web_configured={})",
             apns_tokens.len(),
             fcm_tokens.len(),
+            web_tokens.len(),
             self.apns.is_some(),
             self.fcm.is_some(),
+            self.web.is_some(),
         );
 
         let mut outcomes: Vec<(String, DeliveryOutcome)> = Vec::new();
@@ -2835,6 +2915,52 @@ impl PushDispatcher {
                 (token, DeliveryOutcome::from_fcm(result))
             }))
             .buffer_unordered(FCM_SEND_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+            outcomes.extend(results);
+        }
+
+        if let Some(web) = self.web.as_ref()
+            && !web_tokens.is_empty()
+        {
+            // The payload the service worker reads: the FCM data map plus `v`, minus the
+            // encrypted body (the worker cannot decrypt, and it would eat the 4 KB record).
+            // Public bodies stay as sent, held to 1000 chars (KaChat-Desktop WEB_PUSH_SERVER.md).
+            let mut map = fcm_data.clone();
+            map.remove("enc_payload");
+            map.insert("v".to_string(), "1".to_string());
+            for key in ["body", "subtitle", "title"] {
+                if let Some(value) = map.get_mut(key)
+                    && value.chars().count() > 1000
+                {
+                    *value = value.chars().take(1000).collect();
+                }
+            }
+            let event_type = map.get("type").cloned().unwrap_or_default();
+            let (ttl, urgency) = webpush::ttl_and_urgency(&event_type);
+            let topic = webpush::topic_for(&event_type, map.get("dedup").map(String::as_str));
+            let payload = serde_json::to_string(&map).unwrap_or_default();
+            let subscriptions = self
+                .registry
+                .web_push_for_tokens(web_tokens.clone())
+                .await
+                .unwrap_or_default();
+            let payload = payload.as_str();
+            let topic = topic.as_deref();
+            let results = stream::iter(web_tokens.into_iter().map(|token| {
+                let subscription = subscriptions.get(&token).cloned().flatten();
+                async move {
+                    let outcome = match subscription {
+                        Some(subscription) => DeliveryOutcome::from_web(
+                            web.send(&subscription, payload.as_bytes(), ttl, urgency, topic).await,
+                        ),
+                        // A web token without its subscription can never be delivered to.
+                        None => DeliveryOutcome::Unregistered,
+                    };
+                    (token, outcome)
+                }
+            }))
+            .buffer_unordered(WEB_SEND_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
             outcomes.extend(results);
@@ -3105,6 +3231,15 @@ enum DeliveryOutcome {
 }
 
 impl DeliveryOutcome {
+    fn from_web(result: WebPushSendResult) -> Self {
+        match result {
+            WebPushSendResult::Delivered => Self::Delivered,
+            WebPushSendResult::Unregistered => Self::Unregistered,
+            WebPushSendResult::Auth(err) => Self::AuthFailed(err),
+            WebPushSendResult::Failed(err) => Self::Failed(err),
+        }
+    }
+
     fn from_apns(result: Result<(), ApnsError>) -> Self {
         match result {
             Ok(()) => Self::Delivered,
@@ -3629,6 +3764,20 @@ impl ApnsClient {
 /// `device_token_hash` matches what the server computes here.
 pub(crate) fn normalize_device_token(token: &str) -> anyhow::Result<String> {
     let trimmed = token.trim();
+    // Web Push (platform "web"): the subscription endpoint URL, kept exactly as sent (trimmed).
+    // Only the known browser push services are accepted, so the sender can never be pointed at
+    // an arbitrary URL.
+    if trimmed.starts_with("https://") {
+        if trimmed.len() > webpush::MAX_WEB_ENDPOINT_LEN
+            || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            anyhow::bail!("Invalid web push endpoint");
+        }
+        if !webpush::endpoint_host_allowed(trimmed) {
+            anyhow::bail!("Unsupported web push endpoint host");
+        }
+        return Ok(trimmed.to_string());
+    }
     // If every non-whitespace char is a hex digit, treat it as an APNs token (legacy behavior:
     // strip separators, lowercase). Any other char (`:`, `_`, `-`, or g-z/G-Z) => FCM token.
     let is_apns_hex = !trimmed
@@ -4215,6 +4364,30 @@ mod tests {
     }
 
     #[test]
+    fn normalize_device_token_accepts_a_web_endpoint_verbatim() {
+        let endpoint = "https://web.push.apple.com/QGuQyavXutnMH6bR9";
+        assert_eq!(normalize_device_token(endpoint).unwrap(), endpoint);
+        assert_eq!(
+            normalize_device_token("  https://fcm.googleapis.com/fcm/send/eYk3:APA91bH  ").unwrap(),
+            "https://fcm.googleapis.com/fcm/send/eYk3:APA91bH"
+        );
+    }
+
+    #[test]
+    fn normalize_device_token_rejects_bad_web_endpoints() {
+        // An unknown host (SSRF), embedded whitespace, and one past the length cap.
+        assert!(normalize_device_token("https://evil.example.com/push").is_err());
+        assert!(normalize_device_token("https://web.push.apple.com/a b").is_err());
+        let long = format!("https://web.push.apple.com/{}", "a".repeat(2050));
+        assert!(normalize_device_token(&long).is_err());
+    }
+
+    #[test]
+    fn normalize_platform_accepts_web() {
+        assert_eq!(normalize_platform("Web".to_string()).unwrap(), "web");
+    }
+
+    #[test]
     fn normalize_device_token_rejects_bad_fcm_chars() {
         // '/' is outside the FCM charset.
         let bad = format!("has/slash{}", "a".repeat(64));
@@ -4300,6 +4473,7 @@ mod tests {
             app_attest_sign_count: None,
             apns_environment: None,
             voip_token: None,
+            web_push: None,
             created_at: 0,
             last_seen: 0,
         };
@@ -4365,6 +4539,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("registration succeeds");
@@ -4407,6 +4582,7 @@ mod tests {
                 None,
                 vec![],
                 vec![],
+                None,
                 None,
                 None,
                 None,
@@ -4483,6 +4659,7 @@ mod tests {
                     None,
                     vec![],
                     vec![],
+                    None,
                     None,
                     None,
                     None,
@@ -4643,6 +4820,7 @@ mod kaposts_watch_tests {
                     None,
                     watch,
                     vec![],
+                    None,
                     None,
                     None,
                     None,
