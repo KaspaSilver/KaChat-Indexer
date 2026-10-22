@@ -1496,7 +1496,7 @@ impl DatabaseInterface for PostgresDbManager {
                    b.base64_encoded_profile_image,
                    COALESCE(b.base64_encoded_message, '') as base64_encoded_message
             FROM k_blocks kb
-            LEFT JOIN k_broadcasts b ON b.sender_pubkey = kb.blocked_user_pubkey
+            LEFT JOIN k_broadcasts b ON substring(b.sender_pubkey from 2) = substring(kb.blocked_user_pubkey from 2)
             WHERE kb.sender_pubkey = $1
             "#,
         );
