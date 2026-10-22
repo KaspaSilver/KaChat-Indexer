@@ -336,7 +336,7 @@ async fn get_health(State(state): State<AppState>) -> Result<Json<HealthResponse
         advancing
     };
 
-    let status = if newest_tx == 0 {
+    let mut status = if newest_tx == 0 {
         "starting"
     } else if node_lag_ms < 120_000 {
         "healthy"
@@ -347,6 +347,21 @@ async fn get_health(State(state): State<AppState>) -> Result<Json<HealthResponse
     } else {
         "stalled"
     };
+
+    // Ingestion being current says nothing about the processor (the KaPosts/profile/names
+    // writer): with its heartbeat stale the dashboard's rollup read "healthy" over a red
+    // Processor tile for a day. A stale or missing heartbeat is at least degraded.
+    if status == "healthy" || status == "catching_up" {
+        let hb: Option<String> = sqlx::query_scalar("SELECT value FROM k_vars WHERE key = 'processor_heartbeat'")
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+        let fresh = hb.and_then(|v| v.parse::<i64>().ok()).is_some_and(|ts| now - ts < 90_000);
+        if !fresh {
+            status = "degraded";
+        }
+    }
 
     Ok(Json(HealthResponse {
         db_ok: true,
