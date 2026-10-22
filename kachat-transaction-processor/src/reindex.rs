@@ -8,13 +8,17 @@
 //!   again, which covers a restart or a short outage without anyone doing anything.
 //! - `run`: a reindex on request (`k_vars` key `kaposts_reindex_request`, written by the admin
 //!   API from the panel's Indexer tab). It walks every block the node still holds, from its
-//!   pruning point to the tip, and inserts the KaChat transactions it finds into `transactions`
-//!   (ON CONFLICT DO NOTHING, the few columns the processor reads). The insert trigger then
-//!   notifies the workers like for any new transaction, so everything goes through the normal
-//!   path and every write stays idempotent. Progress is in `kaposts_reindex_status`.
+//!   pruning point to the tip, stores the KaChat transactions it finds that are not indexed yet
+//!   in `kachat_recovered_transactions` (its own table: the ingester prunes `transactions` by
+//!   block time every hour, so an old row put there would be gone before a worker read it,
+//!   kachat-audits IDX-036) and queues them to the workers like the LISTEN channel does. Workers
+//!   read the row from that table when `transactions` has none. Progress is in
+//!   `kaposts_reindex_status`; a status left at "running" by a restart mid-walk is marked failed
+//!   at the next start (IDX-037).
 //!
-//! Pushes stay quiet for anything older than a few minutes either way (worker.rs): a day-old
-//! like is history, not news.
+//! Order does not matter: profiles keep the newest by block time, and a follow or block is
+//! ignored when a newer opposing action is known (k_protocol.rs, IDX-035). Pushes stay quiet
+//! for anything older than a few minutes (worker.rs): a day-old like is history, not news.
 
 use crate::bcast_pending::now_ms;
 use crate::database::DbPool;
@@ -96,8 +100,25 @@ fn is_kachat(payload: &[u8]) -> bool {
     PREFIXES.iter().any(|p| payload.starts_with(p))
 }
 
+/// A walk that was still "running" when the processor stopped (a restart mid-walk, an
+/// update) would otherwise read as running forever, and the admin refuses a new request while
+/// one runs (kachat-audits IDX-037).
+async fn reset_stale_status(pool: &DbPool) {
+    let Some(raw) = get_var(pool, STATUS_KEY).await else { return };
+    let Ok(mut v) = serde_json::from_str::<Value>(&raw) else { return };
+    if v["state"].as_str() != Some("running") {
+        return;
+    }
+    v["state"] = json!("failed");
+    v["error"] = json!("interrupted: the processor restarted during the walk; run it again");
+    v["finished_at"] = json!(now_ms());
+    set_var(pool, STATUS_KEY, &v.to_string()).await;
+    warn!("reindex: a walk was running when the processor last stopped; marked failed");
+}
+
 /// Waits for a request, runs it, records how it went; for the life of the processor.
-pub async fn run(pool: DbPool) {
+pub async fn run(pool: DbPool, queue: mpsc::UnboundedSender<String>) {
+    reset_stale_status(&pool).await;
     loop {
         tokio::time::sleep(POLL).await;
         let Some(req) = get_var(&pool, REQUEST_KEY).await else { continue };
@@ -107,7 +128,7 @@ pub async fn run(pool: DbPool) {
         let mut st = Status { state: "running", started_at: now_ms(), ..Default::default() };
         set_var(&pool, STATUS_KEY, &st.json()).await;
         info!("reindex: starting a walk of the node's blocks{}", from_ms.map(|f| format!(" from {f}")).unwrap_or_default());
-        match walk(&pool, from_ms, &mut st).await {
+        match walk(&pool, &queue, from_ms, &mut st).await {
             Ok(()) => {
                 st.state = "done";
                 info!("reindex: done: {} blocks, {} KaChat transactions seen, {} queued for indexing", st.blocks, st.found, st.queued);
@@ -123,8 +144,19 @@ pub async fn run(pool: DbPool) {
     }
 }
 
+/// Already in one of the processor's tables under this transaction id: indexed, nothing to do.
+async fn already_indexed(pool: &DbPool, tx_id: &[u8]) -> Result<bool> {
+    let hit: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM k_contents WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_votes WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_follows WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_blocks WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_recovered_transactions WHERE transaction_id = $1          LIMIT 1",
+    )
+    .bind(tx_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(hit.is_some())
+}
+
 /// Pruning point to tip, a page of blocks at a time.
-async fn walk(pool: &DbPool, from_ms: Option<i64>, st: &mut Status) -> Result<()> {
+async fn walk(pool: &DbPool, queue: &mpsc::UnboundedSender<String>, from_ms: Option<i64>, st: &mut Status) -> Result<()> {
     let node = crate::bcast_sender::node().ok_or_else(|| anyhow!("no node is configured (KASPA_NODE_WBORSH_URL)"))?;
     if !node.is_connected() {
         return Err(anyhow!("the node is not connected"));
@@ -153,17 +185,29 @@ async fn walk(pool: &DbPool, from_ms: Option<i64>, st: &mut Status) -> Result<()
                 }
                 let Some(v) = &tx.verbose_data else { continue };
                 st.found += 1;
+                let id = v.transaction_id.as_bytes().to_vec();
+                // Edits, deletes, tips, polls and unfollows leave rows the check does not look
+                // at (or none at all): those are queued again, which the guards make harmless.
+                if already_indexed(pool, &id).await? {
+                    continue;
+                }
                 let r = sqlx::query(
-                    "INSERT INTO transactions (transaction_id, payload, block_time, block_hash) \
-                     VALUES ($1, $2, $3, $4) ON CONFLICT (transaction_id) DO NOTHING",
+                    "INSERT INTO kachat_recovered_transactions (transaction_id, payload, block_time, block_hash, inserted_at) \
+                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (transaction_id) DO NOTHING",
                 )
-                .bind(v.transaction_id.as_bytes().to_vec())
+                .bind(&id)
                 .bind(tx.payload.clone())
                 .bind(v.block_time as i64)
                 .bind(hash.as_bytes().to_vec())
+                .bind(now_ms())
                 .execute(pool)
                 .await?;
-                st.queued += r.rows_affected();
+                if r.rows_affected() > 0 {
+                    st.queued += 1;
+                    if queue.send(hex::encode(&id)).is_err() {
+                        return Err(anyhow!("the worker queue is closed"));
+                    }
+                }
             }
         }
         let Some(last) = page.block_hashes.last().copied() else { break };

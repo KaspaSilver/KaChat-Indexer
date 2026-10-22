@@ -1246,7 +1246,7 @@ impl KProtocolProcessor {
             BcastMode::Retry(hash) => hash.to_vec(),
             BcastMode::Live => {
                 let block_hash: Option<Vec<u8>> = sqlx::query_scalar(
-                    "SELECT block_hash FROM transactions WHERE transaction_id = $1",
+                    "SELECT block_hash FROM transactions WHERE transaction_id = $1 UNION ALL SELECT block_hash FROM kachat_recovered_transactions WHERE transaction_id = $1 LIMIT 1",
                 )
                 .bind(&transaction_id_bytes)
                 .fetch_optional(&self.db_pool)
@@ -2155,19 +2155,29 @@ impl KProtocolProcessor {
             return Ok(());
         }
 
-        // Use a single query to delete existing records and insert the new one atomically (skip if transaction already exists)
+        // Replace the person's profile, in one statement, unless they already have a NEWER one
+        // by block time: a reindex or a catch-up can process an older broadcast after a newer
+        // one, and the newest on chain must win whatever the order (kachat-audits IDX-035).
         let result = sqlx::query(
             r#"
-            WITH deleted AS (
+            WITH newer AS (
+                SELECT 1 AS x FROM k_broadcasts
+                WHERE substring(sender_pubkey from 2) = substring($3 from 2)
+                  AND transaction_id != $1 AND block_time > $2
+                LIMIT 1
+            ), deleted AS (
                 DELETE FROM k_broadcasts
                 WHERE substring(sender_pubkey from 2) = substring($3 from 2) AND transaction_id != $1
+                  AND NOT EXISTS (SELECT 1 FROM newer)
                 RETURNING transaction_id
             )
             INSERT INTO k_broadcasts (
                 transaction_id, block_time, sender_pubkey, sender_signature,
                 base64_encoded_nickname, base64_encoded_profile_image, base64_encoded_message,
                 nickname_text
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, convert_from(decode($5, 'base64'), 'UTF8'))
+            )
+            SELECT $1, $2, $3, $4, $5, $6, $7, convert_from(decode($5, 'base64'), 'UTF8')
+            WHERE NOT EXISTS (SELECT 1 FROM newer)
             ON CONFLICT (transaction_id) DO NOTHING
             "#,
         )
@@ -2184,7 +2194,7 @@ impl KProtocolProcessor {
 
         if result.rows_affected() == 0 {
             info!(
-                "Broadcast transaction {} already exists, skipping",
+                "Broadcast transaction {} already exists or is older than the stored profile, skipping",
                 transaction_id
             );
         } else {
@@ -2992,7 +3002,7 @@ impl KProtocolProcessor {
         let block_hash: Option<Vec<u8>> = match mode {
             BcastMode::Retry(hash) => Some(hash.to_vec()),
             BcastMode::Live => sqlx::query_scalar(
-                "SELECT block_hash FROM transactions WHERE transaction_id = $1",
+                "SELECT block_hash FROM transactions WHERE transaction_id = $1 UNION ALL SELECT block_hash FROM kachat_recovered_transactions WHERE transaction_id = $1 LIMIT 1",
             )
             .bind(&transaction_id_bytes)
             .fetch_optional(&self.db_pool)
@@ -3182,6 +3192,16 @@ impl KProtocolProcessor {
         let sender_pubkey_bytes = hex::decode(&k_block.sender_pubkey)?;
         let blocked_user_pubkey_bytes = hex::decode(&k_block.blocked_user_pubkey)?;
 
+        // Last write by block time wins (kachat-audits IDX-035): an older block or unblock
+        // processed after a newer opposing one (a reindex, a catch-up) changes nothing.
+        if !self
+            .relation_is_newest("block", &sender_pubkey_bytes, &blocked_user_pubkey_bytes, &k_block.blocking_action, block_time)
+            .await?
+        {
+            info!("Block action {} is older than a later one for the same pair, skipping", transaction_id);
+            return Ok(());
+        }
+
         match k_block.blocking_action.as_str() {
             "block" => {
                 let transaction_id_bytes = hex::decode(transaction_id)?;
@@ -3241,10 +3261,12 @@ impl KProtocolProcessor {
                     WHERE sender_pubkey = $1
                     AND substring(blocked_user_pubkey from 2) = substring($2 from 2)
                     AND blocking_action = 'block'
+                    AND block_time <= $3
                     "#,
                 )
                 .bind(&sender_pubkey_bytes)
                 .bind(&blocked_user_pubkey_bytes)
+                .bind(block_time)
                 .execute(&self.db_pool)
                 .await?;
 
@@ -3339,6 +3361,14 @@ impl KProtocolProcessor {
                     );
                     return Ok(());
                 }
+                // Last write by block time wins (kachat-audits IDX-035).
+                if !self
+                    .relation_is_newest("follow", &sender_pubkey_bytes, &followed_user_pubkey_bytes, "follow", block_time)
+                    .await?
+                {
+                    info!("Follow {} is older than a later unfollow of the same person, skipping", transaction_id);
+                    return Ok(());
+                }
 
                 // Insert follow record (skip if same sender already follows this user)
                 let result = sqlx::query(
@@ -3385,17 +3415,28 @@ impl KProtocolProcessor {
                 }
             }
             "unfollow" => {
-                // Delete any existing "follow" record for the same sender and followed user
+                // Last write by block time wins (kachat-audits IDX-035): an unfollow older than
+                // a later follow of the same person changes nothing.
+                if !self
+                    .relation_is_newest("follow", &sender_pubkey_bytes, &followed_user_pubkey_bytes, "unfollow", block_time)
+                    .await?
+                {
+                    info!("Unfollow {} is older than a later follow of the same person, skipping", transaction_id);
+                    return Ok(());
+                }
+                // Delete the follow for the same sender and followed user, unless it is newer.
                 let delete_result = sqlx::query(
                     r#"
                     DELETE FROM k_follows
                     WHERE sender_pubkey = $1
                     AND substring(followed_user_pubkey from 2) = substring($2 from 2)
                     AND following_action = 'follow'
+                    AND block_time <= $3
                     "#,
                 )
                 .bind(&sender_pubkey_bytes)
                 .bind(&followed_user_pubkey_bytes)
+                .bind(block_time)
                 .execute(&self.db_pool)
                 .await?;
 
@@ -3416,6 +3457,38 @@ impl KProtocolProcessor {
         }
 
         Ok(())
+    }
+
+    /// kachat-audits IDX-035: records `action` as the newest for (kind, sender, x-only target)
+    /// and says whether it is. False when a later action for the same pair is already known,
+    /// so the caller changes nothing: whatever order a reindex or catch-up processes
+    /// transactions in, the last one on chain wins. A tie (same block time) lets the later
+    /// processed one through, which for the same transaction is the idempotent re-run.
+    async fn relation_is_newest(
+        &self,
+        kind: &str,
+        sender_pubkey: &[u8],
+        target_pubkey: &[u8],
+        action: &str,
+        block_time: i64,
+    ) -> Result<bool> {
+        let r = sqlx::query(
+            r#"
+            INSERT INTO kachat_relation_last (kind, sender_pubkey, target_xonly, action, block_time)
+            VALUES ($1, $2, substring($3 from 2), $4, $5)
+            ON CONFLICT (kind, sender_pubkey, target_xonly) DO UPDATE
+                SET action = EXCLUDED.action, block_time = EXCLUDED.block_time
+                WHERE kachat_relation_last.block_time <= EXCLUDED.block_time
+            "#,
+        )
+        .bind(kind)
+        .bind(sender_pubkey)
+        .bind(target_pubkey)
+        .bind(action)
+        .bind(block_time)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
     }
 }
 

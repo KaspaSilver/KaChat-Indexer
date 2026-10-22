@@ -285,7 +285,8 @@ async fn main() -> Result<()> {
 
     // Missed KaPosts: a reindex of the node's blocks on request (the panel's Indexer tab), and
     // once at start whatever landed in the last hour while nothing was listening (reindex.rs).
-    let _reindex_handle = tokio::spawn(reindex::run(database.pool().clone()));
+    let reindex_sender = catch_up_sender.clone();
+    let _reindex_handle = tokio::spawn(reindex::run(database.pool().clone(), reindex_sender));
     let catch_up_pool = database.pool().clone();
     let _catch_up_handle = tokio::spawn(async move {
         reindex::startup_catch_up(&catch_up_pool, catch_up_sender).await;
@@ -304,6 +305,11 @@ async fn main() -> Result<()> {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             let cutoff = now_ms - retention_ms;
+            // Recovered transactions (reindex.rs) are read once by a worker; a week is plenty.
+            let _ = sqlx::query("DELETE FROM kachat_recovered_transactions WHERE inserted_at < $1")
+                .bind(now_ms - 7 * 86_400_000)
+                .execute(&prune_pool)
+                .await;
             match sqlx::query("DELETE FROM kachat_broadcasts WHERE block_time < $1")
                 .bind(cutoff)
                 .execute(&prune_pool)

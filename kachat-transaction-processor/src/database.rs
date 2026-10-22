@@ -204,6 +204,10 @@ impl KDbClient {
         // Step 1j: the K broadcast signature ledger (kachat-audits IDX-031).
         self.create_broadcast_signature_ledger().await?;
 
+        // Step 1k: recovered transactions (kachat-audits IDX-036) and the newest follow/block
+        // action per pair (IDX-035), both for reindex.rs.
+        self.create_recovery_schema().await?;
+
         // Step 2: idempotently (re)assert the notification function + trigger on EVERY startup,
         // regardless of fresh/upgrade/up-to-date branch and regardless of `upgrade_db`.
         // This self-heals a trigger dropped by a simply-kaspa-indexer schema migration
@@ -240,6 +244,44 @@ impl KDbClient {
             "INSERT INTO kachat_broadcast_signatures (sender_signature, transaction_id) \
              SELECT sender_signature, transaction_id FROM k_broadcasts \
              ON CONFLICT (sender_signature) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// kachat-audits IDX-036 / IDX-035. `kachat_recovered_transactions` holds what a reindex
+    /// recovers from the node's blocks: the ingester's `transactions` table is pruned hourly by
+    /// block time, so an old recovered row would be gone before a worker read it. Workers read
+    /// from here when `transactions` has no row; the processor prunes it by `inserted_at`.
+    /// `kachat_relation_last` is the newest follow/unfollow (kind follow) or block/unblock (kind
+    /// block) seen per sender and x-only target, so a replayed older action never undoes a newer
+    /// one: last write by block time wins, whatever order transactions are processed in.
+    async fn create_recovery_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_recovered_transactions (
+                transaction_id BYTEA PRIMARY KEY,
+                payload BYTEA,
+                block_time BIGINT,
+                block_hash BYTEA,
+                inserted_at BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_relation_last (
+                kind TEXT NOT NULL,
+                sender_pubkey BYTEA NOT NULL,
+                target_xonly BYTEA NOT NULL,
+                action TEXT NOT NULL,
+                block_time BIGINT NOT NULL,
+                PRIMARY KEY (kind, sender_pubkey, target_xonly)
+            )
+            "#,
         )
         .execute(&self.pool)
         .await?;
@@ -764,14 +806,13 @@ pub async fn fetch_transaction(
     // Convert hex string back to bytea for database query
     let transaction_id_bytes = hex::decode(transaction_id_hex)?;
 
+    // The ingester's row, else the copy a reindex recovered (kachat-audits IDX-036).
     let row = sqlx::query(
         r#"
-        SELECT 
-            transaction_id,
-            payload,
-            block_time
-        FROM transactions 
-        WHERE transaction_id = $1
+        SELECT transaction_id, payload, block_time FROM transactions WHERE transaction_id = $1
+        UNION ALL
+        SELECT transaction_id, payload, block_time FROM kachat_recovered_transactions WHERE transaction_id = $1
+        LIMIT 1
         "#,
     )
     .bind(&transaction_id_bytes)

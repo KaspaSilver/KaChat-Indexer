@@ -1687,6 +1687,9 @@ async fn post_content_delete(
 struct ReindexRequest {
     /// Skip blocks older than this (unix ms); absent = everything the node still holds.
     from_ms: Option<i64>,
+    /// Ask even while the status still says running: for a walk that stopped with the
+    /// processor and never wrote its end (kachat-audits IDX-037).
+    force: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1722,7 +1725,7 @@ async fn post_kaposts_reindex(
 ) -> Result<Json<ReindexView>, ApiError> {
     let view = reindex_view(&state.pool).await?;
     let running = view.status.as_ref().and_then(|s| s["state"].as_str()) == Some("running");
-    if view.requested || running {
+    if (view.requested || running) && req.force != Some(true) {
         return Err(ApiError::bad_request("A reindex is already running or waiting to start."));
     }
     let value = serde_json::json!({ "requested_at": now_ms(), "from_ms": req.from_ms }).to_string();
