@@ -1328,7 +1328,39 @@ fn position_key(board: &Board) -> String {
 
 // MARK: Leaderboard (§6 two boards, realized from the reduced state)
 
-fn leaderboard(tournaments: &HashMap<String, Tournament>) -> Vec<LeaderboardRow> {
+/// The leaderboards started fresh at this moment (2026-10-22 05:46 UTC): anything that started
+/// earlier never counts on either period. Must equal the app's
+/// ChessTournamentEngine.leaderboardFreshFromMs.
+pub const LEADERBOARD_FRESH_FROM_MS: i64 = 1_792_647_960_000;
+
+/// Start of the UTC calendar month containing `now_ms`, in ms.
+pub fn utc_month_start_ms(now_ms: i64) -> i64 {
+    const DAY_MS: i64 = 86_400_000;
+    let days = now_ms.div_euclid(DAY_MS);
+    // Howard Hinnant's civil_from_days, then days_from_civil for day 1 of that month.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let doe_month_start = 365 * yoe + yoe / 4 - yoe / 100 + (153 * mp + 2) / 5;
+    (era * 146_097 + doe_month_start - 719_468) * DAY_MS
+}
+
+/// The first counted start time for each period: "all" = the fresh-start cutoff, "month" = the
+/// later of the cutoff and the start of the current UTC month.
+pub fn period_since_ms(monthly: bool, now_ms: i64) -> i64 {
+    if monthly {
+        LEADERBOARD_FRESH_FROM_MS.max(utc_month_start_ms(now_ms))
+    } else {
+        LEADERBOARD_FRESH_FROM_MS
+    }
+}
+
+/// A tournament or 1v1 counts in the period it STARTED in (startedAt >= since), with every one
+/// of its games, even ones that end after the month rolls over.
+fn leaderboard(tournaments: &HashMap<String, Tournament>, since_ms: i64) -> Vec<LeaderboardRow> {
     let mut rows: HashMap<String, LeaderboardRow> = HashMap::new();
     fn row<'a>(rows: &'a mut HashMap<String, LeaderboardRow>, address: &str) -> &'a mut LeaderboardRow {
         rows.entry(address.to_string()).or_insert_with(|| LeaderboardRow {
@@ -1347,8 +1379,8 @@ fn leaderboard(tournaments: &HashMap<String, Tournament>) -> Vec<LeaderboardRow>
     }
     for t in tournaments.values() {
         let started_at = match t.started_at {
-            Some(s) => s,
-            None => continue,
+            Some(s) if s >= since_ms => s,
+            _ => continue,
         };
         let is_duel = t.is_duel();
         // A 1v1 is not a tournament: it counts on the 1v1 board only. So the tournament-level
@@ -1444,14 +1476,28 @@ pub struct TournamentSummary {
     pub champion: Option<String>,
 }
 
-/// Replay the arena once and return both the leaderboard and the lobby list.
-pub fn compute_all(rows: Vec<ArenaRow>) -> (Vec<LeaderboardRow>, Vec<TournamentSummary>, u64) {
+/// One replay's derived views: the all-time and this-month leaderboards (both from the
+/// fresh-start cutoff), the lobby list, and the games-started count.
+pub struct ArenaSnapshot {
+    pub all_time: Vec<LeaderboardRow>,
+    pub all_time_since: i64,
+    pub monthly: Vec<LeaderboardRow>,
+    pub monthly_since: i64,
+    pub lobby: Vec<TournamentSummary>,
+    pub games_started: u64,
+}
+
+/// Replay the arena once and return both leaderboards and the lobby list.
+pub fn compute_all(rows: Vec<ArenaRow>, now_ms: i64) -> ArenaSnapshot {
     let events: Vec<ArenaEvent> = rows
         .into_iter()
         .filter_map(|r| arena_event(r.tx_id, r.sender, r.block_time, &r.content))
         .collect();
     let tournaments = reduce(events);
-    let board = leaderboard(&tournaments);
+    let all_time_since = period_since_ms(false, now_ms);
+    let monthly_since = period_since_ms(true, now_ms);
+    let all_time = leaderboard(&tournaments, all_time_since);
+    let monthly = leaderboard(&tournaments, monthly_since);
     // Chess Games (§ stats): games started = every game the reducer created across all rooms (a
     // duel's single game; a tournament's round games as each round begins).
     let games_started: u64 = tournaments.values().map(|t| t.games.len() as u64).sum();
@@ -1484,7 +1530,14 @@ pub fn compute_all(rows: Vec<ArenaRow>) -> (Vec<LeaderboardRow>, Vec<TournamentS
             .cmp(&a.started_at.unwrap_or(0))
             .then(a.id.cmp(&b.id))
     });
-    (board, lobby, games_started)
+    ArenaSnapshot {
+        all_time,
+        all_time_since,
+        monthly,
+        monthly_since,
+        lobby,
+        games_started,
+    }
 }
 
 #[cfg(test)]
@@ -1505,6 +1558,59 @@ mod tests {
                 .filter_map(|r| arena_event(r.tx_id, r.sender, r.block_time, &r.content))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn utc_month_start_matches_the_calendar() {
+        // 2026-10-22 05:46 UTC -> 2026-10-01 00:00 UTC
+        assert_eq!(utc_month_start_ms(1_792_647_960_000), 1_790_812_800_000);
+        // exactly midnight on the 1st stays put; 2024-02-29 -> 2024-02-01; 2027-01-01 rollover
+        assert_eq!(utc_month_start_ms(1_790_812_800_000), 1_790_812_800_000);
+        assert_eq!(utc_month_start_ms(1_709_164_800_000), 1_706_745_600_000);
+        assert_eq!(utc_month_start_ms(1_798_761_600_000 - 1), 1_796_083_200_000);
+        assert_eq!(utc_month_start_ms(1_798_761_600_000), 1_798_761_600_000);
+    }
+
+    #[test]
+    fn periods_start_from_the_fresh_cutoff() {
+        let oct = 1_792_700_000_000; // late Oct 2026: the cutoff is later than Oct 1
+        assert_eq!(period_since_ms(false, oct), LEADERBOARD_FRESH_FROM_MS);
+        assert_eq!(period_since_ms(true, oct), LEADERBOARD_FRESH_FROM_MS);
+        let nov = 1_793_600_000_000; // Nov 2026: month start wins
+        assert_eq!(period_since_ms(false, nov), LEADERBOARD_FRESH_FROM_MS);
+        assert_eq!(period_since_ms(true, nov), 1_793_491_200_000);
+    }
+
+    #[test]
+    fn duels_count_in_the_period_they_started() {
+        // Each duel: two joins, then bob resigns game 1-0 (alice wins). The old one started
+        // before the cutoff but ends after it; it still must not count anywhere.
+        let duel = |id: &str, t0: i64| {
+            let j = |tx: &str, who: &str, bt: i64| {
+                ev(tx, who, bt, &format!(r#"{{"type":"chess_t","v":1,"t":"{}","a":"join"}}"#, id))
+            };
+            vec![
+                j(&format!("{}j1", id), "alice", t0 - 1),
+                j(&format!("{}j2", id), "bob", t0),
+                ev(&format!("{}r", id), "bob", t0 + 60_000, &format!(
+                    r#"{{"type":"chess_t","v":1,"t":"{}","a":"resign","g":"1-0"}}"#, id
+                )),
+            ]
+        };
+        let mut rows = duel("duel-1", LEADERBOARD_FRESH_FROM_MS - 30_000);
+        rows.extend(duel("duel-2", LEADERBOARD_FRESH_FROM_MS + 30_000));
+        let tournaments = events(rows);
+        assert!(tournaments.values().all(|t| t.games.values().all(|g| g.is_over())));
+
+        let wins = |board: &[LeaderboardRow], who: &str| {
+            board.iter().find(|r| r.address == who).map(|r| (r.wins, r.losses)).unwrap_or((0, 0))
+        };
+        let everything = leaderboard(&tournaments, i64::MIN);
+        assert_eq!(wins(&everything, "alice"), (2, 0));
+        let fresh = leaderboard(&tournaments, LEADERBOARD_FRESH_FROM_MS);
+        assert_eq!(wins(&fresh, "alice"), (1, 0));
+        assert_eq!(wins(&fresh, "bob"), (0, 1));
+        assert!(leaderboard(&tournaments, LEADERBOARD_FRESH_FROM_MS + 31_000).is_empty());
     }
 
     #[test]

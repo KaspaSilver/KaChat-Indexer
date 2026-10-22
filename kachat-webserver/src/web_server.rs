@@ -63,6 +63,9 @@ pub struct AppState {
 pub struct ChessCache {
     computed_at: Option<Instant>,
     players: Vec<ChessPlayerRow>,
+    players_since: i64,
+    monthly_players: Vec<ChessPlayerRow>,
+    monthly_since: i64,
     tournaments: Vec<ChessTournamentRow>,
     games_started: u64,
 }
@@ -76,13 +79,42 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// One cached replay: both leaderboard periods, the lobby and the games-started count.
+#[derive(Clone)]
+struct ChessSnapshot {
+    players: Vec<ChessPlayerRow>,
+    players_since: i64,
+    monthly_players: Vec<ChessPlayerRow>,
+    monthly_since: i64,
+    tournaments: Vec<ChessTournamentRow>,
+    games_started: u64,
+}
+
+impl ChessSnapshot {
+    /// `period=month` = this UTC calendar month; anything else = all time (both from the
+    /// fresh-start cutoff, chess::LEADERBOARD_FRESH_FROM_MS).
+    fn board(self, period: Option<&str>) -> (Vec<ChessPlayerRow>, i64, &'static str) {
+        match period.map(|p| p.trim().to_lowercase()).as_deref() {
+            Some("month") | Some("monthly") => (self.monthly_players, self.monthly_since, "month"),
+            _ => (self.players, self.players_since, "all"),
+        }
+    }
+}
+
 /// Serve the leaderboard + lobby from cache, recomputing from the DB when stale.
-async fn chess_snapshot(state: &AppState) -> (Vec<ChessPlayerRow>, Vec<ChessTournamentRow>, u64) {
+async fn chess_snapshot(state: &AppState) -> ChessSnapshot {
     {
         let cache = state.chess_cache.read().await;
         if let Some(at) = cache.computed_at {
             if at.elapsed() < CHESS_CACHE_TTL {
-                return (cache.players.clone(), cache.tournaments.clone(), cache.games_started);
+                return ChessSnapshot {
+                    players: cache.players.clone(),
+                    players_since: cache.players_since,
+                    monthly_players: cache.monthly_players.clone(),
+                    monthly_since: cache.monthly_since,
+                    tournaments: cache.tournaments.clone(),
+                    games_started: cache.games_started,
+                };
             }
         }
     }
@@ -96,24 +128,30 @@ async fn chess_snapshot(state: &AppState) -> (Vec<ChessPlayerRow>, Vec<ChessTour
             content,
         })
         .collect();
-    let (board, lobby, games_started) = crate::chess::compute_all(arena);
-    let players: Vec<ChessPlayerRow> = board
-        .into_iter()
-        .map(|r| ChessPlayerRow {
-            address: r.address,
-            wins: r.wins,
-            losses: r.losses,
-            duel_wins: r.duel_wins,
-            duel_losses: r.duel_losses,
-            tournament_game_wins: r.tournament_game_wins,
-            tournament_game_losses: r.tournament_game_losses,
-            tournaments_played: r.tournaments_played,
-            tournaments_won: r.tournaments_won,
-            tournaments_lost: r.tournaments_lost,
-            last_played_at: r.last_played_at,
-        })
-        .collect();
-    let tournaments: Vec<ChessTournamentRow> = lobby
+    let snap = crate::chess::compute_all(arena, now_ms());
+    let to_rows = |board: Vec<crate::chess::LeaderboardRow>| -> Vec<ChessPlayerRow> {
+        board
+            .into_iter()
+            .map(|r| ChessPlayerRow {
+                address: r.address,
+                wins: r.wins,
+                losses: r.losses,
+                duel_wins: r.duel_wins,
+                duel_losses: r.duel_losses,
+                tournament_game_wins: r.tournament_game_wins,
+                tournament_game_losses: r.tournament_game_losses,
+                tournaments_played: r.tournaments_played,
+                tournaments_won: r.tournaments_won,
+                tournaments_lost: r.tournaments_lost,
+                last_played_at: r.last_played_at,
+            })
+            .collect()
+    };
+    let players = to_rows(snap.all_time);
+    let monthly_players = to_rows(snap.monthly);
+    let games_started = snap.games_started;
+    let tournaments: Vec<ChessTournamentRow> = snap
+        .lobby
         .into_iter()
         .map(|s| ChessTournamentRow {
             id: s.id,
@@ -124,12 +162,23 @@ async fn chess_snapshot(state: &AppState) -> (Vec<ChessPlayerRow>, Vec<ChessTour
             champion: s.champion,
         })
         .collect();
+    let out = ChessSnapshot {
+        players,
+        players_since: snap.all_time_since,
+        monthly_players,
+        monthly_since: snap.monthly_since,
+        tournaments,
+        games_started,
+    };
     let mut cache = state.chess_cache.write().await;
     cache.computed_at = Some(Instant::now());
-    cache.players = players.clone();
-    cache.tournaments = tournaments.clone();
-    cache.games_started = games_started;
-    (players, tournaments, games_started)
+    cache.players = out.players.clone();
+    cache.players_since = out.players_since;
+    cache.monthly_players = out.monthly_players.clone();
+    cache.monthly_since = out.monthly_since;
+    cache.tournaments = out.tournaments.clone();
+    cache.games_started = out.games_started;
+    out
 }
 
 pub struct WebServer {
@@ -290,11 +339,13 @@ struct GetTrendingHashtagsQuery {
 #[derive(Debug, Deserialize)]
 struct ChessLeaderboardQuery {
     limit: Option<u32>,
+    period: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChessPlayerQuery {
     address: Option<String>,
+    period: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1132,7 +1183,7 @@ async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
     let (k, v) = cat("chessMoves", chess_moves); categories.insert(k, v);
 
     // chessGames: games started per the leaderboard reducer (reuses the cached chess snapshot).
-    let (_, _, games_started) = chess_snapshot(app_state).await;
+    let games_started = chess_snapshot(app_state).await.games_started;
     categories.insert("chessGames".to_string(), serde_json::json!({ "total": games_started }));
 
     // .kachat (KACHAT_NAMES_REGISTRY_V3.md §10): counted from the names follower's history, one
@@ -2160,22 +2211,25 @@ async fn handle_get_contents_following(
 /// Fork addition: GET /get-broadcasts?channel=&limit=&before= — KaChat broadcast history for a
 /// tracked channel, served on the same host as KaPosts (same indexer URL). Newest-first.
 /// A missing or unknown channel returns 200 with empty messages (per BROADCAST_INDEXER.md).
-/// GET /chess/leaderboard?limit=100 — the replayed arena leaderboard (§6).
+/// GET /chess/leaderboard?limit=100&period=month|all — the replayed arena leaderboard (§6).
 async fn handle_chess_leaderboard(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(app_state): State<Arc<AppState>>,
     Query(params): Query<ChessLeaderboardQuery>,
 ) -> Result<Json<ChessLeaderboardResponse>, (StatusCode, Json<ApiError>)> {
     check_rate_limit(&app_state, addr).await?;
-    let (players, _, _) = chess_snapshot(&app_state).await;
+    let (players, since, period) = chess_snapshot(&app_state).await.board(params.period.as_deref());
     let limit = params.limit.unwrap_or(100).clamp(1, 1000) as usize;
     Ok(Json(ChessLeaderboardResponse {
         players: players.into_iter().take(limit).collect(),
+        period: period.to_string(),
+        since,
         generated_at: now_ms(),
     }))
 }
 
-/// GET /chess/player?address= — one player's leaderboard row (zeroed if they've never played).
+/// GET /chess/player?address=&period=month|all — one player's leaderboard row (zeroed if they
+/// haven't played in that period).
 async fn handle_chess_player(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(app_state): State<Arc<AppState>>,
@@ -2194,7 +2248,7 @@ async fn handle_chess_player(
             ));
         }
     };
-    let (players, _, _) = chess_snapshot(&app_state).await;
+    let (players, _, _) = chess_snapshot(&app_state).await.board(params.period.as_deref());
     let row = players
         .into_iter()
         .find(|r| r.address == address)
@@ -2221,7 +2275,7 @@ async fn handle_chess_tournaments(
     Query(params): Query<ChessTournamentsQuery>,
 ) -> Result<Json<ChessTournamentsResponse>, (StatusCode, Json<ApiError>)> {
     check_rate_limit(&app_state, addr).await?;
-    let (_, mut tournaments, _) = chess_snapshot(&app_state).await;
+    let mut tournaments = chess_snapshot(&app_state).await.tournaments;
     if let Some(status) = params.status.as_deref() {
         let status = status.trim().to_lowercase();
         if !status.is_empty() {

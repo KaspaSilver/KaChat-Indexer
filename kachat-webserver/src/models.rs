@@ -712,6 +712,10 @@ pub struct ChessPlayerRow {
 #[derive(Debug, Serialize)]
 pub struct ChessLeaderboardResponse {
     pub players: Vec<ChessPlayerRow>,
+    /// "month" (this UTC calendar month) or "all".
+    pub period: String,
+    /// First counted tournament start time (ms): what started before it is not on this board.
+    pub since: i64,
     #[serde(rename = "generatedAt")]
     pub generated_at: i64,
 }
