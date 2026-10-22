@@ -1,7 +1,7 @@
 -- Migration: v2_to_v3
 -- Description: One person per x-only key for profiles, follows and blocks (audits IDX-031, IDX-032).
 -- The 02/03 parity byte takes no part in BIP340 signature checks, so 02<x> and 03<x> are the same
--- person; reads merge both forms since 12543eb, and this makes the write side agree. Rows already
+-- person. Reads merge both forms since 12543eb, and this makes the write side agree. Rows already
 -- written under the other form are collapsed first (the newest wins).
 -- Date: 2026-10-20
 
