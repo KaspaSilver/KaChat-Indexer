@@ -58,7 +58,6 @@ use workflow_core::channel::Channel;
 mod api;
 mod config;
 mod context;
-mod fcm;
 mod push;
 mod signals;
 mod stats_windows;

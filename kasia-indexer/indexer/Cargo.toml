@@ -32,13 +32,12 @@ utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-swagger-ui = { workspace = true, features = ["axum", "vendored"] }
 workflow-core = { workspace = true }
 itertools = { workspace = true }
-jsonwebtoken.workspace = true
 reqwest.workspace = true
 secp256k1.workspace = true
+ring.workspace = true
 sha2.workspace = true
 rand.workspace = true
 base64.workspace = true
-ring.workspace = true
 p256.workspace = true
 hkdf.workspace = true
 aes-gcm.workspace = true

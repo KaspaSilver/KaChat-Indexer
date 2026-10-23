@@ -72,8 +72,6 @@ pub struct WebPushConfig {
     signing_key: SigningKey,
     /// base64url (no padding) of the 65-byte uncompressed public point, as `web-config` serves it.
     pub public_key_b64: String,
-    /// Raw 65-byte uncompressed public point (the JWT header's `k` and VAPID `k=` use the b64 form).
-    public_key_bytes: Vec<u8>,
     subject: String,
 }
 
@@ -108,11 +106,9 @@ impl WebPushConfig {
         match Self::load_secret(key) {
             Ok(secret) => {
                 let public = secret.public_key().to_encoded_point(false);
-                let public_key_bytes = public.as_bytes().to_vec();
                 Some(WebPushConfig {
                     signing_key: SigningKey::from(&secret),
-                    public_key_b64: URL_SAFE_NO_PAD.encode(&public_key_bytes),
-                    public_key_bytes,
+                    public_key_b64: URL_SAFE_NO_PAD.encode(public.as_bytes()),
                     subject,
                 })
             }
@@ -216,10 +212,6 @@ impl WebPushClient {
                 .context("building the Web Push HTTP client")?,
             jwt_cache: Mutex::new(HashMap::new()),
         })
-    }
-
-    pub fn public_key_b64(&self) -> &str {
-        &self.config.public_key_b64
     }
 
     fn authorization_for(&self, origin: &str) -> String {
