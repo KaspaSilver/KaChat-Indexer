@@ -1476,6 +1476,7 @@ enum PushRegistryCommand {
         address: String,
         response: RegistryResponse<Vec<String>>,
     },
+    #[cfg_attr(not(test), allow(dead_code))] // the registry tests read a stored registration
     RegistrationForToken {
         token: String,
         response: RegistryResponse<Option<DeviceRegistration>>,
@@ -1964,6 +1965,7 @@ impl PushRegistryHandle {
 
     /// Aggregate device-registry census for `GET /push/stats`.
     /// One device's stored registration, by its exact token (tests and diagnostics).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn registration_for_token(
         &self,
         token: String,
@@ -2266,6 +2268,8 @@ impl PushDispatcher {
                 post_id,
                 tx_id,
             } => {
+                let target_tail = key_tail(&target_pubkey);
+                let kind_label = kaposts_kind.clone().unwrap_or_default();
                 let mut tokens = self
                     .registry
                     .matching_tokens_for_kaposts(target_pubkey, actor_pubkey)
@@ -2273,8 +2277,12 @@ impl PushDispatcher {
                 tokens.sort_unstable();
                 tokens.dedup();
                 if tokens.is_empty() {
+                    info!(
+                        "[Push][KaPosts] {kind_label} tx {tx_id} target ...{target_tail}: no device registered for this KaPosts key"
+                    );
                     return Ok(());
                 }
+                let matched = tokens.len();
                 // Honor per-action-type KaPosts toggles: drop devices that disabled this action
                 // kind. A device with no stored preference (map miss) defaults to enabled.
                 if let Some(action) = action.as_deref() {
@@ -2287,6 +2295,9 @@ impl PushDispatcher {
                         prefs.get(token).map(|pref| pref.allows(action)).unwrap_or(true)
                     });
                     if tokens.is_empty() {
+                        info!(
+                            "[Push][KaPosts] {kind_label} tx {tx_id} target ...{target_tail}: {matched} device(s) matched, all have \"{action}\" notifications off"
+                        );
                         return Ok(());
                     }
                 }
@@ -2306,7 +2317,12 @@ impl PushDispatcher {
                 if let Some(kaposts_kind) = kaposts_kind {
                     data.insert("kaposts_kind".to_string(), kaposts_kind);
                 }
-                self.deliver(tokens, &data).await;
+                let wanted = tokens.len();
+                let t = self.deliver(tokens, &data).await;
+                info!(
+                    "[Push][KaPosts] {kind_label} tx {tx_id} target ...{target_tail}: matched {matched}, wanted {wanted}: sent {} failed {} pruned {} non-web {} no-vapid {}",
+                    t.sent, t.failed, t.pruned, t.skipped, t.unconfigured
+                );
                 Ok(())
             }
             ExtensionPushEvent::KaPostsNewPost {
@@ -2318,6 +2334,7 @@ impl PushDispatcher {
             } => {
                 // PUSH_EXTENSIONS.md §3a: every device whose bell list holds the author, except the
                 // author's own devices. Not filtered by the per-kind switches (the bell is the switch).
+                let author_tail = key_tail(&author_pubkey);
                 let mut tokens = self
                     .registry
                     .matching_tokens_for_kaposts_watchers(author_pubkey)
@@ -2325,6 +2342,7 @@ impl PushDispatcher {
                 tokens.sort_unstable();
                 tokens.dedup();
                 if tokens.is_empty() {
+                    info!("[Push][KaPosts] new post tx {tx_id} by ...{author_tail}: nobody has the bell on");
                     return Ok(());
                 }
                 if tokens.len() > MAX_PUSH_FANOUT {
@@ -2336,11 +2354,15 @@ impl PushDispatcher {
                 data.insert("subtitle".to_string(), subtitle);
                 data.insert("body".to_string(), body);
                 data.insert("thread_id".to_string(), "kaposts".to_string());
-                data.insert("tx_id".to_string(), tx_id);
+                data.insert("tx_id".to_string(), tx_id.clone());
                 data.insert("post_id".to_string(), post_id.clone());
                 data.insert("kaposts_kind".to_string(), "post".to_string());
-                // apns-collapse-id = the post's txid.
-                self.deliver(tokens, &data).await;
+                let wanted = tokens.len();
+                let t = self.deliver(tokens, &data).await;
+                info!(
+                    "[Push][KaPosts] new post tx {tx_id} by ...{author_tail}: wanted {wanted}: sent {} failed {} pruned {} non-web {} no-vapid {}",
+                    t.sent, t.failed, t.pruned, t.skipped, t.unconfigured
+                );
                 Ok(())
             }
             ExtensionPushEvent::Name {
@@ -2472,9 +2494,10 @@ impl PushDispatcher {
     /// Web Push is the only transport (2026-10-22): tokens of any other platform (old ios /
     /// macos / android registrations) are counted and skipped. Bookkeeping (metrics,
     /// dead-token pruning) is unchanged.
-    async fn deliver(&mut self, tokens: Vec<String>, fcm_data: &BTreeMap<String, String>) {
+    async fn deliver(&mut self, tokens: Vec<String>, fcm_data: &BTreeMap<String, String>) -> DeliveryTally {
+        let mut tally = DeliveryTally::default();
         if tokens.is_empty() {
-            return;
+            return tally;
         }
         let platforms = self
             .registry
@@ -2489,6 +2512,11 @@ impl PushDispatcher {
                 // An old ios/macos/android registration: no transport any more.
                 _ => skipped += 1,
             }
+        }
+        tally.skipped = skipped;
+        if self.web.is_none() {
+            // Matched web devices, but no VAPID key on this server: nothing can be sent.
+            tally.unconfigured = web_tokens.len();
         }
 
         info!(
@@ -2546,7 +2574,15 @@ impl PushDispatcher {
             outcomes.extend(results);
         }
 
+        for (_, outcome) in &outcomes {
+            match outcome {
+                DeliveryOutcome::Delivered => tally.sent += 1,
+                DeliveryOutcome::Unregistered => tally.pruned += 1,
+                DeliveryOutcome::AuthFailed(_) | DeliveryOutcome::Failed(_) => tally.failed += 1,
+            }
+        }
         self.record_outcomes(outcomes).await;
+        tally
     }
 
     /// Apply metrics + dead-token pruning for a batch of delivery outcomes (transport-agnostic).
@@ -2770,6 +2806,19 @@ impl PushDispatcher {
 }
 
 /// Transport-agnostic delivery result, produced by mapping either `ApnsError` or `FcmError`.
+/// What one deliver() call came to, for the per-event log lines.
+#[derive(Default, Debug, Clone, Copy)]
+struct DeliveryTally {
+    sent: usize,
+    failed: usize,
+    /// Subscriptions the push service said are gone (404/410), removed.
+    pruned: usize,
+    /// Devices of a removed platform (ios/macos/android).
+    skipped: usize,
+    /// Web devices matched while this server has no VAPID key.
+    unconfigured: usize,
+}
+
 enum DeliveryOutcome {
     Delivered,
     Unregistered,
@@ -2907,6 +2956,12 @@ impl SentTxCache {
             self.seen.remove(&id);
         }
     }
+}
+
+/// The last 8 characters of a key, for log lines.
+fn key_tail(key: &str) -> String {
+    let key = key.trim();
+    key.get(key.len().saturating_sub(8)..).unwrap_or(key).to_string()
 }
 
 /// Canonicalize a device token for both storage (DB key) and the signed auth preimage.

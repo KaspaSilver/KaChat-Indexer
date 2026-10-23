@@ -185,6 +185,7 @@ pub async fn run(pool: DbPool) {
                 transaction_id: hex::encode(&id),
                 payload: Some(hex::encode(&payload)),
                 block_time: Some(row.get("block_time")),
+                recovered: false,
             };
             let is_tip = payload.starts_with(TIP_PREFIX);
             let outcome = if is_tip {

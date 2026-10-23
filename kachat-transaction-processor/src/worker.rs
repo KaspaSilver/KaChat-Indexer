@@ -57,11 +57,26 @@ impl Worker {
                                 || payload_str.starts_with("ciph_msg:1:bcast:")
                             {
                                 //info!("Worker {} - Processing K protocol / broadcast transaction: {}", self.id, transaction_id);
-                                // No pushes for a transaction older than a few minutes: a
-                                // reindex or a catch-up after downtime is history, not news.
-                                let quiet = transaction.block_time.is_some_and(|t| {
-                                    crate::bcast_pending::now_ms() - t > crate::bcast_pending::PUSH_MAX_AGE_MS
-                                });
+                                // Pushes stay quiet only for re-queued rows: one a reindex
+                                // recovered (history) or one the startup catch-up re-queued
+                                // (it may have been pushed before the restart). A live
+                                // transaction always pushes, however far behind we are: an age
+                                // cut-off silenced every like while the processor lagged.
+                                let catch_up = crate::reindex::take_catch_up(&transaction_id);
+                                let quiet = transaction.recovered || catch_up;
+                                if quiet {
+                                    let age_s = transaction
+                                        .block_time
+                                        .map(|t| (crate::bcast_pending::now_ms() - t) / 1000)
+                                        .unwrap_or(-1);
+                                    info!(
+                                        "Worker {} - tx {} processed quiet (no pushes): {}, {}s old",
+                                        self.id,
+                                        transaction_id,
+                                        if transaction.recovered { "recovered by a reindex" } else { "startup catch-up" },
+                                        age_s
+                                    );
+                                }
                                 match crate::push_notify::QUIET
                                     .scope(quiet, self.k_processor.process_k_transaction(&transaction))
                                     .await

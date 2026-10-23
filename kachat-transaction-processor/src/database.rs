@@ -832,6 +832,9 @@ pub struct Transaction {
     pub transaction_id: String,
     pub payload: Option<String>,
     pub block_time: Option<i64>,
+    /// Read from `kachat_recovered_transactions` (a reindex put it there), not the live
+    /// ingester table: history, so its pushes stay quiet (worker.rs).
+    pub recovered: bool,
 }
 
 pub async fn fetch_transaction(
@@ -844,9 +847,9 @@ pub async fn fetch_transaction(
     // The ingester's row, else the copy a reindex recovered (kachat-audits IDX-036).
     let row = sqlx::query(
         r#"
-        SELECT transaction_id, payload, block_time FROM transactions WHERE transaction_id = $1
+        SELECT transaction_id, payload, block_time, false AS recovered FROM transactions WHERE transaction_id = $1
         UNION ALL
-        SELECT transaction_id, payload, block_time FROM kachat_recovered_transactions WHERE transaction_id = $1
+        SELECT transaction_id, payload, block_time, true AS recovered FROM kachat_recovered_transactions WHERE transaction_id = $1
         LIMIT 1
         "#,
     )
@@ -862,6 +865,7 @@ pub async fn fetch_transaction(
             transaction_id: hex::encode(&transaction_id),
             payload: payload.map(|p| hex::encode(&p)),
             block_time: row.get("block_time"),
+            recovered: row.get("recovered"),
         }))
     } else {
         Ok(None)

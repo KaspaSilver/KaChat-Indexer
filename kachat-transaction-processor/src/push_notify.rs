@@ -72,12 +72,30 @@ fn post_inner(path: &'static str, mut body: serde_json::Value, actor_pubkey: Opt
         if let Some(actor) = actor_pubkey {
             body["subtitle"] = serde_json::Value::String(actor_display(&actor).await);
         }
+        // What the log line names: the target (kaposts) or author (new-post) by key suffix,
+        // and the transaction.
+        let who = body["target_pubkey"].as_str().or(body["author_pubkey"].as_str()).unwrap_or("");
+        let who = who.get(who.len().saturating_sub(8)..).unwrap_or(who).to_string();
+        let tx = body["tx_id"].as_str().unwrap_or("").to_string();
         let mut req = CLIENT.post(&url).json(&body);
         if let Some(secret) = secret {
             req = req.header("x-internal-secret", secret);
         }
-        if let Err(e) = req.send().await {
-            tracing::debug!("push notify to {} failed: {}", url, e);
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if path.starts_with("kaposts") {
+                    tracing::info!("push notify {path} sent: target ...{who} tx {tx}");
+                } else {
+                    tracing::debug!("push notify {path} sent: tx {tx}");
+                }
+            }
+            // A 401 (secret mismatch) or 5xx used to pass silently as "sent".
+            Ok(resp) => tracing::warn!(
+                "push notify to {} failed: HTTP {} (target ...{who} tx {tx})",
+                url,
+                resp.status().as_u16()
+            ),
+            Err(e) => tracing::warn!("push notify to {} failed: {} (target ...{who} tx {tx})", url, e),
         }
     });
 }

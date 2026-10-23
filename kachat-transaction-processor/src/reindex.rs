@@ -18,7 +18,9 @@
 //!
 //! Order does not matter: profiles keep the newest by block time, and a follow or block is
 //! ignored when a newer opposing action is known (k_protocol.rs, IDX-035). Pushes stay quiet
-//! for anything older than a few minutes (worker.rs): a day-old like is history, not news.
+//! for both kinds of re-queued row (worker.rs): a reindexed like is history, and a catch-up row
+//! may already have been pushed before the restart (the push service's dedup is in memory).
+//! Live transactions always push, however late the processor is.
 
 use crate::bcast_pending::now_ms;
 use crate::database::DbPool;
@@ -257,6 +259,15 @@ async fn walk(pool: &DbPool, queue: &mpsc::UnboundedSender<String>, from_ms: Opt
 
 /// Once at start: the KaChat transactions of the last hour, queued again. The writes they lead
 /// to are idempotent, so nothing is doubled; anything already indexed is a quick no-op.
+/// Transaction ids the startup catch-up re-queued and a worker has not taken yet.
+static CATCH_UP: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether `tx_id` came from the startup catch-up (and forget it): its pushes stay quiet.
+pub fn take_catch_up(tx_id: &str) -> bool {
+    CATCH_UP.lock().map(|mut set| set.remove(tx_id)).unwrap_or(false)
+}
+
 pub async fn startup_catch_up(pool: &DbPool, queue: mpsc::UnboundedSender<String>) {
     let since = now_ms() - 3_600_000;
     let rows = sqlx::query(
@@ -273,8 +284,11 @@ pub async fn startup_catch_up(pool: &DbPool, queue: mpsc::UnboundedSender<String
         Ok(rows) => {
             let n = rows.len();
             for r in rows {
-                let id: Vec<u8> = r.get("transaction_id");
-                if queue.send(hex::encode(id)).is_err() {
+                let id = hex::encode(r.get::<Vec<u8>, _>("transaction_id"));
+                if let Ok(mut set) = CATCH_UP.lock() {
+                    set.insert(id.clone());
+                }
+                if queue.send(id).is_err() {
                     break;
                 }
             }
