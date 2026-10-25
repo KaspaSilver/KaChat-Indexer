@@ -180,6 +180,11 @@ pub struct PushRegistrationRequest {
     // update keeps the stored subscription. Kept out of the auth preimage.
     #[serde(default)]
     pub web_push: Option<WebPushSubscriptionRequest>,
+    // The app's APNs topic for an iPhone app other than KaChat (KaPosts com.kachat.kaposts,
+    // KaChat Wallet com.kachat.wallet). Kept only if in APNS_ALLOWED_TOPICS. Outside the
+    // auth preimage; absent on update keeps the stored one.
+    #[serde(default)]
+    pub apns_topic: Option<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -297,6 +302,11 @@ pub struct PushUpdateRequest {
     // Web Push subscription; absent keeps the stored one (see PushRegistrationRequest).
     #[serde(default)]
     pub web_push: Option<WebPushSubscriptionRequest>,
+    // The app's APNs topic for an iPhone app other than KaChat (KaPosts com.kachat.kaposts,
+    // KaChat Wallet com.kachat.wallet). Kept only if in APNS_ALLOWED_TOPICS. Outside the
+    // auth preimage; absent on update keeps the stored one.
+    #[serde(default)]
+    pub apns_topic: Option<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -943,6 +953,7 @@ async fn register_device(
             payload.apns_environment,
             payload.voip_token,
             web_push,
+            payload.apns_topic,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )
@@ -1027,6 +1038,7 @@ async fn update_registration(
             payload.apns_environment,
             payload.voip_token,
             web_push,
+            payload.apns_topic,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )

@@ -119,6 +119,7 @@ impl PushRegistry {
         apns_environment: Option<String>,
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
+        apns_topic: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -149,8 +150,10 @@ impl PushRegistry {
         let (normalized_watch_only, _) = normalize_watch_only_addresses(watch_only_addresses);
         let requested_apns_environment = normalize_apns_environment(apns_environment);
         let requested_voip_token = normalize_voip_token(voip_token);
-        if addresses.is_empty() && group_ids.is_empty() {
-            anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
+        // A watch-only device (KaChat Wallet: Received KAS + .kachat pushes) registers no chat
+        // address and no group; its watch-only addresses are what it is here for.
+        if addresses.is_empty() && group_ids.is_empty() && normalized_watch_only.is_empty() {
+            anyhow::bail!("watched_addresses, watched_group_ids and watch_only_addresses must not all be empty");
         }
 
         let existing = self.get_registration(&token)?;
@@ -162,6 +165,9 @@ impl PushRegistry {
         // An absent web_push keeps the stored subscription (partial updates must not clobber).
         let normalized_web_push =
             web_push.or_else(|| existing.as_ref().and_then(|reg| reg.web_push.clone()));
+        // Same for the APNs topic; an unknown topic is dropped (then APNS_TOPIC is used).
+        let normalized_apns_topic = normalize_apns_topic(apns_topic)
+            .or_else(|| existing.as_ref().and_then(|reg| reg.apns_topic.clone()));
         let effective_wallet_binding = resolve_wallet_binding(existing.as_ref(), wallet_binding)?;
         let effective_wallet_pubkey = effective_wallet_binding
             .as_ref()
@@ -238,6 +244,7 @@ impl PushRegistry {
                     && reg.apns_environment == normalized_apns_environment
                     && reg.voip_token == normalized_voip_token
                     && reg.web_push == normalized_web_push
+                    && reg.apns_topic == normalized_apns_topic
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -285,6 +292,7 @@ impl PushRegistry {
             apns_environment: normalized_apns_environment,
             voip_token: normalized_voip_token,
             web_push: normalized_web_push,
+            apns_topic: normalized_apns_topic,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -436,6 +444,7 @@ impl PushRegistry {
         apns_environment: Option<String>,
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
+        apns_topic: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -465,8 +474,10 @@ impl PushRegistry {
         let (normalized_watch_only, _) = normalize_watch_only_addresses(watch_only_addresses);
         let requested_apns_environment = normalize_apns_environment(apns_environment);
         let requested_voip_token = normalize_voip_token(voip_token);
-        if addresses.is_empty() && group_ids.is_empty() {
-            anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
+        // A watch-only device (KaChat Wallet: Received KAS + .kachat pushes) registers no chat
+        // address and no group; its watch-only addresses are what it is here for.
+        if addresses.is_empty() && group_ids.is_empty() && normalized_watch_only.is_empty() {
+            anyhow::bail!("watched_addresses, watched_group_ids and watch_only_addresses must not all be empty");
         }
 
         let existing = self.get_registration(&token)?;
@@ -478,6 +489,9 @@ impl PushRegistry {
         // An absent web_push keeps the stored subscription (partial updates must not clobber).
         let normalized_web_push =
             web_push.or_else(|| existing.as_ref().and_then(|reg| reg.web_push.clone()));
+        // Same for the APNs topic; an unknown topic is dropped (then APNS_TOPIC is used).
+        let normalized_apns_topic = normalize_apns_topic(apns_topic)
+            .or_else(|| existing.as_ref().and_then(|reg| reg.apns_topic.clone()));
         let effective_wallet_binding = resolve_wallet_binding(existing.as_ref(), wallet_binding)?;
         let effective_wallet_pubkey = effective_wallet_binding
             .as_ref()
@@ -554,6 +568,7 @@ impl PushRegistry {
                     && reg.apns_environment == normalized_apns_environment
                     && reg.voip_token == normalized_voip_token
                     && reg.web_push == normalized_web_push
+                    && reg.apns_topic == normalized_apns_topic
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -599,6 +614,7 @@ impl PushRegistry {
             apns_environment: normalized_apns_environment,
             voip_token: normalized_voip_token,
             web_push: normalized_web_push,
+            apns_topic: normalized_apns_topic,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -1176,6 +1192,16 @@ impl PushRegistry {
     /// Each token's stored APNs environment ("sandbox"/"production"), or `None` when unknown. Used
     /// by the dispatcher to route each APNs push to the right host (and to skip the host-fallback
     /// probe for devices whose environment is already known).
+    fn apns_topics_for_tokens(&self, tokens: &[String]) -> anyhow::Result<HashMap<String, Option<String>>> {
+        let mut map = HashMap::with_capacity(tokens.len());
+        for token in tokens {
+            if let Some(registration) = self.get_registration(token)? {
+                map.insert(token.clone(), registration.apns_topic);
+            }
+        }
+        Ok(map)
+    }
+
     fn web_push_for_tokens(
         &self,
         tokens: &[String],
@@ -1486,6 +1512,7 @@ enum PushRegistryCommand {
         apns_environment: Option<String>,
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
+        apns_topic: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1506,6 +1533,7 @@ enum PushRegistryCommand {
         apns_environment: Option<String>,
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
+        apns_topic: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1577,6 +1605,10 @@ enum PushRegistryCommand {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, Option<String>>>,
     },
+    ApnsTopicsForTokens {
+        tokens: Vec<String>,
+        response: RegistryResponse<HashMap<String, Option<String>>>,
+    },
     WebPushForTokens {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, Option<WebPushSubscription>>>,
@@ -1643,6 +1675,7 @@ impl PushRegistryActor {
                     apns_environment,
                     voip_token,
                     web_push,
+                    apns_topic,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1664,6 +1697,7 @@ impl PushRegistryActor {
                         apns_environment,
                         voip_token,
                         web_push,
+                        apns_topic,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1685,6 +1719,7 @@ impl PushRegistryActor {
                     apns_environment,
                     voip_token,
                     web_push,
+                    apns_topic,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1705,6 +1740,7 @@ impl PushRegistryActor {
                         apns_environment,
                         voip_token,
                         web_push,
+                        apns_topic,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1808,6 +1844,10 @@ impl PushRegistryActor {
                     let result = self.registry.apns_environment_for_tokens(&tokens);
                     let _ = response.send(result);
                 }
+                PushRegistryCommand::ApnsTopicsForTokens { tokens, response } => {
+                    let result = self.registry.apns_topics_for_tokens(&tokens);
+                    let _ = response.send(result);
+                }
                 PushRegistryCommand::WebPushForTokens { tokens, response } => {
                     let result = self.registry.web_push_for_tokens(&tokens);
                     let _ = response.send(result);
@@ -1882,6 +1922,7 @@ impl PushRegistryHandle {
         apns_environment: Option<String>,
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
+        apns_topic: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1902,6 +1943,7 @@ impl PushRegistryHandle {
             apns_environment,
             voip_token,
             web_push,
+            apns_topic,
             wallet_binding,
             device_key_binding,
             response,
@@ -1927,6 +1969,7 @@ impl PushRegistryHandle {
         apns_environment: Option<String>,
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
+        apns_topic: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1946,6 +1989,7 @@ impl PushRegistryHandle {
             apns_environment,
             voip_token,
             web_push,
+            apns_topic,
             wallet_binding,
             device_key_binding,
             response,
@@ -2107,6 +2151,15 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// Map each token to its stored APNs topic (None = APNS_TOPIC).
+    pub async fn apns_topics_for_tokens(
+        &self,
+        tokens: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, Option<String>>> {
+        self.request(|response| PushRegistryCommand::ApnsTopicsForTokens { tokens, response })
+            .await
+    }
+
     /// Map each `web` token to its stored browser subscription (None if the record lacks one).
     pub async fn web_push_for_tokens(
         &self,
@@ -2252,6 +2305,11 @@ pub struct DeviceRegistration {
     // the auth preimage, like every optional field added after LegacyV1. Value only.
     #[serde(default)]
     pub web_push: Option<WebPushSubscription>,
+    // The app's APNs topic (bundle id) for an iPhone app other than KaChat: KaPosts
+    // (com.kachat.kaposts) or KaChat Wallet (com.kachat.wallet). None = APNS_TOPIC. Only topics
+    // in APNS_ALLOWED_TOPICS are kept. Outside the auth preimage; value only.
+    #[serde(default)]
+    pub apns_topic: Option<String>,
     #[serde(default)]
     pub app_attest_key_id: Option<String>,
     #[serde(default)]
@@ -2870,6 +2928,20 @@ impl PushDispatcher {
             .platforms_for_tokens(tokens.clone())
             .await
             .unwrap_or_default();
+        // Per-app APNs topics; KaChat Wallet devices take only their two kinds of push.
+        let topics = self
+            .registry
+            .apns_topics_for_tokens(tokens.clone())
+            .await
+            .unwrap_or_default();
+        let event_type = fcm_data.get("type").map(String::as_str).unwrap_or("");
+        let wallet_ok = WALLET_PUSH_TYPES.contains(&event_type);
+        let before = tokens.len();
+        let tokens: Vec<String> = tokens
+            .into_iter()
+            .filter(|t| wallet_ok || topics.get(t).cloned().flatten().as_deref() != Some(WALLET_APNS_TOPIC))
+            .collect();
+        tally.wallet_filtered = before - tokens.len();
         let mut apns_tokens = Vec::new();
         let mut fcm_tokens = Vec::new();
         let mut web_tokens = Vec::new();
@@ -2908,11 +2980,21 @@ impl PushDispatcher {
                 .apns_environment_for_tokens(apns_tokens.clone())
                 .await
                 .unwrap_or_default();
+            // One line per topic, so a send on another app's topic is visible in the log.
+            let mut by_topic: BTreeMap<String, usize> = BTreeMap::new();
+            for token in &apns_tokens {
+                let topic = topics.get(token).cloned().flatten().unwrap_or_else(|| apns.topic.clone());
+                *by_topic.entry(topic).or_default() += 1;
+            }
+            for (topic, n) in &by_topic {
+                info!("[Push][APNs] {event_type} send topic={topic} devices={n}");
+            }
             let results = stream::iter(apns_tokens.into_iter().map(|token| {
                 let stored_env = envs.get(&token).cloned().flatten();
+                let topic = topics.get(&token).cloned().flatten();
                 async move {
                     let (result, learned) = apns
-                        .send_routed(&token, apns_payload, collapse_id, stored_env.as_deref())
+                        .send_routed(&token, apns_payload, collapse_id, stored_env.as_deref(), topic.as_deref())
                         .await;
                     (token, DeliveryOutcome::from_apns(result), learned)
                 }
@@ -3269,6 +3351,8 @@ struct DeliveryTally {
     pruned: usize,
     /// Web devices matched while this server has no VAPID key.
     unconfigured: usize,
+    /// KaChat Wallet devices dropped because this kind of push is not one of theirs.
+    wallet_filtered: usize,
 }
 
 enum DeliveryOutcome {
@@ -3635,7 +3719,7 @@ impl ApnsClient {
         payload: &T,
         collapse_id: Option<&str>,
     ) -> Result<(), ApnsError> {
-        self.send_collapsible_to(&self.endpoint, token, payload, collapse_id)
+        self.send_collapsible_to(&self.endpoint, token, payload, collapse_id, None)
             .await
     }
 
@@ -3647,7 +3731,11 @@ impl ApnsClient {
         token: &str,
         payload: &T,
         collapse_id: Option<&str>,
+        topic: Option<&str>,
     ) -> Result<(), ApnsError> {
+        // The device's own app (KaPosts, KaChat Wallet), else KaChat's APNS_TOPIC: Apple answers
+        // DeviceTokenNotForTopic for a token sent on another app's topic.
+        let topic = topic.unwrap_or(&self.topic);
         let auth_token = self
             .auth_token()
             .await
@@ -3657,7 +3745,7 @@ impl ApnsClient {
             .client
             .post(url)
             .header("authorization", format!("bearer {}", auth_token))
-            .header("apns-topic", &self.topic)
+            .header("apns-topic", topic)
             .header("apns-push-type", "alert")
             .header("apns-priority", "10");
         if let Some(collapse_id) = collapse_id {
@@ -3700,7 +3788,7 @@ impl ApnsClient {
                 reason.as_deref().unwrap_or("unknown"),
                 status,
                 endpoint,
-                self.topic,
+                topic,
                 token_tail,
             );
         }
@@ -3722,21 +3810,22 @@ impl ApnsClient {
         payload: &T,
         collapse_id: Option<&str>,
         stored_env: Option<&str>,
+        topic: Option<&str>,
     ) -> (Result<(), ApnsError>, Option<String>) {
         match stored_env {
             Some("sandbox") => (
-                self.send_collapsible_to(Self::SANDBOX, token, payload, collapse_id)
+                self.send_collapsible_to(Self::SANDBOX, token, payload, collapse_id, topic)
                     .await,
                 None,
             ),
             Some("production") => (
-                self.send_collapsible_to(Self::PROD, token, payload, collapse_id)
+                self.send_collapsible_to(Self::PROD, token, payload, collapse_id, topic)
                     .await,
                 None,
             ),
             _ => {
                 let first = self
-                    .send_collapsible_to(&self.endpoint, token, payload, collapse_id)
+                    .send_collapsible_to(&self.endpoint, token, payload, collapse_id, topic)
                     .await;
                 if !matches!(first, Err(ApnsError::InvalidToken)) {
                     return (first, None);
@@ -3748,7 +3837,7 @@ impl ApnsClient {
                     (Self::SANDBOX, "sandbox")
                 };
                 match self
-                    .send_collapsible_to(other_host, token, payload, collapse_id)
+                    .send_collapsible_to(other_host, token, payload, collapse_id, topic)
                     .await
                 {
                     Ok(()) => (Ok(()), Some(other_env.to_string())),
@@ -4288,6 +4377,37 @@ fn normalize_kaposts_pubkey(pubkey: Option<String>) -> Option<String> {
     }
 }
 
+/// The APNs topics a device may register for: `APNS_ALLOWED_TOPICS` (comma-separated bundle
+/// ids, set by Kaspa Quick Start: com.kachat.app, com.kachat.kaposts, com.kachat.wallet), else
+/// `APNS_TOPIC` alone. Read once.
+fn allowed_apns_topics() -> &'static [String] {
+    static TOPICS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    TOPICS.get_or_init(|| {
+        let list: Vec<String> = std::env::var("APNS_ALLOWED_TOPICS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !list.is_empty() {
+            return list;
+        }
+        std::env::var("APNS_TOPIC").ok().map(|t| vec![t.trim().to_string()]).unwrap_or_default()
+    })
+}
+
+/// Keep a requested APNs topic only if it is an allowed one (exact bundle id).
+fn normalize_apns_topic(topic: Option<String>) -> Option<String> {
+    let topic = topic?.trim().to_string();
+    allowed_apns_topics().iter().any(|t| *t == topic).then_some(topic)
+}
+
+/// KaChat Wallet (KaChat-Wallet/PUSH_SERVICE.md): its devices get only Received KAS and
+/// .kachat pushes. It has no notification service extension, so an encrypted chat push would
+/// show as a bare banner.
+const WALLET_APNS_TOPIC: &str = "com.kachat.wallet";
+const WALLET_PUSH_TYPES: &[&str] = &["address_activity", "name_event"];
+
 /// Canonicalize a requested APNs environment to the stored form: "development"/"sandbox" =>
 /// "sandbox", "production" => "production", anything else (incl. empty) => None (unknown).
 fn normalize_apns_environment(env: Option<String>) -> Option<String> {
@@ -4529,6 +4649,7 @@ mod tests {
             apns_environment: None,
             voip_token: None,
             web_push: None,
+            apns_topic: None,
             created_at: 0,
             last_seen: 0,
         };
@@ -4595,6 +4716,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("registration succeeds");
@@ -4637,6 +4759,7 @@ mod tests {
                 None,
                 vec![],
                 vec![],
+                None,
                 None,
                 None,
                 None,
@@ -4714,6 +4837,7 @@ mod tests {
                     None,
                     vec![],
                     vec![],
+                    None,
                     None,
                     None,
                     None,
@@ -4832,6 +4956,79 @@ mod kaposts_watch_tests {
     }
 
     #[tokio::test]
+    async fn a_wallet_registers_watch_only_and_keeps_an_allowed_topic() {
+        // Only this test passes an apns_topic, so it is the first to read the allow-list.
+        // SAFETY: set before any thread reads the variable (the OnceLock is still empty).
+        unsafe { std::env::set_var("APNS_ALLOWED_TOPICS", "com.kachat.app, com.kachat.wallet") };
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let registry = PushRegistry::new(
+            tx_keyspace.clone(),
+            DeviceRegistrationPartition::new(&tx_keyspace).expect("device partition"),
+            WatchedAddressPartition::new(&tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(&tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(&tx_keyspace).expect("primary partition"),
+            create_shared_metrics(),
+        );
+        let (actor, handle) = PushRegistryActor::new(registry, 8);
+        let actor_thread = std::thread::spawn(move || actor.process());
+        let address = Address::new(Prefix::Mainnet, Version::PubKey, &[7u8; 32]).to_string();
+        let register = |token: String, watch_only: Vec<String>, topic: Option<&str>| {
+            let handle = handle.clone();
+            let address = address.clone();
+            let topic = topic.map(str::to_string);
+            async move {
+                handle
+                    .register(
+                        token,
+                        "ios".to_string(),
+                        vec![], // no chat address
+                        vec![], // no group
+                        vec![],
+                        Some(address),
+                        vec![],
+                        vec![],
+                        Default::default(),
+                        None,
+                        None,
+                        vec![],
+                        watch_only,
+                        None,
+                        None,
+                        None,
+                        topic,
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        };
+
+        // KaChat Wallet: nothing but watch-only addresses, on its own topic.
+        register("ab".repeat(32), vec![address.clone()], Some("com.kachat.wallet"))
+            .await
+            .expect("a watch-only registration is accepted");
+        // A topic not on the allow-list is dropped (the device then uses APNS_TOPIC).
+        register("cd".repeat(32), vec![address.clone()], Some("com.example.other"))
+            .await
+            .expect("registration succeeds");
+        // Nothing at all to watch is still refused.
+        assert!(register("ef".repeat(32), vec![], None).await.is_err());
+
+        let topics = handle
+            .apns_topics_for_tokens(vec!["ab".repeat(32), "cd".repeat(32)])
+            .await
+            .expect("topics");
+        assert_eq!(topics.get(&"ab".repeat(32)).cloned().flatten().as_deref(), Some("com.kachat.wallet"));
+        assert_eq!(topics.get(&"cd".repeat(32)).cloned().flatten(), None);
+
+        drop(handle);
+        actor_thread.join().expect("actor exits cleanly");
+    }
+
+    #[tokio::test]
     async fn new_post_reaches_watchers_but_not_the_authors_own_devices() {
         let db_dir = tempfile::tempdir().expect("temporary database directory");
         let tx_keyspace = fjall::Config::new(db_dir.path())
@@ -4875,6 +5072,7 @@ mod kaposts_watch_tests {
                     None,
                     watch,
                     vec![],
+                    None,
                     None,
                     None,
                     None,
