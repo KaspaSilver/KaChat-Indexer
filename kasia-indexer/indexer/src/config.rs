@@ -13,10 +13,27 @@ pub struct IndexerConfig {
     pub kaspa_node_wborsh_url: Option<String>,
     #[serde(default = "default_periodic_processor_interval_secs")]
     pub periodic_processor_interval_secs: u64,
+    pub apns_team_id: Option<String>,
+    pub apns_key_id: Option<String>,
+    pub apns_topic: Option<String>,
+    pub apns_key_path: Option<PathBuf>,
+    pub apns_key: Option<String>,
+    // Optional explicit VoIP APNs topic. If unset, derived as `apns_topic + ".voip"`.
+    #[serde(default)]
+    pub apns_voip_topic: Option<String>,
+    #[serde(default = "default_apns_environment")]
+    pub apns_environment: ApnsEnvironment,
     #[serde(default = "default_push_auth_mode")]
     pub push_auth_mode: PushAuthMode,
-    // The Apple (APNS_*) and Android (FCM_*) push settings were removed 2026-10-22 with their
-    // transports: Web Push only. Old values in the environment are ignored.
+    // --- FCM (Firebase Cloud Messaging) for Android push ---
+    // GCP/Firebase project id (e.g. "kachat-12345"); required to enable FCM delivery.
+    pub fcm_project_id: Option<String>,
+    // Path to the Firebase *service-account* JSON (Console → Project settings → Service
+    // accounts → Generate new private key). Used for FCM HTTP v1 OAuth2. Mounted on the box,
+    // like the APNs .p8. Prefer this over the inline form.
+    pub fcm_service_account_path: Option<PathBuf>,
+    // Inline alternative to fcm_service_account_path (the full service-account JSON as a string).
+    pub fcm_service_account_json: Option<String>,
 }
 
 fn default_periodic_processor_interval_secs() -> u64 {
@@ -63,6 +80,17 @@ mod network_type_tests {
 
 fn default_kasia_indexer_db_root() -> PathBuf {
     std::env::home_dir().unwrap().join(".kasia-indexer")
+}
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum ApnsEnvironment {
+    Sandbox,
+    Production,
+}
+
+fn default_apns_environment() -> ApnsEnvironment {
+    ApnsEnvironment::Sandbox
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

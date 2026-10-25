@@ -93,6 +93,7 @@ impl PushApi {
             .route("/register", post(register_device))
             .route("/update", put(update_registration))
             .route("/unregister", delete(unregister_device))
+            .route("/ring", post(ring_call))
             .route("/stats", get(get_push_stats))
             .route("/web-config", get(get_web_config))
     }
@@ -165,6 +166,15 @@ pub struct PushRegistrationRequest {
     #[serde(default)]
     #[serde(rename = "watch_only_addresses")]
     pub watch_only_addresses: Vec<String>,
+    // Per-device APNs environment ("development"/"production"). Absent = unknown (server learns it
+    // via BadDeviceToken fallback). Kept out of the auth preimage.
+    #[serde(default)]
+    #[serde(rename = "apns_environment")]
+    pub apns_environment: Option<String>,
+    // VoIP push token (PushKit) for incoming-call rings. Absent = device can't receive VoIP pushes.
+    // Kept out of the auth preimage.
+    #[serde(default)]
+    pub voip_token: Option<String>,
     // Web Push subscription (platform "web"): endpoint == device_token, plus the browser's
     // P-256 key and auth secret. Required on register for platform "web"; an absent one on
     // update keeps the stored subscription. Kept out of the auth preimage.
@@ -279,6 +289,11 @@ pub struct PushUpdateRequest {
     #[serde(default)]
     #[serde(rename = "watch_only_addresses")]
     pub watch_only_addresses: Vec<String>,
+    #[serde(default)]
+    #[serde(rename = "apns_environment")]
+    pub apns_environment: Option<String>,
+    #[serde(default)]
+    pub voip_token: Option<String>,
     // Web Push subscription; absent keeps the stored one (see PushRegistrationRequest).
     #[serde(default)]
     pub web_push: Option<WebPushSubscriptionRequest>,
@@ -292,6 +307,27 @@ pub struct PushUnregisterRequest {
     pub device_token: String,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
+}
+
+// VoIP call ring: a caller asks the push service to ring every device registered under the callee
+// `to_address`. The caller authenticates exactly like register (auth over path=/v1/push/ring),
+// and must own the `device_token` it presents. `payload` is an opaque hex blob forwarded verbatim.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RingRequest {
+    #[serde(rename = "device_token")]
+    pub device_token: String,
+    #[serde(rename = "to_address")]
+    pub to_address: String,
+    #[serde(rename = "call_id")]
+    pub call_id: String,
+    #[serde(default)]
+    pub video: bool,
+    pub kind: String,
+    #[serde(default)]
+    pub payload: String,
+    #[serde(default)]
+    pub timestamp: u64,
+    pub auth: PushAuthRequest,
 }
 
 #[derive(Debug, Deserialize, ToSchema, Clone)]
@@ -904,6 +940,8 @@ async fn register_device(
             kaposts_notify,
             payload.kaposts_watch_authors,
             payload.watch_only_addresses,
+            payload.apns_environment,
+            payload.voip_token,
             web_push,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
@@ -986,6 +1024,8 @@ async fn update_registration(
             kaposts_notify,
             payload.kaposts_watch_authors,
             payload.watch_only_addresses,
+            payload.apns_environment,
+            payload.voip_token,
             web_push,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
@@ -1061,6 +1101,98 @@ async fn unregister_device(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/push/ring",
+    request_body = RingRequest,
+    responses(
+        (status = 200, description = "Ring queued"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 400, description = "Bad request", body = ErrorResponse)
+    )
+)]
+async fn ring_call(
+    State(state): State<PushApi>,
+    Json(payload): Json<RingRequest>,
+) -> impl IntoResponse {
+    // Authenticate exactly like register: the signature covers path=/v1/push/ring with the caller's
+    // own wallet as primary_address, and empty watched/group/alias sets.
+    let verified = match authenticate_push_request(
+        &state,
+        "POST",
+        "/v1/push/ring",
+        &payload.device_token,
+        &[],
+        None,
+        &[],
+        Some(payload.auth.wallet_address.as_str()),
+        &[],
+        Some(&payload.auth),
+    ) {
+        Ok(verified) => verified,
+        Err(err) => {
+            warn!("Push ring auth rejected: {}", err.message);
+            return Err(err.into_response());
+        }
+    };
+    let Some(wallet) = verified.wallet_binding else {
+        return Err(PushApiError::unauthorized("ring requires signed wallet auth").into_response());
+    };
+
+    // The caller must own the device_token it presents (bound to the authenticated wallet).
+    let normalized_token = match normalize_device_token(&payload.device_token) {
+        Ok(token) => token,
+        Err(err) => return Err(err.into_response()),
+    };
+    match state
+        .registry
+        .registration_for_token(normalized_token)
+        .await
+    {
+        Ok(Some(reg)) => {
+            let owns = reg.wallet_pubkey.as_deref() == Some(wallet.wallet_pubkey.as_str())
+                || reg.wallet_address.as_deref() == Some(wallet.wallet_address.as_str())
+                || reg.primary_address.as_deref() == Some(wallet.wallet_address.as_str());
+            if !owns {
+                return Err(PushApiError::forbidden(
+                    "device_token is not bound to the authenticated wallet",
+                )
+                .into_response());
+            }
+        }
+        Ok(None) => {
+            return Err(
+                PushApiError::forbidden("device_token is not registered").into_response()
+            );
+        }
+        Err(_) => {
+            return Err(
+                PushApiError::internal("failed to look up device registration").into_response(),
+            );
+        }
+    }
+
+    // Normalize the callee address so it matches stored (canonical) primary addresses.
+    let to_address = match normalize_wallet_address(&payload.to_address) {
+        Ok(address) => address,
+        Err(err) => return Err(err.into_response()),
+    };
+
+    // Hand off to the dispatcher (owns the ApnsClient): it resolves the callee's VoIP tokens and
+    // sends the ring. Respond 200 once queued, even if the callee has zero VoIP-capable devices.
+    let _ = state.ext_push_tx.try_send(ExtensionPushEvent::Ring {
+        to_address,
+        call_id: payload.call_id,
+        kind: payload.kind,
+        video: payload.video,
+        sender: wallet.wallet_address,
+        timestamp: unix_time_ms(),
+        payload: payload.payload,
+    });
+
+    Ok(Json(serde_json::json!({})))
+}
 
 #[allow(clippy::too_many_arguments)]
 fn authenticate_push_request(
@@ -1889,6 +2021,13 @@ impl PushApiError {
     fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
         }
     }
