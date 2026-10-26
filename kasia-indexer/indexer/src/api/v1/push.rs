@@ -879,7 +879,7 @@ async fn register_device(
     let token_suffix = dt.get(dt.len().saturating_sub(10)..).unwrap_or(dt.as_str());
     let watched_sample: Vec<&String> = payload.watched_addresses.iter().take(4).collect();
     tracing::info!(
-        "[Push] register platform={} token=...{} watched={} watched_sample={:?} groups={} bcast_channels={:?} kaposts_pubkey={} kaposts_watch_authors={} primary={} auth={}",
+        "[Push] register platform={} token=...{} watched={} watched_sample={:?} groups={} bcast_channels={:?} kaposts_pubkey={} kaposts_watch_authors={} watch_only={} apns_topic={:?} primary={} auth={}",
         payload.platform,
         token_suffix,
         payload.watched_addresses.len(),
@@ -888,6 +888,8 @@ async fn register_device(
         payload.watched_broadcast_channels,
         payload.kaposts_pubkey.is_some(),
         payload.kaposts_watch_authors.len(),
+        payload.watch_only_addresses.len(),
+        payload.apns_topic,
         payload.primary_address.is_some(),
         payload.auth.is_some(),
     );
@@ -987,6 +989,22 @@ async fn update_registration(
     State(state): State<PushApi>,
     Json(payload): Json<PushUpdateRequest>,
 ) -> impl IntoResponse {
+    let dt = &payload.device_token;
+    let token_suffix = dt.get(dt.len().saturating_sub(10)..).unwrap_or(dt.as_str());
+    // apns_topic is the requested one; a topic not in APNS_ALLOWED_TOPICS is dropped on store.
+    tracing::info!(
+        "[Push] update token=...{} watched={} groups={} bcast_channels={:?} kaposts_pubkey={} kaposts_watch_authors={} watch_only={} apns_topic={:?} primary={} auth={}",
+        token_suffix,
+        payload.watched_addresses.len(),
+        payload.watched_group_ids.as_ref().map(|g| g.len()).unwrap_or(0),
+        payload.watched_broadcast_channels,
+        payload.kaposts_pubkey.is_some(),
+        payload.kaposts_watch_authors.len(),
+        payload.watch_only_addresses.len(),
+        payload.apns_topic,
+        payload.primary_address.is_some(),
+        payload.auth.is_some(),
+    );
     let verified_auth = match authenticate_push_request(
         &state,
         "PUT",
