@@ -108,8 +108,9 @@ pub enum ExtensionPushEvent {
 pub struct FundsPushEvent {
     /// Watched outputs credited by this tx: (address, amount in sompi).
     pub credited: Vec<(AddressPayload, u64)>,
-    /// Resolved input (sender) address, if known — used for self-send filtering.
-    pub sender: Option<AddressPayload>,
+    /// Watched addresses whose outputs this tx's inputs spend (any input, deduped). A device
+    /// watching any of them gets no push: the owner funded their own address.
+    pub senders: Vec<AddressPayload>,
     /// Accepting tx id.
     pub tx_id: [u8; 32],
     pub timestamp: u64,

@@ -38,6 +38,9 @@ use indexer_db::migration::apply_migrations;
 use indexer_db::processing::accepting_block_to_txs::AcceptingBlockToTxIDPartition;
 use indexer_db::processing::pending_senders::PendingSenderResolutionPartition;
 use indexer_db::processing::tx_id_to_acceptance::TxIDToAcceptancePartition;
+use indexer_db::processing::watched_outpoints::{
+    WatchedOutpointPartition, WatchedOutpointSpendPartition,
+};
 use indexer_db::push::{
     DeviceRegistrationPartition, PrimaryAddressPartition, WatchedAddressPartition,
     WatchedGroupIdPartition,
@@ -233,6 +236,8 @@ async fn main() -> anyhow::Result<()> {
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
     let acceptance_to_tx_id_partition = AcceptingBlockToTxIDPartition::new(&tx_keyspace)?;
     let pending_sender_resolution_partition = PendingSenderResolutionPartition::new(&tx_keyspace)?;
+    let watched_outpoint_partition = WatchedOutpointPartition::new(&tx_keyspace)?;
+    let watched_outpoint_spend_partition = WatchedOutpointSpendPartition::new(&tx_keyspace)?;
     let handshake_by_sender_partition = HandshakeBySenderPartition::new(&tx_keyspace)?;
     let payment_by_sender_partition = PaymentBySenderPartition::new(&tx_keyspace)?;
     let block_gaps_partition = BlockGapsPartition::new(&tx_keyspace)?;
@@ -373,6 +378,8 @@ async fn main() -> anyhow::Result<()> {
         .shared_metrics(metrics.clone())
         .push_tx(push_tx.clone())
         .push_funds_tx(funds_push_tx.clone())
+        .watched_outpoint_partition(watched_outpoint_partition.clone())
+        .watched_outpoint_spend_partition(watched_outpoint_spend_partition.clone())
         .build();
     let mut virtual_processor = VirtualProcessor::builder()
         .synced_capacity(3_000_000)

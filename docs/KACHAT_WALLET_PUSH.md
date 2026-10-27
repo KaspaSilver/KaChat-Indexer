@@ -3,6 +3,14 @@
 **For:** the indexer session (`kasia-indexer`, the push service). **From:** the KaChat Wallet
 iOS session (`KaspaSilver/KaChat-Wallet-iPhone`).
 
+> **Status (2026-10-27): both done in the indexer.** §1: the block processor keeps the outpoints
+> paying a watched address (`watched_outpoints`, fjall) and resolves EVERY input against it;
+> `FundsPushEvent.senders` is a list and `watch_only_tokens` drops a device watching any of them.
+> A spent outpoint stays resolvable for 24 h (`watched_outpoint_spends`), so every parallel block
+> carrying the spend still sees it, then is pruned. Not done: seeding the map from the node on
+> register, so a coin received before its address was watched can still ping once when first
+> spent. §2: register/update accept a device with only `primary_address`.
+
 KaChat Wallet (`com.kachat.wallet`) registers for two pushes only: **Received KAS**
 (`address_activity`, its own addresses in `watch_only_addresses`) and **.kachat name events**
 (`name_event`, its main address in `primary_address`). The per-app topic and the wallet-only push

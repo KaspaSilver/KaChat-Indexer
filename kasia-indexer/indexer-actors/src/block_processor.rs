@@ -38,6 +38,10 @@ use indexer_db::metadata::MetadataPartition;
 use indexer_db::processing::tx_id_to_acceptance::{
     AcceptanceKey, Action, InsertionEntry, TxIDToAcceptancePartition,
 };
+use indexer_db::processing::watched_outpoints::{
+    WatchedOutpointKey, WatchedOutpointPartition, WatchedOutpointSpendKey,
+    WatchedOutpointSpendPartition,
+};
 use indexer_db::{AddressPayload, IntoBytes, PartitionId};
 use kaspa_consensus_core::tx::Transaction;
 use kaspa_rpc_core::{RpcBlock, RpcHeader, RpcTransaction, RpcTransactionId, RpcTransactionOutput};
@@ -50,6 +54,7 @@ use protocol::operation::{
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::iter;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, info_span, trace, warn};
 
 #[derive(bon::Builder)]
@@ -87,9 +92,21 @@ pub struct BlockProcessor {
     push_tx: Option<flume::Sender<PushEvent>>,
     // Address Activity: accepted txs crediting a watched (owned) address are forwarded here.
     push_funds_tx: Option<flume::Sender<FundsPushEvent>>,
+    // Address Activity self-send filter: which watched address each output paid, and when it was
+    // spent (pruned after WATCHED_SPEND_RETENTION).
+    watched_outpoint_partition: WatchedOutpointPartition,
+    watched_outpoint_spend_partition: WatchedOutpointSpendPartition,
+    last_watched_prune: Option<Instant>,
     #[builder(default)]
     gaps_filling_in_progress: usize,
 }
+
+/// How long a spent watched outpoint stays resolvable: long enough for every parallel block
+/// carrying the spending tx to be processed, gap filling after a restart included.
+const WATCHED_SPEND_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often expired spends are pruned, and at most how many per pass.
+const WATCHED_PRUNE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const WATCHED_PRUNE_BATCH: usize = 10_000;
 
 impl BlockProcessor {
     pub fn process(&mut self) -> anyhow::Result<()> {
@@ -350,6 +367,7 @@ impl BlockProcessor {
             block.header.blue_work.to_be_bytes(),
         )?;
         debug!(hash = %block.header.hash.as_bytes().to_hex_64(), tx_count = block.transactions.len(), "Processing block transactions");
+        self.prune_watched_spends(wtx)?;
         for tx in &block.transactions {
             self.handle_transaction(wtx, &block.header, tx)?;
         }
@@ -366,52 +384,103 @@ impl BlockProcessor {
         }
     }
 
+    /// Drop spent watched outpoints older than WATCHED_SPEND_RETENTION, at most once per
+    /// WATCHED_PRUNE_INTERVAL.
+    fn prune_watched_spends(&mut self, wtx: &mut WriteTransaction) -> anyhow::Result<()> {
+        if self
+            .last_watched_prune
+            .is_some_and(|at| at.elapsed() < WATCHED_PRUNE_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.last_watched_prune = Some(Instant::now());
+        let cutoff_ms = unix_ms().saturating_sub(WATCHED_SPEND_RETENTION.as_millis() as u64);
+        let expired = self
+            .watched_outpoint_spend_partition
+            .spent_before(cutoff_ms, WATCHED_PRUNE_BATCH)?;
+        for spend in &expired {
+            self.watched_outpoint_partition.remove_wtx(wtx, &spend.outpoint);
+            self.watched_outpoint_spend_partition.remove_wtx(wtx, spend);
+        }
+        if !expired.is_empty() {
+            debug!(count = expired.len(), "Pruned spent watched outpoints");
+        }
+        Ok(())
+    }
+
     /// Address Activity: emit a [`FundsPushEvent`] when `tx` credits at least one watched (owned)
-    /// address. The dispatcher does the per-device match, per-device summing, self-send filtering
-    /// and rate limiting. Cheap no-op when no device is watching (`watch_only_is_empty`).
+    /// address, and record each output paying one. The senders are the watched addresses whose
+    /// outputs ANY input spends; a device watching one of them gets no push (a self-send,
+    /// docs/KACHAT_WALLET_PUSH.md §1). An input missing from the map did not come from a watched
+    /// address (or arrived before it was watched). The dispatcher does the per-device match,
+    /// per-device summing and rate limiting. Cheap no-op when no device is watching
+    /// (`watch_only_is_empty`).
     fn emit_funds_received(
         &self,
+        wtx: &mut WriteTransaction,
         tx: &RpcTransaction,
         tx_id: RpcTransactionId,
         block_header: &RpcHeader,
-    ) {
+    ) -> anyhow::Result<()> {
         let Some(funds_tx) = &self.push_funds_tx else {
-            return;
+            return Ok(());
         };
         if crate::watch_only_is_empty() {
-            return;
+            return Ok(());
         }
+        let mut senders: Vec<AddressPayload> = Vec::new();
+        let mut spent_at_ms = None;
+        for input in &tx.inputs {
+            let outpoint = WatchedOutpointKey {
+                tx_id: input.previous_outpoint.transaction_id.as_bytes(),
+                index: input.previous_outpoint.index.into(),
+            };
+            let Some(addr) = self.watched_outpoint_partition.get_wtx(wtx, &outpoint)? else {
+                continue;
+            };
+            let spent_at_ms = *spent_at_ms.get_or_insert_with(unix_ms);
+            self.watched_outpoint_spend_partition.insert_wtx(
+                wtx,
+                &WatchedOutpointSpendKey {
+                    spent_at_ms: spent_at_ms.into(),
+                    outpoint,
+                },
+            );
+            if !senders.contains(&addr) {
+                senders.push(addr);
+            }
+        }
+        let tx_id_bytes = tx_id.as_bytes();
         let mut credited: Vec<(AddressPayload, u64)> = Vec::new();
-        for output in &tx.outputs {
+        for (index, output) in tx.outputs.iter().enumerate() {
             if let Ok(addr) = AddressPayload::try_from(&output.script_public_key)
                 && crate::watch_only_contains(&addr)
             {
+                self.watched_outpoint_partition.insert_wtx(
+                    wtx,
+                    &WatchedOutpointKey {
+                        tx_id: tx_id_bytes,
+                        index: (index as u32).into(),
+                    },
+                    &addr,
+                );
                 credited.push((addr, output.value));
             }
         }
         if credited.is_empty() {
-            return;
+            return Ok(());
         }
-        // Best-effort sender resolution (first input) for self-send filtering — catches the common
-        // case of change returning to one's own address from one's own outgoing payment.
-        let sender = tx.inputs.first().and_then(|input| {
-            let outpoint = input.previous_outpoint;
-            self.tx_id_to_acceptance_partition
-                .key_by_tx_id(outpoint.transaction_id.as_ref())
-                .ok()
-                .flatten()
-                .map(|key| key.receiver)
-        });
         let event = FundsPushEvent {
             credited,
-            sender,
-            tx_id: tx_id.as_bytes(),
+            senders,
+            tx_id: tx_id_bytes,
             timestamp: block_header.timestamp,
             daa_score: block_header.daa_score,
         };
         if funds_tx.try_send(event).is_err() {
             warn!("Dropping funds push event; queue is full");
         }
+        Ok(())
     }
 
     fn handle_transaction(
@@ -431,7 +500,7 @@ impl BlockProcessor {
         // this fires on block sighting (matching the message pushes here), not strictly on
         // acceptance; the dispatcher dedups by tx id, but a tx later reorged out of the selected
         // chain could yield a rare false "received" push.
-        self.emit_funds_received(tx, tx_id, block_header);
+        self.emit_funds_received(wtx, tx, tx_id, block_header)?;
 
         // todo handle the case when tx has many operations
         let Some(op) = parse_sealed_operation(&tx.payload).inspect(|op| {
@@ -1105,6 +1174,13 @@ impl BlockProcessor {
         }
         Ok(())
     }
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn decode_fixed_hex<const N: usize>(hex_bytes: &[u8]) -> anyhow::Result<[u8; N]> {

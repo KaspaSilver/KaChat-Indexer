@@ -1834,6 +1834,7 @@ dependencies = [
  "kaspa-txscript",
  "rayon",
  "smallvec",
+ "tempfile",
  "tracing",
  "zerocopy",
 ]

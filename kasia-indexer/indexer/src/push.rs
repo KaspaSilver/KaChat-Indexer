@@ -151,9 +151,17 @@ impl PushRegistry {
         let requested_apns_environment = normalize_apns_environment(apns_environment);
         let requested_voip_token = normalize_voip_token(voip_token);
         // A watch-only device (KaChat Wallet: Received KAS + .kachat pushes) registers no chat
-        // address and no group; its watch-only addresses are what it is here for.
-        if addresses.is_empty() && group_ids.is_empty() && normalized_watch_only.is_empty() {
-            anyhow::bail!("watched_addresses, watched_group_ids and watch_only_addresses must not all be empty");
+        // address and no group; its watch-only addresses are what it is here for. With Address
+        // Activity off it sends only its primary address, for .kachat name events
+        // (docs/KACHAT_WALLET_PUSH.md §2).
+        if addresses.is_empty()
+            && group_ids.is_empty()
+            && normalized_watch_only.is_empty()
+            && normalized_primary_address.is_none()
+        {
+            anyhow::bail!(
+                "nothing to watch: watched_addresses, watched_group_ids, watch_only_addresses and primary_address are all empty"
+            );
         }
 
         let existing = self.get_registration(&token)?;
@@ -475,9 +483,17 @@ impl PushRegistry {
         let requested_apns_environment = normalize_apns_environment(apns_environment);
         let requested_voip_token = normalize_voip_token(voip_token);
         // A watch-only device (KaChat Wallet: Received KAS + .kachat pushes) registers no chat
-        // address and no group; its watch-only addresses are what it is here for.
-        if addresses.is_empty() && group_ids.is_empty() && normalized_watch_only.is_empty() {
-            anyhow::bail!("watched_addresses, watched_group_ids and watch_only_addresses must not all be empty");
+        // address and no group; its watch-only addresses are what it is here for. With Address
+        // Activity off it sends only its primary address, for .kachat name events
+        // (docs/KACHAT_WALLET_PUSH.md §2).
+        if addresses.is_empty()
+            && group_ids.is_empty()
+            && normalized_watch_only.is_empty()
+            && normalized_primary_address.is_none()
+        {
+            anyhow::bail!(
+                "nothing to watch: watched_addresses, watched_group_ids, watch_only_addresses and primary_address are all empty"
+            );
         }
 
         let existing = self.get_registration(&token)?;
@@ -1043,13 +1059,14 @@ impl PushRegistry {
     }
 
     /// Address Activity: devices to notify that `address` was credited. Matches devices whose
-    /// `watch_only_addresses` include `address`, and drops any device that also watches `sender`
-    /// (a self-send: the owner funded their own address, so no ping). Iterates all registrations
-    /// (funds events are gated on the global watch-only set, so this only runs for real hits).
+    /// `watch_only_addresses` include `address`, and drops any device that also watches one of
+    /// `senders` (a self-send: the owner funded their own address, so no ping;
+    /// docs/KACHAT_WALLET_PUSH.md §1). Iterates all registrations (funds events are gated on the
+    /// global watch-only set, so this only runs for real hits).
     pub fn watch_only_tokens(
         &self,
         address: &AddressPayload,
-        sender: Option<&AddressPayload>,
+        senders: &[AddressPayload],
     ) -> anyhow::Result<Vec<String>> {
         let rtx = self.tx_keyspace.read_tx();
         let mut tokens = Vec::new();
@@ -1069,9 +1086,7 @@ impl PushRegistry {
             if !payloads.iter().any(|p| p == address) {
                 continue;
             }
-            if let Some(sender) = sender
-                && payloads.iter().any(|p| p == sender)
-            {
+            if payloads.iter().any(|p| senders.contains(p)) {
                 continue;
             }
             tokens.push(reg.device_token);
@@ -1598,7 +1613,7 @@ enum PushRegistryCommand {
     },
     MatchWatchOnlyTokens {
         address: AddressPayload,
-        sender: Option<AddressPayload>,
+        senders: Vec<AddressPayload>,
         response: RegistryResponse<Vec<String>>,
     },
     ApnsEnvironmentForTokens {
@@ -1834,10 +1849,10 @@ impl PushRegistryActor {
                 }
                 PushRegistryCommand::MatchWatchOnlyTokens {
                     address,
-                    sender,
+                    senders,
                     response,
                 } => {
-                    let result = self.registry.watch_only_tokens(&address, sender.as_ref());
+                    let result = self.registry.watch_only_tokens(&address, &senders);
                     let _ = response.send(result);
                 }
                 PushRegistryCommand::ApnsEnvironmentForTokens { tokens, response } => {
@@ -2132,11 +2147,11 @@ impl PushRegistryHandle {
     pub async fn match_watch_only_tokens(
         &self,
         address: AddressPayload,
-        sender: Option<AddressPayload>,
+        senders: Vec<AddressPayload>,
     ) -> anyhow::Result<Vec<String>> {
         self.request(|response| PushRegistryCommand::MatchWatchOnlyTokens {
             address,
-            sender,
+            senders,
             response,
         })
         .await
@@ -2831,7 +2846,7 @@ impl PushDispatcher {
             }
             let mut tokens = self
                 .registry
-                .match_watch_only_tokens(*address, event.sender)
+                .match_watch_only_tokens(*address, event.senders.clone())
                 .await?;
             tokens.sort_unstable();
             tokens.dedup();
@@ -4975,9 +4990,9 @@ mod kaposts_watch_tests {
         let (actor, handle) = PushRegistryActor::new(registry, 8);
         let actor_thread = std::thread::spawn(move || actor.process());
         let address = Address::new(Prefix::Mainnet, Version::PubKey, &[7u8; 32]).to_string();
-        let register = |token: String, watch_only: Vec<String>, topic: Option<&str>| {
+        let register = |token: String, watch_only: Vec<String>, topic: Option<&str>, primary: bool| {
             let handle = handle.clone();
-            let address = address.clone();
+            let primary = primary.then(|| address.clone());
             let topic = topic.map(str::to_string);
             async move {
                 handle
@@ -4987,7 +5002,7 @@ mod kaposts_watch_tests {
                         vec![], // no chat address
                         vec![], // no group
                         vec![],
-                        Some(address),
+                        primary,
                         vec![],
                         vec![],
                         Default::default(),
@@ -5007,15 +5022,27 @@ mod kaposts_watch_tests {
         };
 
         // KaChat Wallet: nothing but watch-only addresses, on its own topic.
-        register("ab".repeat(32), vec![address.clone()], Some("com.kachat.wallet"))
+        register("ab".repeat(32), vec![address.clone()], Some("com.kachat.wallet"), true)
             .await
             .expect("a watch-only registration is accepted");
         // A topic not on the allow-list is dropped (the device then uses APNS_TOPIC).
-        register("cd".repeat(32), vec![address.clone()], Some("com.example.other"))
+        register("cd".repeat(32), vec![address.clone()], Some("com.example.other"), true)
             .await
             .expect("registration succeeds");
+        // Address Activity off: only the primary address, for .kachat name events
+        // (docs/KACHAT_WALLET_PUSH.md §2).
+        register("ef".repeat(32), vec![], Some("com.kachat.wallet"), true)
+            .await
+            .expect("a primary-address-only registration is accepted");
+        assert!(
+            handle
+                .tokens_for_primary_address_str(address.clone())
+                .await
+                .expect("primary tokens")
+                .contains(&"ef".repeat(32))
+        );
         // Nothing at all to watch is still refused.
-        assert!(register("ef".repeat(32), vec![], None).await.is_err());
+        assert!(register("01".repeat(32), vec![], None, false).await.is_err());
 
         let topics = handle
             .apns_topics_for_tokens(vec!["ab".repeat(32), "cd".repeat(32)])
@@ -5023,6 +5050,83 @@ mod kaposts_watch_tests {
             .expect("topics");
         assert_eq!(topics.get(&"ab".repeat(32)).cloned().flatten().as_deref(), Some("com.kachat.wallet"));
         assert_eq!(topics.get(&"cd".repeat(32)).cloned().flatten(), None);
+
+        drop(handle);
+        actor_thread.join().expect("actor exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn a_self_send_from_any_watched_input_is_not_received() {
+        use indexer_db::AddressPayload;
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let registry = PushRegistry::new(
+            tx_keyspace.clone(),
+            DeviceRegistrationPartition::new(&tx_keyspace).expect("device partition"),
+            WatchedAddressPartition::new(&tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(&tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(&tx_keyspace).expect("primary partition"),
+            create_shared_metrics(),
+        );
+        let (actor, handle) = PushRegistryActor::new(registry, 8);
+        let actor_thread = std::thread::spawn(move || actor.process());
+        let addr = |b: u8| Address::new(Prefix::Mainnet, Version::PubKey, &[b; 32]);
+        let (main, spending, stranger) = (addr(1), addr(2), addr(3));
+        let payload = |a: &Address| AddressPayload::try_from(a).expect("payload");
+
+        // A wallet watching its main and one spending address; another device watching main only.
+        for (token, watch_only) in [
+            ("ab".repeat(32), vec![main.to_string(), spending.to_string()]),
+            ("cd".repeat(32), vec![main.to_string()]),
+        ] {
+            handle
+                .register(
+                    token,
+                    "ios".to_string(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    vec![],
+                    vec![],
+                    Default::default(),
+                    None,
+                    None,
+                    vec![],
+                    watch_only,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("watch-only registration");
+        }
+        let matched = |senders: Vec<AddressPayload>| {
+            let handle = handle.clone();
+            let main = payload(&main);
+            async move {
+                let mut tokens = handle.match_watch_only_tokens(main, senders).await.expect("match");
+                tokens.sort();
+                tokens
+            }
+        };
+
+        // From someone else: both devices.
+        assert_eq!(matched(vec![]).await, vec!["ab".repeat(32), "cd".repeat(32)]);
+        assert_eq!(matched(vec![payload(&stranger)]).await, vec!["ab".repeat(32), "cd".repeat(32)]);
+        // Change back to main from a spend of the spending address (not the first input): only
+        // the device that doesn't watch the spending address.
+        assert_eq!(
+            matched(vec![payload(&stranger), payload(&spending)]).await,
+            vec!["cd".repeat(32)]
+        );
+        // Spending from main itself: neither.
+        assert!(matched(vec![payload(&main)]).await.is_empty());
 
         drop(handle);
         actor_thread.join().expect("actor exits cleanly");

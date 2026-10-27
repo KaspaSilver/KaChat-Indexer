@@ -16,3 +16,6 @@ zerocopy = { workspace = true, features = ["derive"] }
 kaspa-consensus-core.workspace = true
 kaspa-txscript.workspace = true
 kaspa-addresses.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"
