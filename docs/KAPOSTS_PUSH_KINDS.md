@@ -1,4 +1,4 @@
-# KaPosts pushes: no chat pushes, no chat address needed to register (2026-10-27)
+# KaPosts pushes: only KaPosts and Public Chats pushes (2026-10-27)
 
 **For:** the indexer session (`kasia-indexer`, the push service). **From:** the KaPosts iOS
 session (`KaspaSilver/KaPosts-iPhone`).
@@ -6,7 +6,7 @@ session (`KaspaSilver/KaPosts-iPhone`).
 KaPosts (`com.kachat.kaposts`, shown to people as "KaPost") is the feed and Public Chats app. It
 has no 1:1 chats, no groups and no calls, and it has no notification service extension. It
 needs two kinds of push only: **`kaposts`** (likes, comments, reposts, follows, new posts from
-watched authors) and **`broadcast`** (Public Chats rooms). Two things are needed.
+watched authors) and **`broadcast`** (Public Chats rooms). One server change is needed (section 1).
 
 ## 1. KaPosts devices get only `kaposts` and `broadcast` pushes (required)
 
@@ -19,8 +19,8 @@ body "New message" (seen 2026-10-27). That is `PushAlert::from_type`'s fallback 
 chat message. KaPosts has no extension to decrypt or hide it, so iOS shows the raw alert. The
 27f9c57 note says "KaPosts devices get whatever they register for", and a KaPosts device ends up
 matched for chat pushes in two ways:
-- `watched_addresses`: KaPosts still sends the addresses of any 1:1 conversations its shared
-  code knows about (see 2 for why it can't send an empty list).
+- `watched_addresses`: KaPosts sent the addresses of any 1:1 conversations its shared code
+  knew about. It sends none from now on (see 2).
 - `primary_address`: handshake and `inbox` pushes go to every device whose primary address is
   the recipient (`tokens_for_primary_address`, `tokens_for_inbox`). The same seed is often used
   in KaChat and KaPosts.
@@ -37,35 +37,15 @@ and in the token filter, drop a KaPosts-topic token unless `KAPOSTS_PUSH_TYPES` 
 `event_type`, the same way as the wallet filter (count it in the tally like `wallet_filtered`).
 VoIP: KaPosts registers no VoIP token, so rings can't reach it already.
 
-## 2. Accept a KaPosts registration with no chat address (required)
+## 2. Registering without a chat address (done by 97692c5)
 
-**The rule:** `register` and `update` accept empty `watched_addresses`, `watched_group_ids` and
-`watch_only_addresses` when the device has something KaPosts-shaped to watch: `kaposts_pubkey`
-is set, or `kaposts_watch_authors` or `watched_broadcast_channels` is not empty.
+KaPosts used to send the addresses of any 1:1 conversations its shared code knew about. It did
+this only because `register` / `update` refused an empty `watched_addresses`. 97692c5 accepts a
+registration whose only watch is `primary_address`, and KaPosts always sends one. So KaPosts now
+sends `watched_addresses: []` and registers on its main address, `kaposts_pubkey` and rooms. This
+needs 97692c5 deployed; until then, its registration gets a 400.
 
-**What happens today:** both refuse it ("watched_addresses, watched_group_ids and
-watch_only_addresses must not all be empty"). KaPosts therefore only registers when it has a 1:1
-conversation address to send. A KaPosts user with none never registers, and gets KaPosts
-notifications only from the in-app poller while the app runs.
-
-**Where:** the emptiness check in `register` (around line 155) and `update` (around line 479) in
-`indexer/src/push.rs`, for example:
-
-```rust
-let kaposts_watch = normalized_kaposts_pubkey.is_some()
-    || !normalized_kaposts_watch_authors.is_empty()
-    || !broadcast_channels.is_empty();
-if addresses.is_empty() && group_ids.is_empty() && normalized_watch_only.is_empty()
-    && !kaposts_watch
-{
-    anyhow::bail!("nothing to watch");
-}
-```
-
-(With the KaChat Wallet hand-off's `primary_address` case added to the same condition.)
-
-Once this ships, KaPosts will send `watched_addresses: []` and register on its KaPosts key and
-rooms alone. That app change waits for this one, since the server refuses it today.
+The primary address still matches handshake and `inbox` pushes, so section 1 is still needed.
 
 ## The app side
 
@@ -73,7 +53,7 @@ rooms alone. That app change waits for this one, since the server refuses it tod
   the foreground (`AppDelegate.userNotificationCenter(_:willPresent:)` in
   `KaPosts/App/KaPostsApp.swift`). In the background or closed it can't. It has no extension,
   so only the server can stop those banners.
-- KaPosts registers with `apns_topic: "com.kachat.kaposts"`, `kaposts_pubkey`,
+- KaPosts registers with `apns_topic: "com.kachat.kaposts"`, `watched_addresses: []`, `kaposts_pubkey`,
   `kaposts_notify`, `kaposts_watch_authors`, `watched_broadcast_channels`,
   `hidden_broadcast_senders` and `primary_address`.
 
@@ -84,5 +64,5 @@ rooms alone. That app change waits for this one, since the server refuses it tod
    KaPosts token filtered.
 2. Like that account's post: KaPosts gets the `kaposts` push. Post in a room KaPosts has the bell
    on for: KaPosts gets the `broadcast` push.
-3. Register a device with `apns_topic` `com.kachat.kaposts`, `kaposts_pubkey` set and empty
-   `watched_addresses` / `watched_group_ids` / `watch_only_addresses`: 200, not 400.
+3. Make sure 97692c5 is deployed. The KaPosts register log line shows `watched=0` and
+   `primary=true`, and the response is 200.
