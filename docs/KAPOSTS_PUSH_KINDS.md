@@ -8,6 +8,10 @@ has no 1:1 chats, no groups and no calls, and it has no notification service ext
 needs two kinds of push only: **`kaposts`** (likes, comments, reposts, follows, new posts from
 watched authors) and **`broadcast`** (Public Chats rooms). One server change is needed (section 1).
 
+> **Status (2026-10-27): done.** `deliver()` drops a `com.kachat.kaposts` token unless the push
+> type is `kaposts` or `broadcast` (`topic_takes_push`, shared with the wallet filter). When it
+> drops any token it logs `[Push] type=<type>: filtered wallet=N kaposts=N`.
+
 ## 1. KaPosts devices get only `kaposts` and `broadcast` pushes (required)
 
 **The rule:** a device registered with `apns_topic` = `com.kachat.kaposts` gets no push of any

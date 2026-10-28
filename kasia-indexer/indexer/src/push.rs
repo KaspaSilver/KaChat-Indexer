@@ -2943,20 +2943,33 @@ impl PushDispatcher {
             .platforms_for_tokens(tokens.clone())
             .await
             .unwrap_or_default();
-        // Per-app APNs topics; KaChat Wallet devices take only their two kinds of push.
+        // Per-app APNs topics; KaChat Wallet and KaPosts devices take only their own kinds of push.
         let topics = self
             .registry
             .apns_topics_for_tokens(tokens.clone())
             .await
             .unwrap_or_default();
         let event_type = fcm_data.get("type").map(String::as_str).unwrap_or("");
-        let wallet_ok = WALLET_PUSH_TYPES.contains(&event_type);
-        let before = tokens.len();
         let tokens: Vec<String> = tokens
             .into_iter()
-            .filter(|t| wallet_ok || topics.get(t).cloned().flatten().as_deref() != Some(WALLET_APNS_TOPIC))
+            .filter(|t| {
+                let topic = topics.get(t).cloned().flatten();
+                let ok = topic_takes_push(topic.as_deref(), event_type);
+                if !ok {
+                    match topic.as_deref() {
+                        Some(KAPOSTS_APNS_TOPIC) => tally.kaposts_filtered += 1,
+                        _ => tally.wallet_filtered += 1,
+                    }
+                }
+                ok
+            })
             .collect();
-        tally.wallet_filtered = before - tokens.len();
+        if tally.wallet_filtered + tally.kaposts_filtered > 0 {
+            info!(
+                "[Push] type={event_type}: filtered wallet={} kaposts={} (not their kind of push)",
+                tally.wallet_filtered, tally.kaposts_filtered
+            );
+        }
         let mut apns_tokens = Vec::new();
         let mut fcm_tokens = Vec::new();
         let mut web_tokens = Vec::new();
@@ -3368,6 +3381,8 @@ struct DeliveryTally {
     unconfigured: usize,
     /// KaChat Wallet devices dropped because this kind of push is not one of theirs.
     wallet_filtered: usize,
+    /// KaPosts devices dropped because this kind of push is not one of theirs.
+    kaposts_filtered: usize,
 }
 
 enum DeliveryOutcome {
@@ -4423,6 +4438,22 @@ fn normalize_apns_topic(topic: Option<String>) -> Option<String> {
 const WALLET_APNS_TOPIC: &str = "com.kachat.wallet";
 const WALLET_PUSH_TYPES: &[&str] = &["address_activity", "name_event"];
 
+/// KaPosts (docs/KAPOSTS_PUSH_KINDS.md): its devices get only KaPosts and Public Chats pushes. It
+/// has no notification service extension either, and its primary address would otherwise match
+/// handshake and inbox pushes.
+const KAPOSTS_APNS_TOPIC: &str = "com.kachat.kaposts";
+const KAPOSTS_PUSH_TYPES: &[&str] = &["kaposts", "broadcast"];
+
+/// Whether a device on this APNs topic takes a push of this `type`. Devices on other topics (or
+/// none) take every kind.
+fn topic_takes_push(topic: Option<&str>, event_type: &str) -> bool {
+    match topic {
+        Some(WALLET_APNS_TOPIC) => WALLET_PUSH_TYPES.contains(&event_type),
+        Some(KAPOSTS_APNS_TOPIC) => KAPOSTS_PUSH_TYPES.contains(&event_type),
+        _ => true,
+    }
+}
+
 /// Canonicalize a requested APNs environment to the stored form: "development"/"sandbox" =>
 /// "sandbox", "production" => "production", anything else (incl. empty) => None (unknown).
 fn normalize_apns_environment(env: Option<String>) -> Option<String> {
@@ -4902,6 +4933,32 @@ mod tests {
 #[cfg(test)]
 mod name_push_tests {
     use super::*;
+
+    #[test]
+    fn wallet_and_kaposts_devices_take_only_their_own_pushes() {
+        let chat = [
+            "message",
+            "handshake",
+            "payment",
+            "inbox",
+            "group_message",
+            "group_control",
+        ];
+        for kind in chat {
+            assert!(!topic_takes_push(Some(KAPOSTS_APNS_TOPIC), kind), "{kind}");
+            assert!(!topic_takes_push(Some(WALLET_APNS_TOPIC), kind), "{kind}");
+            assert!(topic_takes_push(Some("com.kachat.app"), kind), "{kind}");
+            assert!(topic_takes_push(None, kind), "{kind}");
+        }
+        for kind in ["kaposts", "broadcast"] {
+            assert!(topic_takes_push(Some(KAPOSTS_APNS_TOPIC), kind), "{kind}");
+            assert!(!topic_takes_push(Some(WALLET_APNS_TOPIC), kind), "{kind}");
+        }
+        for kind in ["address_activity", "name_event"] {
+            assert!(topic_takes_push(Some(WALLET_APNS_TOPIC), kind), "{kind}");
+            assert!(!topic_takes_push(Some(KAPOSTS_APNS_TOPIC), kind), "{kind}");
+        }
+    }
 
     #[test]
     fn name_event_payload_matches_part_e() {
