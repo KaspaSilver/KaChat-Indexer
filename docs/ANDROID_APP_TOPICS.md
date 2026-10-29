@@ -25,6 +25,12 @@ credential.
 §1 and §2 change the same function and must ship together. Until §1 ships, KaPay and KaPost
 Android devices store `apns_topic = None`, and under §2 they would get KaChat's chat pushes.
 
+> **Status (2026-10-29): done in the indexer alone.** `KNOWN_APP_TOPICS` (`push.rs`) always
+> accepts the five app topics, whatever `APNS_ALLOWED_TOPICS` lists, so Kaspa Quick Start needs no
+> change. `kapay.kachat.app` is filtered with `com.kachat.wallet` and `kapost.kachat.app` with
+> `com.kachat.kaposts` (`WALLET_APNS_TOPICS` / `KAPOSTS_APNS_TOPICS` in `topic_takes_push`).
+> Covered by `a_wallet_registers_watch_only_and_keeps_an_allowed_topic`.
+
 ## 1. Accept the two Android topics (required)
 
 **What happens today:** `normalize_apns_topic` (`indexer/src/push.rs`) keeps a topic only if it

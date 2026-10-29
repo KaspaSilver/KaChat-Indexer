@@ -2957,7 +2957,7 @@ impl PushDispatcher {
                 let ok = topic_takes_push(topic.as_deref(), event_type);
                 if !ok {
                     match topic.as_deref() {
-                        Some(KAPOSTS_APNS_TOPIC) => tally.kaposts_filtered += 1,
+                        Some(t) if KAPOSTS_APNS_TOPICS.contains(&t) => tally.kaposts_filtered += 1,
                         _ => tally.wallet_filtered += 1,
                     }
                 }
@@ -4407,9 +4407,9 @@ fn normalize_kaposts_pubkey(pubkey: Option<String>) -> Option<String> {
     }
 }
 
-/// The APNs topics a device may register for: `APNS_ALLOWED_TOPICS` (comma-separated bundle
-/// ids, set by Kaspa Quick Start: com.kachat.app, com.kachat.kaposts, com.kachat.wallet), else
-/// `APNS_TOPIC` alone. Read once.
+/// The extra APNs topics a device may register for, on top of `KNOWN_APP_TOPICS`:
+/// `APNS_ALLOWED_TOPICS` (comma-separated bundle ids, set by Kaspa Quick Start: com.kachat.app,
+/// com.kachat.kaposts, com.kachat.wallet), else `APNS_TOPIC` alone. Read once.
 fn allowed_apns_topics() -> &'static [String] {
     static TOPICS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     TOPICS.get_or_init(|| {
@@ -4426,30 +4426,42 @@ fn allowed_apns_topics() -> &'static [String] {
     })
 }
 
-/// Keep a requested APNs topic only if it is an allowed one (exact bundle id).
+/// The KaChat apps' own topics, always accepted whatever the env lists: the iPhone bundle ids
+/// and the Android package names (docs/ANDROID_APP_TOPICS.md). An app topic that was dropped to
+/// `None` would let every kind of push through to an app that can't show it.
+const KNOWN_APP_TOPICS: &[&str] = &[
+    "com.kachat.app",
+    "com.kachat.kaposts",
+    "com.kachat.wallet",
+    "kapay.kachat.app",
+    "kapost.kachat.app",
+];
+
+/// Keep a requested APNs topic only if it is a known or allowed one (exact bundle id).
 fn normalize_apns_topic(topic: Option<String>) -> Option<String> {
     let topic = topic?.trim().to_string();
-    allowed_apns_topics().iter().any(|t| *t == topic).then_some(topic)
+    (KNOWN_APP_TOPICS.contains(&topic.as_str()) || allowed_apns_topics().contains(&topic))
+        .then_some(topic)
 }
 
-/// KaChat Wallet (KaChat-Wallet/PUSH_SERVICE.md): its devices get only Received KAS and
-/// .kachat pushes. It has no notification service extension, so an encrypted chat push would
-/// show as a bare banner.
-const WALLET_APNS_TOPIC: &str = "com.kachat.wallet";
+/// KaChat Wallet (KaChat-Wallet/PUSH_SERVICE.md), called KaPay on Android: its devices get only
+/// Received KAS and .kachat pushes. It has no notification service extension, so an encrypted
+/// chat push would show as a bare banner. iPhone topic, then Android.
+const WALLET_APNS_TOPICS: &[&str] = &["com.kachat.wallet", "kapay.kachat.app"];
 const WALLET_PUSH_TYPES: &[&str] = &["address_activity", "name_event"];
 
 /// KaPosts (docs/KAPOSTS_PUSH_KINDS.md): its devices get only KaPosts and Public Chats pushes. It
 /// has no notification service extension either, and its primary address would otherwise match
-/// handshake and inbox pushes.
-const KAPOSTS_APNS_TOPIC: &str = "com.kachat.kaposts";
+/// handshake and inbox pushes. iPhone topic, then Android.
+const KAPOSTS_APNS_TOPICS: &[&str] = &["com.kachat.kaposts", "kapost.kachat.app"];
 const KAPOSTS_PUSH_TYPES: &[&str] = &["kaposts", "broadcast"];
 
 /// Whether a device on this APNs topic takes a push of this `type`. Devices on other topics (or
 /// none) take every kind.
 fn topic_takes_push(topic: Option<&str>, event_type: &str) -> bool {
     match topic {
-        Some(WALLET_APNS_TOPIC) => WALLET_PUSH_TYPES.contains(&event_type),
-        Some(KAPOSTS_APNS_TOPIC) => KAPOSTS_PUSH_TYPES.contains(&event_type),
+        Some(t) if WALLET_APNS_TOPICS.contains(&t) => WALLET_PUSH_TYPES.contains(&event_type),
+        Some(t) if KAPOSTS_APNS_TOPICS.contains(&t) => KAPOSTS_PUSH_TYPES.contains(&event_type),
         _ => true,
     }
 }
@@ -4944,19 +4956,31 @@ mod name_push_tests {
             "group_message",
             "group_control",
         ];
+        // iPhone and Android topics of each app behave the same.
+        let wallets = ["com.kachat.wallet", "kapay.kachat.app"];
+        let kaposts = ["com.kachat.kaposts", "kapost.kachat.app"];
         for kind in chat {
-            assert!(!topic_takes_push(Some(KAPOSTS_APNS_TOPIC), kind), "{kind}");
-            assert!(!topic_takes_push(Some(WALLET_APNS_TOPIC), kind), "{kind}");
+            for topic in wallets.iter().chain(&kaposts) {
+                assert!(!topic_takes_push(Some(topic), kind), "{topic} {kind}");
+            }
             assert!(topic_takes_push(Some("com.kachat.app"), kind), "{kind}");
             assert!(topic_takes_push(None, kind), "{kind}");
         }
         for kind in ["kaposts", "broadcast"] {
-            assert!(topic_takes_push(Some(KAPOSTS_APNS_TOPIC), kind), "{kind}");
-            assert!(!topic_takes_push(Some(WALLET_APNS_TOPIC), kind), "{kind}");
+            for topic in kaposts {
+                assert!(topic_takes_push(Some(topic), kind), "{topic} {kind}");
+            }
+            for topic in wallets {
+                assert!(!topic_takes_push(Some(topic), kind), "{topic} {kind}");
+            }
         }
         for kind in ["address_activity", "name_event"] {
-            assert!(topic_takes_push(Some(WALLET_APNS_TOPIC), kind), "{kind}");
-            assert!(!topic_takes_push(Some(KAPOSTS_APNS_TOPIC), kind), "{kind}");
+            for topic in wallets {
+                assert!(topic_takes_push(Some(topic), kind), "{topic} {kind}");
+            }
+            for topic in kaposts {
+                assert!(!topic_takes_push(Some(topic), kind), "{topic} {kind}");
+            }
         }
     }
 
@@ -5047,15 +5071,20 @@ mod kaposts_watch_tests {
         let (actor, handle) = PushRegistryActor::new(registry, 8);
         let actor_thread = std::thread::spawn(move || actor.process());
         let address = Address::new(Prefix::Mainnet, Version::PubKey, &[7u8; 32]).to_string();
-        let register = |token: String, watch_only: Vec<String>, topic: Option<&str>, primary: bool| {
+        let register_on = |platform: &str,
+                           token: String,
+                           watch_only: Vec<String>,
+                           topic: Option<&str>,
+                           primary: bool| {
             let handle = handle.clone();
+            let platform = platform.to_string();
             let primary = primary.then(|| address.clone());
             let topic = topic.map(str::to_string);
             async move {
                 handle
                     .register(
                         token,
-                        "ios".to_string(),
+                        platform,
                         vec![], // no chat address
                         vec![], // no group
                         vec![],
@@ -5076,6 +5105,9 @@ mod kaposts_watch_tests {
                     )
                     .await
             }
+        };
+        let register = |token: String, watch_only: Vec<String>, topic: Option<&str>, primary: bool| {
+            register_on("ios", token, watch_only, topic, primary)
         };
 
         // KaChat Wallet: nothing but watch-only addresses, on its own topic.
@@ -5107,6 +5139,36 @@ mod kaposts_watch_tests {
             .expect("topics");
         assert_eq!(topics.get(&"ab".repeat(32)).cloned().flatten().as_deref(), Some("com.kachat.wallet"));
         assert_eq!(topics.get(&"cd".repeat(32)).cloned().flatten(), None);
+
+        // Android KaPay and KaPost (docs/ANDROID_APP_TOPICS.md): their package names are kept
+        // although APNS_ALLOWED_TOPICS above doesn't list them, so their filters apply.
+        let kapay = "a1".repeat(32);
+        let kapost = "a2".repeat(32);
+        register_on("android", kapay.clone(), vec![address.clone()], Some("kapay.kachat.app"), true)
+            .await
+            .expect("KaPay Android registers");
+        register_on("android", kapost.clone(), vec![], Some("kapost.kachat.app"), true)
+            .await
+            .expect("KaPost Android registers on its primary address alone");
+        let primary_tokens = handle
+            .tokens_for_primary_address_str(address.clone())
+            .await
+            .expect("primary tokens");
+        assert!(primary_tokens.contains(&kapay) && primary_tokens.contains(&kapost));
+        let topics = handle
+            .apns_topics_for_tokens(vec![kapay.clone(), kapost.clone()])
+            .await
+            .expect("topics");
+        let kapay_topic = topics.get(&kapay).cloned().flatten();
+        let kapost_topic = topics.get(&kapost).cloned().flatten();
+        assert_eq!(kapay_topic.as_deref(), Some("kapay.kachat.app"));
+        assert_eq!(kapost_topic.as_deref(), Some("kapost.kachat.app"));
+        // A handshake for that primary address skips KaPay; a Received push reaches it.
+        assert!(!super::topic_takes_push(kapay_topic.as_deref(), "handshake"));
+        assert!(super::topic_takes_push(kapay_topic.as_deref(), "address_activity"));
+        // A DM skips KaPost; a KaPosts push reaches it.
+        assert!(!super::topic_takes_push(kapost_topic.as_deref(), "message"));
+        assert!(super::topic_takes_push(kapost_topic.as_deref(), "kaposts"));
 
         drop(handle);
         actor_thread.join().expect("actor exits cleanly");
