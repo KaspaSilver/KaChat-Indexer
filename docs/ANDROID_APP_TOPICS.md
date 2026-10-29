@@ -1,26 +1,29 @@
-# Android app topics: KaPay and KaPost on Android (2026-10-29)
+# App push kinds: KaPay and KaPost on Android, KaChat chats only (2026-10-29)
 
 **For:** the indexer session (`kasia-indexer`, the push service). **From:** the KaPay Android
 session (`KaspaSilver/KaPay-Android`, formerly KaChat-Wallet-Android), also on behalf of KaPost
-Android (`KaspaSilver/KaPosts-Android`).
+Android (`KaspaSilver/KaPosts-Android`) and KaChat Android (`KaspaSilver/KaChat-Android`).
+
+Each app may get only its own kinds of push, on iPhone and Android alike:
+
+| App | iPhone `apns_topic` | Android `apns_topic` | Pushes it may get |
+|---|---|---|---|
+| KaPay (the wallet) | `com.kachat.wallet` | `kapay.kachat.app` (new) | `address_activity`, `name_event` |
+| KaPost | `com.kachat.kaposts` | `kapost.kachat.app` (new) | `kaposts`, `broadcast` |
+| KaChat | none sent (APNs default topic `com.kachat.app`) | none sent, the same as iPhone | `contextual`, `handshake`, `payment`, `group_message`, `group_control` (new rule) |
 
 The Android apps are published under their own package names, which differ from the iPhone
-bundle ids, and each registers with `apns_topic` = its Android package (debug builds send the
-same, without `.debug`):
+bundle ids. KaPay and KaPost Android send `apns_topic` = their package (debug builds send the
+same, without `.debug`). KaPlay (chess, `kaplay.kachat.app`) has no push on either platform and
+never registers.
 
-| App | iPhone `apns_topic` (already handled) | Android `apns_topic` (new) | Pushes it may get |
-|---|---|---|---|
-| KaPay (the wallet) | `com.kachat.wallet` | `kapay.kachat.app` | `address_activity`, `name_event` |
-| KaPost | `com.kachat.kaposts` | `kapost.kachat.app` | `kaposts`, `broadcast` |
-| KaChat | `com.kachat.app` | (none sent, as today) | everything |
+Firebase is unchanged: `com.kachat.app(.debug)`, `kapay.kachat.app(.debug)` and
+`kapost.kachat.app(.debug)` are all Android apps in the project the service already sends with
+(`kachat-fc22a`), so their FCM tokens work with the existing service account. No new key or
+credential.
 
-KaChat Android (`com.kachat.app`) needs no change. It already works and keeps getting every
-kind of push. KaPlay (chess, `kaplay.kachat.app`) has no push on either platform and never
-registers.
-
-Firebase is unchanged: the Android apps `kapay.kachat.app(.debug)` and `kapost.kachat.app(.debug)`
-are registered in the same project the service already sends with (`kachat-fc22a`), so their FCM
-tokens work with the existing service account. No new key or credential.
+§1 and §2 change the same function and must ship together. Until §1 ships, KaPay and KaPost
+Android devices store `apns_topic = None`, and under §2 they would get KaChat's chat pushes.
 
 ## 1. Accept the two Android topics (required)
 
@@ -61,6 +64,64 @@ same goes for KaPost Android, which is the bug `KAPOSTS_PUSH_KINDS.md` fixed for
   `allowed_apns_topics` is read once (`OnceLock`) and a second test's list would race the
   first.
 
+## 2. KaChat gets only chat pushes (required)
+
+KaChat is now 1:1 and group chats only. On iPhone, KaChat-iPhone `e2f6732b` removed Public Chats,
+KaPosts and Chess Online, and `d54ea87c` removed the wallet features and the .kachat market. On
+Android the same removals are `d6ff6f17` and `21e9d74d`. Its pushes are now limited to:
+
+- 1:1 chats: `contextual` (messages, including inbox messages and self-stash, which goes out as
+  `contextual`) and `handshake` (a new conversation);
+- group chats: `group_message` and `group_control`;
+- KAS received on the chat address: `payment`, the payment sent inside a chat (the sealed
+  payment; the app shows "<who> - Sent you 1.5 KAS");
+- call rings, which go through `/v1/push/ring` and PushKit, outside this filter, and are
+  unchanged.
+
+**What happens today:** `topic_takes_push` has no KaChat entry: a device with `apns_topic`
+`None` or `com.kachat.app` takes every kind. Both apps register the removed features empty
+(`watched_broadcast_channels: []`, `kaposts_pubkey: null`, no KaPosts watch authors, no
+`watch_only_addresses`), so `broadcast`, `kaposts` and `address_activity` mostly no longer match
+a KaChat device. But:
+
+- `name_event` matches on `primary_address` (`tokens_for_primary_address_str`), so every KaChat
+  device whose address owns a .kachat name still gets each sold, offer, expiry and reminder
+  push. The apps can't show them any more: iPhone files them silently, and Android drops them
+  (`KaChatFirebaseMessagingService`, `"name_event"`). Each one still wakes the phone and uses
+  up the device's rate limit.
+- A KaChat phone that last registered on an older build still holds its public chat channels
+  and KaPosts pubkey until it next re-registers. Until then it keeps getting `broadcast` and
+  `kaposts` pushes the app drops.
+
+**The rule:** a KaChat device (`apns_topic` `None` or `com.kachat.app`) takes only
+`contextual`, `handshake`, `payment`, `group_message` and `group_control`. `name_event`,
+`address_activity`, `kaposts` and `broadcast` never reach it.
+
+**Suggested fix:**
+
+- `const KACHAT_PUSH_TYPES: &[&str] = &["contextual", "handshake", "payment", "group_message",
+  "group_control"];` and in `topic_takes_push`
+  `None | Some("com.kachat.app") => KACHAT_PUSH_TYPES.contains(&event_type)`. After §1, `None`
+  only ever means a KaChat device, because every other app sends a topic. Leave any other
+  unknown topic at `true`; `normalize_apns_topic` already turns those into `None`.
+- Check the `type` strings `deliver` sees against the FCM `type` field: the chat events write
+  `payload.message_type`, which is `contextual` / `payment` / `handshake` / `group_message` /
+  `group_control` (the `kind_label` `self_stash` is only a log label). The existing table test
+  lists `message` and `inbox`. If either really occurs as a `type`, add it to the list.
+  Otherwise fix the test.
+- Tally: add `kachat_filtered` next to `wallet_filtered` / `kaposts_filtered`, so the log line
+  shows KaChat devices being skipped.
+- Tests: in `wallet_and_kaposts_devices_take_only_their_own_pushes`, assert that `None` and
+  `Some("com.kachat.app")` take each chat kind and refuse `name_event`, `address_activity`,
+  `kaposts` and `broadcast`. Add one registry-level test: a KaChat registration (no topic)
+  whose `primary_address` owns a name gets no `name_event` push, while a KaPay registration on
+  the same address does.
+
+**Not part of this:** a plain KAS transfer from another wallet (no chat payment attached) is an
+`address_activity` event. That reaches only devices with `watch_only_addresses`, which is KaPay.
+KaChat registers none, on iPhone or Android, so it gets no push for those, the same as iPhone
+today.
+
 ## How to test
 
 1. Install a KaPay Android build made after 2026-10-29 (it has `google-services.json`; b5 or
@@ -70,3 +131,6 @@ same goes for KaPost Android, which is the bug `KAPOSTS_PUSH_KINDS.md` fixed for
 3. Send KAS to the wallet's address from another wallet with KaPay closed: one "Received KAS"
    push arrives. A KaChat chat message to the same address produces no push on that phone.
 4. KaPost Android: likes and replies push; a DM to its address does not.
+5. KaChat (iPhone and Android): a 1:1 message, a new conversation, a group message and a
+   payment sent in a chat each push. A .kachat name event for the account's own name doesn't
+   push, and neither does a KaPosts like. The `deliver` log shows them as `kachat=` filtered.
