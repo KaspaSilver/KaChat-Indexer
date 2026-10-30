@@ -25,11 +25,18 @@ credential.
 §1 and §2 change the same function and must ship together. Until §1 ships, KaPay and KaPost
 Android devices store `apns_topic = None`, and under §2 they would get KaChat's chat pushes.
 
-> **Status (2026-10-29): done in the indexer alone.** `KNOWN_APP_TOPICS` (`push.rs`) always
-> accepts the five app topics, whatever `APNS_ALLOWED_TOPICS` lists, so Kaspa Quick Start needs no
-> change. `kapay.kachat.app` is filtered with `com.kachat.wallet` and `kapost.kachat.app` with
-> `com.kachat.kaposts` (`WALLET_APNS_TOPICS` / `KAPOSTS_APNS_TOPICS` in `topic_takes_push`).
-> Covered by `a_wallet_registers_watch_only_and_keeps_an_allowed_topic`.
+> **Status (2026-10-29): §1 and §2 done in the indexer alone, shipped together.**
+> - §1: `KNOWN_APP_TOPICS` (`push.rs`) always accepts the five app topics, whatever
+>   `APNS_ALLOWED_TOPICS` lists, so Kaspa Quick Start needs no change. `kapay.kachat.app` is
+>   filtered with `com.kachat.wallet` and `kapost.kachat.app` with `com.kachat.kaposts`.
+> - §2: `topic_takes_push` gives a KaChat device (topic none or `com.kachat.app`) only
+>   `KACHAT_PUSH_TYPES` (`contextual`, `handshake`, `payment`, `group_message`,
+>   `group_control`). The chat `type` really is `contextual` (inbox and self-stash too); the
+>   old table test's `message` / `inbox` never occur and are gone.
+> - `deliver` logs `[Push] type=<type>: filtered wallet=N kaposts=N kachat=N`.
+> - Tests: `each_app_takes_only_its_own_pushes` (every type against every app topic) and
+>   `a_wallet_registers_watch_only_and_keeps_an_allowed_topic` (Android topics kept; on one
+>   primary address the name event reaches only the KaPay devices, a handshake only KaChat).
 
 ## 1. Accept the two Android topics (required)
 

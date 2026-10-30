@@ -2943,7 +2943,7 @@ impl PushDispatcher {
             .platforms_for_tokens(tokens.clone())
             .await
             .unwrap_or_default();
-        // Per-app APNs topics; KaChat Wallet and KaPosts devices take only their own kinds of push.
+        // Per-app APNs topics; each app's devices take only their own kinds of push.
         let topics = self
             .registry
             .apns_topics_for_tokens(tokens.clone())
@@ -2957,17 +2957,18 @@ impl PushDispatcher {
                 let ok = topic_takes_push(topic.as_deref(), event_type);
                 if !ok {
                     match topic.as_deref() {
+                        Some(t) if WALLET_APNS_TOPICS.contains(&t) => tally.wallet_filtered += 1,
                         Some(t) if KAPOSTS_APNS_TOPICS.contains(&t) => tally.kaposts_filtered += 1,
-                        _ => tally.wallet_filtered += 1,
+                        _ => tally.kachat_filtered += 1,
                     }
                 }
                 ok
             })
             .collect();
-        if tally.wallet_filtered + tally.kaposts_filtered > 0 {
+        if tally.wallet_filtered + tally.kaposts_filtered + tally.kachat_filtered > 0 {
             info!(
-                "[Push] type={event_type}: filtered wallet={} kaposts={} (not their kind of push)",
-                tally.wallet_filtered, tally.kaposts_filtered
+                "[Push] type={event_type}: filtered wallet={} kaposts={} kachat={} (not their kind of push)",
+                tally.wallet_filtered, tally.kaposts_filtered, tally.kachat_filtered
             );
         }
         let mut apns_tokens = Vec::new();
@@ -3383,6 +3384,8 @@ struct DeliveryTally {
     wallet_filtered: usize,
     /// KaPosts devices dropped because this kind of push is not one of theirs.
     kaposts_filtered: usize,
+    /// KaChat devices dropped because this kind of push is not one of theirs.
+    kachat_filtered: usize,
 }
 
 enum DeliveryOutcome {
@@ -4456,10 +4459,25 @@ const WALLET_PUSH_TYPES: &[&str] = &["address_activity", "name_event"];
 const KAPOSTS_APNS_TOPICS: &[&str] = &["com.kachat.kaposts", "kapost.kachat.app"];
 const KAPOSTS_PUSH_TYPES: &[&str] = &["kaposts", "broadcast"];
 
-/// Whether a device on this APNs topic takes a push of this `type`. Devices on other topics (or
-/// none) take every kind.
+/// KaChat (docs/ANDROID_APP_TOPICS.md §2) is 1:1 and group chats only: messages (`contextual`,
+/// which includes inbox messages and self-stash), new conversations, payments sent in a chat and
+/// group pushes. Call rings go through PushKit, outside this filter. A KaChat device sends no
+/// topic on either platform (iPhone uses the default `com.kachat.app`); every other app sends
+/// one, and an unknown topic is stored as none, so none means KaChat.
+const KACHAT_APNS_TOPIC: &str = "com.kachat.app";
+const KACHAT_PUSH_TYPES: &[&str] = &[
+    "contextual",
+    "handshake",
+    "payment",
+    "group_message",
+    "group_control",
+];
+
+/// Whether a device on this APNs topic takes a push of this `type`. A topic outside the apps'
+/// own (only possible through APNS_ALLOWED_TOPICS) takes every kind.
 fn topic_takes_push(topic: Option<&str>, event_type: &str) -> bool {
     match topic {
+        None | Some(KACHAT_APNS_TOPIC) => KACHAT_PUSH_TYPES.contains(&event_type),
         Some(t) if WALLET_APNS_TOPICS.contains(&t) => WALLET_PUSH_TYPES.contains(&event_type),
         Some(t) if KAPOSTS_APNS_TOPICS.contains(&t) => KAPOSTS_PUSH_TYPES.contains(&event_type),
         _ => true,
@@ -4947,41 +4965,34 @@ mod name_push_tests {
     use super::*;
 
     #[test]
-    fn wallet_and_kaposts_devices_take_only_their_own_pushes() {
-        let chat = [
-            "message",
-            "handshake",
-            "payment",
-            "inbox",
-            "group_message",
-            "group_control",
+    fn each_app_takes_only_its_own_pushes() {
+        // Every `type` deliver() sends, by the app that takes it. iPhone and Android topics of
+        // each app behave the same; KaChat sends no topic on either.
+        let kachat: [Option<&str>; 2] = [None, Some("com.kachat.app")];
+        let wallets = [Some("com.kachat.wallet"), Some("kapay.kachat.app")];
+        let kaposts = [Some("com.kachat.kaposts"), Some("kapost.kachat.app")];
+        let kinds: [(&str, &[Option<&str>]); 9] = [
+            ("contextual", &kachat),
+            ("handshake", &kachat),
+            ("payment", &kachat),
+            ("group_message", &kachat),
+            ("group_control", &kachat),
+            ("kaposts", &kaposts),
+            ("broadcast", &kaposts),
+            ("address_activity", &wallets),
+            ("name_event", &wallets),
         ];
-        // iPhone and Android topics of each app behave the same.
-        let wallets = ["com.kachat.wallet", "kapay.kachat.app"];
-        let kaposts = ["com.kachat.kaposts", "kapost.kachat.app"];
-        for kind in chat {
-            for topic in wallets.iter().chain(&kaposts) {
-                assert!(!topic_takes_push(Some(topic), kind), "{topic} {kind}");
-            }
-            assert!(topic_takes_push(Some("com.kachat.app"), kind), "{kind}");
-            assert!(topic_takes_push(None, kind), "{kind}");
-        }
-        for kind in ["kaposts", "broadcast"] {
-            for topic in kaposts {
-                assert!(topic_takes_push(Some(topic), kind), "{topic} {kind}");
-            }
-            for topic in wallets {
-                assert!(!topic_takes_push(Some(topic), kind), "{topic} {kind}");
+        for (kind, owners) in kinds {
+            for topic in kachat.iter().chain(&wallets).chain(&kaposts) {
+                assert_eq!(
+                    topic_takes_push(*topic, kind),
+                    owners.contains(topic),
+                    "{topic:?} {kind}"
+                );
             }
         }
-        for kind in ["address_activity", "name_event"] {
-            for topic in wallets {
-                assert!(topic_takes_push(Some(topic), kind), "{topic} {kind}");
-            }
-            for topic in kaposts {
-                assert!(!topic_takes_push(Some(topic), kind), "{topic} {kind}");
-            }
-        }
+        // A topic only an env allow-list could add is not filtered.
+        assert!(topic_takes_push(Some("com.example.other"), "name_event"));
     }
 
     #[test]
@@ -5167,8 +5178,39 @@ mod kaposts_watch_tests {
         assert!(!super::topic_takes_push(kapay_topic.as_deref(), "handshake"));
         assert!(super::topic_takes_push(kapay_topic.as_deref(), "address_activity"));
         // A DM skips KaPost; a KaPosts push reaches it.
-        assert!(!super::topic_takes_push(kapost_topic.as_deref(), "message"));
+        assert!(!super::topic_takes_push(kapost_topic.as_deref(), "contextual"));
         assert!(super::topic_takes_push(kapost_topic.as_deref(), "kaposts"));
+
+        // KaChat (no topic, on iPhone and Android) on the same primary address: matched for the
+        // address's .kachat name event, but only the wallet devices take it; KaChat takes chats.
+        let kachat = "a3".repeat(32);
+        register_on("android", kachat.clone(), vec![], None, true)
+            .await
+            .expect("KaChat registers on its primary address");
+        let name_tokens = handle
+            .tokens_for_primary_address_str(address.clone())
+            .await
+            .expect("primary tokens");
+        let topics = handle
+            .apns_topics_for_tokens(name_tokens.clone())
+            .await
+            .expect("topics");
+        let takes = |kind: &str| -> Vec<String> {
+            let mut out: Vec<String> = name_tokens
+                .iter()
+                .filter(|t| super::topic_takes_push(topics.get(*t).cloned().flatten().as_deref(), kind))
+                .cloned()
+                .collect();
+            out.sort();
+            out
+        };
+        assert!(name_tokens.contains(&kachat));
+        let mut wallets = vec!["ab".repeat(32), "ef".repeat(32), kapay.clone()];
+        wallets.sort();
+        assert_eq!(takes("name_event"), wallets);
+        let mut chats = vec!["cd".repeat(32), kachat.clone()]; // "cd": its topic was dropped to none
+        chats.sort();
+        assert_eq!(takes("handshake"), chats);
 
         drop(handle);
         actor_thread.join().expect("actor exits cleanly");
