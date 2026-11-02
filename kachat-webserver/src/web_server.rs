@@ -26,7 +26,8 @@ use crate::api_handlers::ApiHandlers;
 use crate::config::ServerConfig;
 use crate::database_trait::DatabaseInterface;
 use crate::models::{
-    ApiError, BroadcastChannelsResponse, BroadcastsResponse, ChessLeaderboardResponse, ChessPlayerRow, ChessTournamentRow,
+    ApiError, BroadcastChannelsResponse, BroadcastsResponse, ChessBotBoard, ChessBotLeaderboardResponse,
+    ChessBotPlayerRow, ChessLeaderboardResponse, ChessPlayerRow, ChessTournamentRow,
     ChessTournamentsResponse, GetThreadResponse, PaginatedEngagementResponse,
     PaginatedNotificationsResponse, PaginatedPostsResponse, PaginatedRepliesResponse,
     PaginatedTippersResponse, PaginatedUsersResponse, PollData, PostDetailsResponse, ServerUserPost,
@@ -52,6 +53,8 @@ pub struct AppState {
     pub translate_rate_limit_map: crate::translate::TranslateRateLimitMap,
     /// Chess leaderboard: replaying the whole arena is expensive, so cache the two derived views.
     pub chess_cache: Arc<RwLock<ChessCache>>,
+    /// Chess bot leaderboards: the chess-bots replay, cached the same way.
+    pub chess_bots_cache: Arc<RwLock<ChessBotsCache>>,
     /// §5.10: direct pool handle for the scheduled-posts store (raw SQL).
     pub scheduled_pool: sqlx::PgPool,
     /// .kachat names registry module (testnet). Off unless KACHAT_NAMES_MANIFEST is set.
@@ -71,6 +74,82 @@ pub struct ChessCache {
 }
 
 const CHESS_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Cached result of one chess-bots replay (chess::compute_bots), both periods.
+#[derive(Default)]
+pub struct ChessBotsCache {
+    computed_at: Option<Instant>,
+    snapshot: ChessBotsSnapshot,
+}
+
+#[derive(Clone, Default)]
+struct ChessBotsSnapshot {
+    bots: Vec<ChessBotBoard>,
+    since: i64,
+    monthly_bots: Vec<ChessBotBoard>,
+    monthly_since: i64,
+}
+
+impl ChessBotsSnapshot {
+    /// `period=month` = this UTC calendar month; anything else = all time.
+    fn board(self, period: Option<&str>) -> (Vec<ChessBotBoard>, i64, &'static str) {
+        match period.map(|p| p.trim().to_lowercase()).as_deref() {
+            Some("month") | Some("monthly") => (self.monthly_bots, self.monthly_since, "month"),
+            _ => (self.bots, self.since, "all"),
+        }
+    }
+}
+
+/// Serve the bot boards from cache, replaying the chess-bots rows when stale.
+async fn chess_bots_snapshot(state: &AppState) -> ChessBotsSnapshot {
+    {
+        let cache = state.chess_bots_cache.read().await;
+        if cache.computed_at.is_some_and(|at| at.elapsed() < CHESS_CACHE_TTL) {
+            return cache.snapshot.clone();
+        }
+    }
+    let rows = state.db.get_chess_bots_rows().await.unwrap_or_default();
+    let rows: Vec<crate::chess::ArenaRow> = rows
+        .into_iter()
+        .map(|(tx_id, sender, block_time, content)| crate::chess::ArenaRow {
+            tx_id,
+            sender,
+            block_time,
+            content,
+        })
+        .collect();
+    let snap = crate::chess::compute_bots(rows, now_ms());
+    let to_boards = |boards: Vec<crate::chess::BotBoard>| -> Vec<ChessBotBoard> {
+        boards
+            .into_iter()
+            .map(|b| ChessBotBoard {
+                level: b.level,
+                games: b.games,
+                players: b
+                    .players
+                    .into_iter()
+                    .map(|p| ChessBotPlayerRow {
+                        address: p.address,
+                        moves: p.moves,
+                        at: p.at,
+                        game_id: p.game_id,
+                        tx_id: p.tx_id,
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
+    let out = ChessBotsSnapshot {
+        bots: to_boards(snap.all_time),
+        since: snap.all_time_since,
+        monthly_bots: to_boards(snap.monthly),
+        monthly_since: snap.monthly_since,
+    };
+    let mut cache = state.chess_bots_cache.write().await;
+    cache.computed_at = Some(Instant::now());
+    cache.snapshot = out.clone();
+    out
+}
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -450,6 +529,7 @@ impl WebServer {
             http,
             translate_rate_limit_map,
             chess_cache: Arc::new(RwLock::new(ChessCache::default())),
+            chess_bots_cache: Arc::new(RwLock::new(ChessBotsCache::default())),
             scheduled_pool,
             names: crate::names::NamesState::from_env(),
         });
@@ -602,6 +682,8 @@ impl WebServer {
                 .route("/chess/leaderboard", get(handle_chess_leaderboard))
                 .route("/chess/player", get(handle_chess_player))
                 .route("/chess/tournaments", get(handle_chess_tournaments))
+                // KaPlay bot games: fewest moves to beat each bot (CHESS_BOT_LEADERBOARD.md).
+                .route("/chess/bots/leaderboard", get(handle_chess_bots_leaderboard))
                 .route("/translate", post(crate::translate::handle_translate))
                 .route(
                     "/translate/languages",
@@ -1174,7 +1256,7 @@ async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
 
     let public_chats = stats_count3(pool,
         "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7 \
-         FROM kachat_broadcasts WHERE channel <> 'chess-arena'", d1, d7).await;
+         FROM kachat_broadcasts WHERE channel NOT IN ('chess-arena', 'chess-bots')", d1, d7).await;
     let (k, v) = cat("publicChats", public_chats); categories.insert(k, v);
 
     let chess_moves = stats_count3(pool,
@@ -2225,6 +2307,26 @@ async fn handle_chess_leaderboard(
         period: period.to_string(),
         since,
         generated_at: now_ms(),
+    }))
+}
+
+/// GET /chess/bots/leaderboard?period=month|all&limit=100 — a board per bot, `limit` players each.
+async fn handle_chess_bots_leaderboard(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<ChessLeaderboardQuery>,
+) -> Result<Json<ChessBotLeaderboardResponse>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+    let (mut bots, since, period) = chess_bots_snapshot(&app_state).await.board(params.period.as_deref());
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000) as usize;
+    for bot in &mut bots {
+        bot.players.truncate(limit);
+    }
+    Ok(Json(ChessBotLeaderboardResponse {
+        period: period.to_string(),
+        since,
+        generated_at: now_ms(),
+        bots,
     }))
 }
 

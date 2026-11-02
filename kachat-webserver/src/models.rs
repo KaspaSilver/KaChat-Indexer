@@ -740,6 +740,39 @@ pub struct ChessTournamentsResponse {
     pub generated_at: i64,
 }
 
+// Chess bot leaderboards — see CHESS_BOT_LEADERBOARD.md §4.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChessBotPlayerRow {
+    pub address: String,
+    /// The player's own moves in their shortest win against this bot.
+    pub moves: i64,
+    /// Block time (ms) of that win.
+    pub at: i64,
+    #[serde(rename = "gameId")]
+    pub game_id: String,
+    #[serde(rename = "txId")]
+    pub tx_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChessBotBoard {
+    pub level: i64,
+    /// Every counted game against this bot in the period, wins or not.
+    pub games: u64,
+    pub players: Vec<ChessBotPlayerRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChessBotLeaderboardResponse {
+    /// "month" (this UTC calendar month) or "all".
+    pub period: String,
+    /// First counted block time (ms).
+    pub since: i64,
+    #[serde(rename = "generatedAt")]
+    pub generated_at: i64,
+    pub bots: Vec<ChessBotBoard>,
+}
+
 impl ServerReply {
     // New method to construct from enriched KReplyRecord with blocking status
     pub fn from_enriched_k_reply_record_with_block_status(

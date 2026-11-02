@@ -127,6 +127,31 @@ impl PostgresDbManager {
         hex::encode(bytes)
     }
 
+    /// Every row of a chess channel for a replay, as (tx_id_hex, sender_address, block_time,
+    /// content). The engines sort into chain order themselves.
+    async fn chess_channel_rows(&self, channel: &str) -> DatabaseResult<Vec<(String, String, i64, String)>> {
+        let rows = sqlx::query(
+            "SELECT encode(transaction_id, 'hex') AS tx, sender_address, block_time, content \
+             FROM kachat_broadcasts WHERE channel = $1",
+        )
+        .bind(channel)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch #{}: {}", channel, e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("tx"),
+                    row.get::<String, _>("sender_address"),
+                    row.get::<i64, _>("block_time"),
+                    row.get::<String, _>("content"),
+                )
+            })
+            .collect())
+    }
+
     fn parse_compound_cursor(cursor: &str) -> DatabaseResult<(u64, i64)> {
         if cursor.contains('_') {
             let parts: Vec<&str> = cursor.split('_').collect();
@@ -749,7 +774,7 @@ impl PostgresDbManager {
 /// The processor's fallback room list when `k_vars['broadcast_channels']` is unset. Kept in sync
 /// with `DEFAULT_BROADCAST_CHANNELS` in kachat-transaction-processor/src/k_protocol.rs (and
 /// kachat-admin, which shows it as suggestions).
-const DEFAULT_BROADCAST_CHANNELS: [&str; 16] = [
+const DEFAULT_BROADCAST_CHANNELS: [&str; 17] = [
     "kaspa",
     "kachat-bugs",
     "kaspa-indonesia",
@@ -766,6 +791,7 @@ const DEFAULT_BROADCAST_CHANNELS: [&str; 16] = [
     "kaspa-romania",
     "kaspa-russian",
     "chess-arena",
+    "chess-bots",
 ];
 
 #[async_trait]
@@ -2781,25 +2807,11 @@ impl DatabaseInterface for PostgresDbManager {
     }
 
     async fn get_chess_arena_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>> {
-        let rows = sqlx::query(
-            "SELECT encode(transaction_id, 'hex') AS tx, sender_address, block_time, content \
-             FROM kachat_broadcasts WHERE channel = 'chess-arena'",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch chess arena: {}", e)))?;
+        self.chess_channel_rows(crate::chess::ARENA_CHANNEL).await
+    }
 
-        Ok(rows
-            .iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("tx"),
-                    row.get::<String, _>("sender_address"),
-                    row.get::<i64, _>("block_time"),
-                    row.get::<String, _>("content"),
-                )
-            })
-            .collect())
+    async fn get_chess_bots_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>> {
+        self.chess_channel_rows(crate::chess::BOTS_CHANNEL).await
     }
 
     async fn get_content_by_id(

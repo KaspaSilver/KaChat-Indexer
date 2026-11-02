@@ -218,6 +218,9 @@ pub trait DatabaseInterface: Send + Sync {
     // (tx_id_hex, sender_address, block_time, content). The engine sorts internally.
     async fn get_chess_arena_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>>;
 
+    // Chess bot leaderboards: every chess-bots row (kept for good), in the same shape.
+    async fn get_chess_bots_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>>;
+
     // NEW: k_contents table - Get content by ID using unified content table
     async fn get_content_by_id(
         &self,

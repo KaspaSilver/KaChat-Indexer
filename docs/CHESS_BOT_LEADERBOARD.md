@@ -8,6 +8,16 @@ instead of one per move. KaPlay's Leaderboard tab shows a board per bot: each pl
 moves to win**. The server has to store those transactions and serve the boards. Until it does,
 each phone shows only its own wins.
 
+> **Status (2026-11-02): §1 to §5 done in the indexer.**
+> - §1: `chess-bots` is in `DEFAULT_BROADCAST_CHANNELS` (processor, webserver, admin), out of the
+>   `publicChats` stat, and exempt from the retention pruner (`kachat-transaction-processor/src/main.rs`).
+>   **A server with a saved channel list in the admin dashboard must add `chess-bots` there**, or
+>   it isn't tracked. Production has a saved list.
+> - §2 to §4: `chess::compute_bots` (`kachat-webserver/src/chess.rs`) serves
+>   `GET /chess/bots/leaderboard`, cached for 30 s like `/chess/leaderboard`. A row whose game id
+>   isn't a lowercase UUID is ignored, and doesn't take that (sender, `g`) slot.
+> - §5: `chess::tests` (`a_bot_win_counts_the_players_own_moves` and the three after it).
+
 ## 1. Track the channel (required)
 
 Add `chess-bots` to the tracked broadcast channels: `DEFAULT_BROADCAST_CHANNELS` in

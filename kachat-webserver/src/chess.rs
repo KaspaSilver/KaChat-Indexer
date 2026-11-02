@@ -1458,7 +1458,7 @@ fn leaderboard(tournaments: &HashMap<String, Tournament>, since_ms: i64) -> Vec<
 // Public entry points for the HTTP layer
 // ---------------------------------------------------------------------------
 
-/// A raw chess-arena broadcast row (as read from kachat_broadcasts).
+/// A raw chess-arena or chess-bots broadcast row (as read from kachat_broadcasts).
 pub struct ArenaRow {
     pub tx_id: String,
     pub sender: String,
@@ -1537,6 +1537,215 @@ pub fn compute_all(rows: Vec<ArenaRow>, now_ms: i64) -> ArenaSnapshot {
         monthly_since,
         lobby,
         games_started,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bot leaderboards (CHESS_BOT_LEADERBOARD.md): KaPlay's games against its on-phone bots
+// ---------------------------------------------------------------------------
+
+/// One transaction per finished bot game: kchat:1:bcast:chess-bots:<json>, signed by the player.
+pub const BOTS_CHANNEL: &str = "chess-bots";
+const BOT_LEVELS: std::ops::RangeInclusive<i64> = 1..=5;
+const BOT_END_REASONS: [&str; 6] = [
+    "checkmate",
+    "resignation",
+    "stalemate",
+    "insufficient material",
+    "the fifty-move rule",
+    "threefold repetition",
+];
+
+#[derive(Deserialize)]
+struct BotResultMessage {
+    #[serde(rename = "type", default)]
+    msg_type: String,
+    #[serde(default)]
+    v: i64,
+    #[serde(default)]
+    a: String,
+    #[serde(default)]
+    g: String,
+    #[serde(default)]
+    bot: i64,
+    #[serde(default)]
+    c: String,
+    #[serde(default)]
+    r: String,
+    #[serde(default)]
+    why: String,
+    #[serde(default)]
+    m: String,
+}
+
+/// Cheap gate, then decode. Only v2 `result` rows: the old v1 start/move/resign rows are ignored.
+fn decode_bot_result(content: &str) -> Option<BotResultMessage> {
+    if content.len() > 16_384 || !content.starts_with('{') || !content.contains("\"chess_bot\"") {
+        return None;
+    }
+    let message: BotResultMessage = serde_json::from_str(content).ok()?;
+    (message.msg_type == "chess_bot" && message.v == 2 && message.a == "result").then_some(message)
+}
+
+/// The game id is a lowercase UUID.
+fn is_game_id(g: &str) -> bool {
+    g.len() == 36
+        && g.char_indices().all(|(i, ch)| match i {
+            8 | 13 | 18 | 23 => ch == '-',
+            _ => ch.is_ascii_digit() || ('a'..='f').contains(&ch),
+        })
+}
+
+/// Replay `m` (space separated, e.g. `e2e4`, a promotion `e7e8q`) from the starting position.
+/// None if any move is malformed or illegal; else the final board and the ply count.
+fn replay_bot_moves(m: &str) -> Option<(Board, usize)> {
+    let mut board = initial_board();
+    let mut plies = 0;
+    for token in m.split_whitespace() {
+        if !token.is_ascii() || !(4..=5).contains(&token.len()) {
+            return None;
+        }
+        let promotion = match token.get(4..) {
+            Some("") => None,
+            letter => Some(PieceType::from_promotion_letter(letter)?),
+        };
+        let mv = normalizing_promotion(
+            Move {
+                from: Square::from_algebraic(&token[0..2])?,
+                to: Square::from_algebraic(&token[2..4])?,
+                promotion,
+            },
+            &board,
+        );
+        if !is_legal(mv, &board) {
+            return None;
+        }
+        board = apply(mv, &board);
+        plies += 1;
+    }
+    Some((board, plies))
+}
+
+/// A counted bot game: valid fields and every move legal. `win_moves` is the player's own move
+/// count when the game is a real win (r=won, why=checkmate, and the player's colour mated).
+struct BotGame {
+    level: i64,
+    sender: String,
+    tx_id: String,
+    block_time: i64,
+    game_id: String,
+    win_moves: Option<i64>,
+}
+
+fn bot_game(row: ArenaRow, message: BotResultMessage) -> Option<BotGame> {
+    let player = match message.c.as_str() {
+        "w" => Color::White,
+        "b" => Color::Black,
+        _ => return None,
+    };
+    if !BOT_LEVELS.contains(&message.bot)
+        || !["won", "lost", "drawn"].contains(&message.r.as_str())
+        || !BOT_END_REASONS.contains(&message.why.as_str())
+    {
+        return None;
+    }
+    let (board, plies) = replay_bot_moves(&message.m)?;
+    let mated_by_player = board.side_to_move == player.opposite() && is_checkmate(&board);
+    let win_moves = (message.r == "won" && message.why == "checkmate" && mated_by_player).then(|| {
+        let plies = plies as i64;
+        if player == Color::White { (plies + 1) / 2 } else { plies / 2 }
+    });
+    Some(BotGame {
+        level: message.bot,
+        sender: row.sender,
+        tx_id: row.tx_id,
+        block_time: row.block_time,
+        game_id: message.g,
+        win_moves,
+    })
+}
+
+/// One player's best (fewest moves) win against a bot.
+#[derive(Clone)]
+pub struct BotBoardRow {
+    pub address: String,
+    pub moves: i64,
+    pub at: i64,
+    pub game_id: String,
+    pub tx_id: String,
+}
+
+/// One bot's board: every counted game in the period, and the players who beat it.
+#[derive(Clone)]
+pub struct BotBoard {
+    pub level: i64,
+    pub games: u64,
+    pub players: Vec<BotBoardRow>,
+}
+
+pub struct BotSnapshot {
+    pub all_time: Vec<BotBoard>,
+    pub all_time_since: i64,
+    pub monthly: Vec<BotBoard>,
+    pub monthly_since: i64,
+}
+
+/// Boards for games at or after `since_ms` (by block time), lowest level first, bots with no
+/// games left out. `games` is in chain order, so on equal moves the earlier win stays.
+fn bot_boards(games: &[BotGame], since_ms: i64) -> Vec<BotBoard> {
+    let mut boards: Vec<BotBoard> = Vec::new();
+    for level in BOT_LEVELS {
+        let mut played = 0u64;
+        let mut best: HashMap<&str, BotBoardRow> = HashMap::new();
+        for game in games.iter().filter(|g| g.level == level && g.block_time >= since_ms) {
+            played += 1;
+            let Some(moves) = game.win_moves else { continue };
+            if best.get(game.sender.as_str()).is_some_and(|row| row.moves <= moves) {
+                continue;
+            }
+            best.insert(
+                &game.sender,
+                BotBoardRow {
+                    address: game.sender.clone(),
+                    moves,
+                    at: game.block_time,
+                    game_id: game.game_id.clone(),
+                    tx_id: game.tx_id.clone(),
+                },
+            );
+        }
+        if played == 0 {
+            continue;
+        }
+        let mut players: Vec<BotBoardRow> = best.into_values().collect();
+        players.sort_by(|a, b| a.moves.cmp(&b.moves).then(a.at.cmp(&b.at)).then(a.tx_id.cmp(&b.tx_id)));
+        boards.push(BotBoard { level, games: played, players });
+    }
+    boards
+}
+
+/// Replay the chess-bots rows once and return both periods' boards. Only the first row per
+/// (sender, game id) counts, in chain order (block time, then txid).
+pub fn compute_bots(mut rows: Vec<ArenaRow>, now_ms: i64) -> BotSnapshot {
+    rows.sort_by(|a, b| a.block_time.cmp(&b.block_time).then_with(|| a.tx_id.cmp(&b.tx_id)));
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut games: Vec<BotGame> = Vec::new();
+    for row in rows {
+        let Some(message) = decode_bot_result(&row.content) else { continue };
+        if !is_game_id(&message.g) || !seen.insert((row.sender.clone(), message.g.clone())) {
+            continue;
+        }
+        if let Some(game) = bot_game(row, message) {
+            games.push(game);
+        }
+    }
+    let all_time_since = period_since_ms(false, now_ms);
+    let monthly_since = period_since_ms(true, now_ms);
+    BotSnapshot {
+        all_time: bot_boards(&games, all_time_since),
+        all_time_since,
+        monthly: bot_boards(&games, monthly_since),
+        monthly_since,
     }
 }
 
@@ -1783,5 +1992,118 @@ mod tests {
         let ts = events(allowance_duel_opening(start));
         let g = ts.get("duel-1").unwrap().game(1, 0).unwrap();
         assert_eq!((g.white_used_ms, g.black_used_ms), (24_000, 15_000));
+    }
+
+    // Bot leaderboards (CHESS_BOT_LEADERBOARD.md §5).
+    const SCHOLARS_MATE: &str = "e2e4 e7e5 d1h5 b8c6 f1c4 g8f6 h5f7";
+    const SLOW_SCHOLARS_MATE: &str = "e2e4 e7e5 d1h5 b8c6 f1c4 a7a6 a2a3 g8f6 h5f7";
+    const FOOLS_MATE: &str = "f2f3 e7e5 g2g4 d8h4";
+    const BOT_NOW: i64 = 1_793_600_000_000; // Nov 2026
+
+    fn bot_row(tx: &str, sender: &str, bt: i64, g: &str, bot: i64, c: &str, r: &str, why: &str, m: &str) -> ArenaRow {
+        let json = serde_json::json!({
+            "a": "result", "bot": bot, "c": c, "g": g, "m": m, "r": r,
+            "type": "chess_bot", "v": 2, "why": why,
+        });
+        ev(tx, sender, bt, &json.to_string())
+    }
+    fn game_id(n: u32) -> String {
+        format!("3b0f{:04x}-0000-4000-8000-000000000000", n)
+    }
+    fn bot_win(tx: &str, sender: &str, bt: i64, n: u32, m: &str) -> ArenaRow {
+        bot_row(tx, sender, bt, &game_id(n), 3, "w", "won", "checkmate", m)
+    }
+    /// (games, [(address, moves)]) of bot 3's all-time board.
+    fn bot3(rows: Vec<ArenaRow>) -> (u64, Vec<(String, i64)>) {
+        let snap = compute_bots(rows, BOT_NOW);
+        match snap.all_time.iter().find(|b| b.level == 3) {
+            Some(b) => (b.games, b.players.iter().map(|p| (p.address.clone(), p.moves)).collect()),
+            None => (0, Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_bot_win_counts_the_players_own_moves() {
+        let t = LEADERBOARD_FRESH_FROM_MS + 1_000;
+        assert_eq!(bot3(vec![bot_win("a", "alice", t, 1, SCHOLARS_MATE)]), (1, vec![("alice".into(), 4)]));
+        let black = bot_row("b", "bob", t, &game_id(2), 3, "b", "won", "checkmate", FOOLS_MATE);
+        assert_eq!(bot3(vec![black]), (1, vec![("bob".into(), 2)]));
+    }
+
+    #[test]
+    fn a_bot_board_keeps_each_players_fewest_moves() {
+        let t = LEADERBOARD_FRESH_FROM_MS + 1_000;
+        let longer_after = vec![
+            bot_win("a", "alice", t, 1, SCHOLARS_MATE),
+            bot_win("b", "alice", t + 1, 2, SLOW_SCHOLARS_MATE),
+        ];
+        assert_eq!(bot3(longer_after), (2, vec![("alice".into(), 4)]));
+        let shorter_after = vec![
+            bot_win("a", "alice", t, 1, SLOW_SCHOLARS_MATE),
+            bot_win("b", "alice", t + 1, 2, SCHOLARS_MATE),
+        ];
+        let snap = compute_bots(shorter_after, BOT_NOW);
+        let row = &snap.all_time[0].players[0];
+        assert_eq!((row.moves, row.at, row.tx_id.as_str()), (4, t + 1, "b"));
+        // Sorted by moves, then earliest win.
+        let three = vec![
+            bot_win("a", "carol", t, 1, SLOW_SCHOLARS_MATE),
+            bot_win("b", "dave", t + 2, 2, SCHOLARS_MATE),
+            bot_win("c", "erin", t + 1, 3, SCHOLARS_MATE),
+        ];
+        let order: Vec<String> = bot3(three).1.into_iter().map(|(a, _)| a).collect();
+        assert_eq!(order, ["erin", "dave", "carol"]);
+    }
+
+    #[test]
+    fn bot_rows_that_dont_count() {
+        let t = LEADERBOARD_FRESH_FROM_MS + 1_000;
+        // An illegal move: nothing at all.
+        assert_eq!(bot3(vec![bot_win("a", "alice", t, 1, "e2e4 e7e5 e1e3")]), (0, vec![]));
+        // Won but no checkmate on the board, or mate by the bot: a game, not a board row.
+        assert_eq!(bot3(vec![bot_win("a", "alice", t, 1, "e2e4 e7e5")]), (1, vec![]));
+        assert_eq!(bot3(vec![bot_win("a", "alice", t, 1, FOOLS_MATE)]), (1, vec![]));
+        // A resignation with no moves is a game.
+        let resigned = bot_row("a", "alice", t, &game_id(1), 3, "b", "lost", "resignation", "");
+        assert_eq!(bot3(vec![resigned]), (1, vec![]));
+        // v:1 rows change nothing.
+        let mut old = bot_win("a", "alice", t, 1, SCHOLARS_MATE);
+        old.content = old.content.replace("\"v\":2", "\"v\":1");
+        assert_eq!(bot3(vec![old]), (0, vec![]));
+        // A second row for the same (sender, g) changes nothing; another sender's does count.
+        let dup = vec![
+            bot_win("a", "alice", t, 1, "e2e4 e7e5"),
+            bot_win("b", "alice", t + 1, 1, SCHOLARS_MATE),
+            bot_win("c", "bob", t + 2, 1, SCHOLARS_MATE),
+        ];
+        assert_eq!(bot3(dup), (2, vec![("bob".into(), 4)]));
+        // Bad fields: level 6, colour, result, reason, game id.
+        for row in [
+            bot_row("a", "alice", t, &game_id(1), 6, "w", "won", "checkmate", SCHOLARS_MATE),
+            bot_row("a", "alice", t, &game_id(1), 3, "x", "won", "checkmate", SCHOLARS_MATE),
+            bot_row("a", "alice", t, &game_id(1), 3, "w", "win", "checkmate", SCHOLARS_MATE),
+            bot_row("a", "alice", t, &game_id(1), 3, "w", "won", "mate", SCHOLARS_MATE),
+            bot_row("a", "alice", t, "3B0F0001-0000-4000-8000-000000000000", 3, "w", "won", "checkmate", SCHOLARS_MATE),
+        ] {
+            assert!(compute_bots(vec![row], BOT_NOW).all_time.is_empty());
+        }
+    }
+
+    #[test]
+    fn bot_boards_follow_the_leaderboard_periods() {
+        let october = LEADERBOARD_FRESH_FROM_MS + 1_000;
+        let november = 1_793_491_200_000 + 1_000;
+        let rows = vec![
+            bot_win("a", "alice", LEADERBOARD_FRESH_FROM_MS - 1, 1, SCHOLARS_MATE),
+            bot_win("b", "bob", october, 2, SCHOLARS_MATE),
+            bot_row("c", "carol", november, &game_id(3), 5, "w", "lost", "checkmate", FOOLS_MATE),
+        ];
+        let snap = compute_bots(rows, BOT_NOW);
+        assert_eq!((snap.all_time_since, snap.monthly_since), (LEADERBOARD_FRESH_FROM_MS, 1_793_491_200_000));
+        let summary = |boards: &[BotBoard]| -> Vec<(i64, u64, usize)> {
+            boards.iter().map(|b| (b.level, b.games, b.players.len())).collect()
+        };
+        assert_eq!(summary(&snap.all_time), [(3, 1, 1), (5, 1, 0)]);
+        assert_eq!(summary(&snap.monthly), [(5, 1, 0)]);
     }
 }

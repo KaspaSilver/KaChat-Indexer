@@ -294,7 +294,8 @@ async fn main() -> Result<()> {
 
     // Broadcast retention pruner: broadcasts are ephemeral channel chatter, so drop rows older
     // than the retention window (default 3 days). Runs immediately, then hourly. Detached — it
-    // loops forever and only stops at process exit.
+    // loops forever and only stops at process exit. `chess-bots` rows are kept for good: the
+    // all-time bot leaderboards are replayed from them (CHESS_BOT_LEADERBOARD.md).
     let prune_pool = database.pool().clone();
     let retention_days = args.broadcast_retention_days;
     let _prune_handle = tokio::spawn(async move {
@@ -316,7 +317,7 @@ async fn main() -> Result<()> {
             .bind(now_ms - 30 * 86_400_000)
             .execute(&prune_pool)
             .await;
-            match sqlx::query("DELETE FROM kachat_broadcasts WHERE block_time < $1")
+            match sqlx::query("DELETE FROM kachat_broadcasts WHERE block_time < $1 AND channel <> 'chess-bots'")
                 .bind(cutoff)
                 .execute(&prune_pool)
                 .await
