@@ -1451,6 +1451,9 @@ impl KProtocolProcessor {
             error!("Invalid signature for post {}, skipping", transaction_id);
             return Ok(()); // Skip posts with invalid signatures
         }
+        if !self.signature_is_fresh(&k_post.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         // KaChat exclusivity + text-only content policy (fork addition).
         if let Err(reason) = validate_kachat_message(&k_post.base64_encoded_message) {
@@ -1711,6 +1714,9 @@ impl KProtocolProcessor {
             error!("Invalid signature for reply {}, skipping", transaction_id);
             return Ok(()); // Skip replies with invalid signatures
         }
+        if !self.signature_is_fresh(&k_reply.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         // KaChat exclusivity + text-only content policy (fork addition).
         if let Err(reason) = validate_kachat_message(&k_reply.base64_encoded_message) {
@@ -1964,6 +1970,9 @@ impl KProtocolProcessor {
             error!("Invalid signature for quote {}, skipping", transaction_id);
             return Ok(()); // Skip quotes with invalid signatures
         }
+        if !self.signature_is_fresh(&k_quote.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         // KaChat exclusivity + text-only content policy (fork addition).
         // A plain repost is a quote whose message is exactly the marker (empty body), so it
@@ -2144,6 +2153,9 @@ impl KProtocolProcessor {
             );
             return Ok(()); // Skip broadcasts with invalid signatures
         }
+        if !self.signature_is_fresh(&k_broadcast.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         // Convert hex strings to bytea for database storage
         let transaction_id_bytes = hex::decode(transaction_id)?;
@@ -2251,6 +2263,9 @@ impl KProtocolProcessor {
             error!("Invalid signature for vote {}, skipping", transaction_id);
             return Ok(()); // Skip votes with invalid signatures
         }
+        if !self.signature_is_fresh(&k_vote.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         // Removal counter-action (fork addition): 'unvote' withdraws the sender's prior
         // upvote/downvote on this post. Delete the matching vote row (and its notification
@@ -2262,7 +2277,9 @@ impl KProtocolProcessor {
                 r#"
                 WITH deleted_votes AS (
                     DELETE FROM k_votes
-                    WHERE post_id = $1 AND sender_pubkey = $2
+                    WHERE post_id = $1
+                      AND substring(sender_pubkey from octet_length(sender_pubkey) - 31)
+                        = substring($2 from octet_length($2) - 31)
                     RETURNING transaction_id
                 )
                 DELETE FROM k_mentions
@@ -2315,20 +2332,42 @@ impl KProtocolProcessor {
             return Ok(());
         }
 
-        // Single query to insert vote and mention using CTE (skip if already exists)
-        let result = sqlx::query(
+        // One vote per key per post: a newer vote replaces this key's earlier one (a change of
+        // mind, or the same vote again), an older one is dropped. Both in one transaction, so the
+        // unique index never sees two.
+        let mut db_tx = self.db_pool.begin().await?;
+        let replaced: Vec<(Vec<u8>, String)> = sqlx::query_as(
             r#"
-            WITH vote_insert AS (
-                INSERT INTO k_votes (
-                    transaction_id, block_time, sender_pubkey, sender_signature,
-                    post_id, vote
-                ) VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (sender_signature) DO NOTHING
-                RETURNING transaction_id, block_time, sender_pubkey
-            )
-            INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey)
-            SELECT vi.transaction_id, 'vote', $7, vi.block_time, vi.sender_pubkey
-            FROM vote_insert vi
+            DELETE FROM k_votes
+            WHERE post_id = $1
+              AND substring(sender_pubkey from octet_length(sender_pubkey) - 31)
+                = substring($2 from octet_length($2) - 31)
+              AND block_time <= $3
+              AND sender_signature <> $4
+            RETURNING transaction_id, vote
+            "#,
+        )
+        .bind(&post_id_bytes)
+        .bind(&sender_pubkey_bytes)
+        .bind(block_time)
+        .bind(&sender_signature_bytes)
+        .fetch_all(&mut *db_tx)
+        .await?;
+        if !replaced.is_empty() {
+            let ids: Vec<Vec<u8>> = replaced.iter().map(|(id, _)| id.clone()).collect();
+            sqlx::query("DELETE FROM k_mentions WHERE content_type = 'vote' AND content_id = ANY($1)")
+                .bind(&ids)
+                .execute(&mut *db_tx)
+                .await?;
+        }
+        // Conflicts on the signature (seen before) or on a newer vote by this key: nothing new.
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO k_votes (
+                transaction_id, block_time, sender_pubkey, sender_signature,
+                post_id, vote
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT DO NOTHING
             "#,
         )
         .bind(&transaction_id_bytes)
@@ -2336,21 +2375,39 @@ impl KProtocolProcessor {
         .bind(&sender_pubkey_bytes)
         .bind(&sender_signature_bytes)
         .bind(&post_id_bytes)
-        .bind(k_vote.vote)
-        .bind(&mentioned_pubkey_bytes)
-        .execute(&self.db_pool)
-        .await?;
+        .bind(&k_vote.vote)
+        .execute(&mut *db_tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if inserted {
+            sqlx::query(
+                "INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey) \
+                 VALUES ($1, 'vote', $2, $3, $4)",
+            )
+            .bind(&transaction_id_bytes)
+            .bind(&mentioned_pubkey_bytes)
+            .bind(block_time)
+            .bind(&sender_pubkey_bytes)
+            .execute(&mut *db_tx)
+            .await?;
+        }
+        db_tx.commit().await?;
 
-        if result.rows_affected() == 0 {
+        if !inserted {
             info!(
-                "Vote transaction {} already exists, skipping",
+                "Vote transaction {} already exists or a newer vote by this key does, skipping",
                 transaction_id
             );
-        } else {
-            info!(
-                "Saved K vote: {} -> {} ({})",
-                transaction_id, post_id_for_log, vote_for_log
-            );
+            return Ok(());
+        }
+        info!(
+            "Saved K vote: {} -> {} ({})",
+            transaction_id, post_id_for_log, vote_for_log
+        );
+        // The same vote again (a second like) changes nothing the author needs to hear about.
+        if replaced.iter().any(|(_, vote)| *vote == vote_for_log) {
+            return Ok(());
         }
         // KaPosts push: notify the post's author of an up/down vote (skip unvote). Carries the
         // action kind so the push service can honor the like/dislike toggles.
@@ -2396,6 +2453,9 @@ impl KProtocolProcessor {
                 "Invalid signature for unquote action {}, skipping",
                 transaction_id
             );
+            return Ok(());
+        }
+        if !self.signature_is_fresh(&k_unquote.sender_signature, transaction_id).await? {
             return Ok(());
         }
 
@@ -2457,6 +2517,9 @@ impl KProtocolProcessor {
             &k_edit.sender_pubkey,
         ) {
             error!("Invalid signature for edit {}, skipping", transaction_id);
+            return Ok(());
+        }
+        if !self.signature_is_fresh(&k_edit.sender_signature, transaction_id).await? {
             return Ok(());
         }
 
@@ -2629,6 +2692,9 @@ impl KProtocolProcessor {
             error!("Invalid signature for delete {}, skipping", transaction_id);
             return Ok(());
         }
+        if !self.signature_is_fresh(&k_delete.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         let block_time = transaction.block_time.unwrap_or(0);
         let transaction_id_bytes = hex::decode(transaction_id)?;
@@ -2784,6 +2850,9 @@ impl KProtocolProcessor {
             error!("Invalid signature for poll {}, skipping", transaction_id);
             return Ok(());
         }
+        if !self.signature_is_fresh(&k_poll.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         // The question is a post's message: KaChat marker, non-empty, text-only.
         if let Err(reason) = validate_kachat_message(&k_poll.base64_encoded_question) {
@@ -2931,6 +3000,9 @@ impl KProtocolProcessor {
             error!("Invalid signature for pollvote {}, skipping", transaction_id);
             return Ok(());
         }
+        if !self.signature_is_fresh(&k_vote.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         let poll_id_bytes = hex::decode(&k_vote.poll_id)?;
         // The poll must be indexed; read its option count and close time.
@@ -3032,6 +3104,9 @@ impl KProtocolProcessor {
             &k_tip.sender_pubkey,
         ) {
             error!("Invalid signature for tip {}, skipping", transaction_id);
+            return Ok(BcastOutcome::Done);
+        }
+        if !self.signature_is_fresh(&k_tip.sender_signature, transaction_id).await? {
             return Ok(BcastOutcome::Done);
         }
 
@@ -3255,6 +3330,9 @@ impl KProtocolProcessor {
             );
             return Ok(()); // Skip block actions with invalid signatures
         }
+        if !self.signature_is_fresh(&k_block.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         // Extract block time
         let block_time = transaction.block_time.unwrap_or(0);
@@ -3400,6 +3478,9 @@ impl KProtocolProcessor {
             );
             return Ok(()); // Skip follow actions with invalid signatures
         }
+        if !self.signature_is_fresh(&k_follow.sender_signature, transaction_id).await? {
+            return Ok(());
+        }
 
         // Extract block time
         let block_time = transaction.block_time.unwrap_or(0);
@@ -3535,6 +3616,53 @@ impl KProtocolProcessor {
     /// so the caller changes nothing: whatever order a reindex or catch-up processes
     /// transactions in, the last one on chain wins. A tie (same block time) lets the later
     /// processed one through, which for the same transaction is the idempotent re-run.
+    /// False when this signature already came in another tx: a copy of a signed action, which
+    /// must not apply again. The same tx seen again (another block, a retry) is still fresh. Call
+    /// it only once the signature has verified, so a forged copy can't claim it first.
+    async fn signature_is_fresh(&self, signature_hex: &str, transaction_id: &str) -> Result<bool> {
+        let signature = hex::decode(signature_hex)?;
+        let tx_id = hex::decode(transaction_id)?;
+        let first: Option<Vec<u8>> = sqlx::query_scalar(
+            r#"
+            WITH ins AS (
+                INSERT INTO kachat_used_signatures (sender_signature, transaction_id)
+                VALUES ($1, $2)
+                ON CONFLICT (sender_signature) DO NOTHING
+                RETURNING transaction_id
+            )
+            SELECT transaction_id FROM ins
+            UNION ALL
+            SELECT transaction_id FROM kachat_used_signatures WHERE sender_signature = $1
+            LIMIT 1
+            "#,
+        )
+        .bind(&signature)
+        .bind(&tx_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        // Another worker inserted it while this statement ran, after its snapshot: read it now.
+        let first = match first {
+            Some(first) => first,
+            None => {
+                sqlx::query_scalar(
+                    "SELECT transaction_id FROM kachat_used_signatures WHERE sender_signature = $1",
+                )
+                .bind(&signature)
+                .fetch_one(&self.db_pool)
+                .await?
+            }
+        };
+        if first != tx_id {
+            warn!(
+                "KaPosts signature in tx {} was already used by tx {}: a replayed action, skipping",
+                transaction_id,
+                hex::encode(&first)
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     async fn relation_is_newest(
         &self,
         kind: &str,

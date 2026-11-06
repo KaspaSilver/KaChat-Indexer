@@ -320,6 +320,72 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        // One vote per key per post (the x-only key, so the 02 and 03 forms of one key are the
+        // same voter). Only the signature was unique, so one key could like a post any number
+        // of times. Duplicates from before keep the newest.
+        let has_one_vote_index: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = 'idx_kachat_votes_one_per_sender')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !has_one_vote_index {
+            let removed = sqlx::query(
+                "WITH dup AS ( \
+                    DELETE FROM k_votes a USING k_votes b \
+                    WHERE a.post_id = b.post_id \
+                      AND substring(a.sender_pubkey from octet_length(a.sender_pubkey) - 31) \
+                        = substring(b.sender_pubkey from octet_length(b.sender_pubkey) - 31) \
+                      AND (a.block_time, a.id) < (b.block_time, b.id) \
+                    RETURNING a.transaction_id) \
+                 DELETE FROM k_mentions WHERE content_type = 'vote' \
+                   AND content_id IN (SELECT transaction_id FROM dup)",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_kachat_votes_one_per_sender ON k_votes \
+                 (post_id, substring(sender_pubkey from octet_length(sender_pubkey) - 31))",
+            )
+            .execute(&self.pool)
+            .await?;
+            info!("One vote per key per post: index created, {} duplicate vote mention(s) removed", removed.rows_affected());
+        }
+        // Every KaPosts signature, with the tx that first carried it. A K action signs only its
+        // text, so the same signed action copied into a later tx would apply again: an old block
+        // after an unblock, an old unblock after a block, a vote counted twice.
+        let had_used_signatures: bool =
+            sqlx::query_scalar("SELECT to_regclass('kachat_used_signatures') IS NOT NULL")
+                .fetch_one(&self.pool)
+                .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kachat_used_signatures (\
+                sender_signature BYTEA PRIMARY KEY, \
+                transaction_id BYTEA NOT NULL)",
+        )
+        .execute(&self.pool)
+        .await?;
+        if !had_used_signatures {
+            // Seed it with every signature still on record, so those can't be replayed either.
+            // Actions whose rows are gone (an undone block or follow) can't be recovered.
+            for table in [
+                "k_contents", "k_votes", "k_blocks", "k_follows", "k_broadcasts", "k_edits",
+                "k_poll_votes", "k_tips",
+            ] {
+                let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(table)
+                    .fetch_one(&self.pool)
+                    .await?;
+                if exists {
+                    sqlx::query(&format!(
+                        "INSERT INTO kachat_used_signatures (sender_signature, transaction_id) \
+                         SELECT sender_signature, transaction_id FROM {table} \
+                         ON CONFLICT (sender_signature) DO NOTHING"
+                    ))
+                    .execute(&self.pool)
+                    .await?;
+                }
+            }
+        }
         Ok(())
     }
 
