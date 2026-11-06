@@ -50,6 +50,19 @@ const FCM_SEND_CONCURRENCY: usize = 16;
 const WEB_SEND_CONCURRENCY: usize = 16;
 /// Address Activity: at most this many funds pushes per device within `WATCH_ONLY_RATE_WINDOW`.
 const WATCH_ONLY_RATE_MAX: usize = 30;
+/// Every APNs and FCM request gives up after these. The dispatcher serves one event at a time,
+/// so without a limit one stalled connection held up every push behind it.
+const PUSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The HTTP client for APNs and FCM, with the timeouts above.
+pub(crate) fn push_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(PUSH_CONNECT_TIMEOUT)
+        .timeout(PUSH_REQUEST_TIMEOUT)
+        .build()
+}
+
 const WATCH_ONLY_RATE_WINDOW: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone)]
@@ -2413,6 +2426,8 @@ pub struct PushStats {
 pub struct PushDispatcher {
     rx: flume::Receiver<PushEvent>,
     ext_rx: flume::Receiver<ExtensionPushEvent>,
+    /// Call rings, served before everything else (a ring is useless seconds later).
+    ring_rx: flume::Receiver<ExtensionPushEvent>,
     funds_rx: flume::Receiver<FundsPushEvent>,
     registry: PushRegistryHandle,
     metrics: SharedMetrics,
@@ -2435,6 +2450,7 @@ impl PushDispatcher {
     pub fn new(
         rx: flume::Receiver<PushEvent>,
         ext_rx: flume::Receiver<ExtensionPushEvent>,
+        ring_rx: flume::Receiver<ExtensionPushEvent>,
         funds_rx: flume::Receiver<FundsPushEvent>,
         registry: PushRegistryHandle,
         context: &IndexerContext,
@@ -2490,6 +2506,7 @@ impl PushDispatcher {
         Self {
             rx,
             ext_rx,
+            ring_rx,
             funds_rx,
             metrics: registry.metrics(),
             registry,
@@ -2511,6 +2528,18 @@ impl PushDispatcher {
     pub async fn run(mut self) {
         loop {
             tokio::select! {
+                // Rings first: every other kind of push can wait a moment, a ring can't.
+                biased;
+                ring = self.ring_rx.recv_async() => {
+                    let Ok(event) = ring else { break };
+                    self.metrics.increment_push_events_total();
+                    if !self.push_enabled() {
+                        continue;
+                    }
+                    if let Err(err) = self.handle_extension_event(event).await {
+                        warn!("[Push] Failed to handle ring: {err}");
+                    }
+                }
                 event = self.rx.recv_async() => {
                     let Ok(event) = event else { break };
                     self.metrics.increment_push_events_total();
@@ -3771,7 +3800,7 @@ impl ApnsClient {
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| format!("{topic}.voip"));
 
-        let client = reqwest::Client::builder().build()?;
+        let client = push_http_client()?;
 
         Ok(Self {
             client,

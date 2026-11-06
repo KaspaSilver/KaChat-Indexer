@@ -51,6 +51,10 @@ pub struct PushApi {
     nonces: Arc<StdMutex<NonceStore>>,
     /// KaChat fork: channel to inject broadcast/KaPosts pushes (fed by the internal endpoint).
     ext_push_tx: flume::Sender<ExtensionPushEvent>,
+    /// Call rings, on their own queue: the dispatcher serves it first, and a flood of rings
+    /// can't push other notifications out of ext_push_tx.
+    ring_push_tx: flume::Sender<ExtensionPushEvent>,
+    ring_limiter: Arc<StdMutex<RingLimiter>>,
     /// Optional shared secret guarding the internal endpoints (env INTERNAL_PUSH_SECRET).
     internal_secret: Option<String>,
     /// §5.10: the node client used to broadcast scheduled posts (the webserver's scheduler relays
@@ -65,6 +69,7 @@ impl PushApi {
         network_type: RpcNetworkType,
         auth_mode: PushAuthMode,
         ext_push_tx: flume::Sender<ExtensionPushEvent>,
+        ring_push_tx: flume::Sender<ExtensionPushEvent>,
         rpc_client: KaspaRpcClient,
     ) -> Self {
         let internal_secret = std::env::var("INTERNAL_PUSH_SECRET")
@@ -82,6 +87,8 @@ impl PushApi {
             network_type,
             nonces: Arc::new(StdMutex::new(NonceStore::default())),
             ext_push_tx,
+            ring_push_tx,
+            ring_limiter: Arc::new(StdMutex::new(RingLimiter::default())),
             internal_secret,
             rpc_client,
         }
@@ -1221,9 +1228,18 @@ async fn ring_call(
         Err(err) => return Err(err.into_response()),
     };
 
+    let allowed = match state.ring_limiter.lock() {
+        Ok(mut limiter) => limiter.allow(&wallet.wallet_address, &to_address, unix_time_ms()),
+        Err(_) => return Err(PushApiError::internal("failed to lock ring limiter").into_response()),
+    };
+    if !allowed {
+        return Err(PushApiError::too_many_requests("too many rings, try again shortly").into_response());
+    }
+
     // Hand off to the dispatcher (owns the ApnsClient): it resolves the callee's VoIP tokens and
-    // sends the ring. Respond 200 once queued, even if the callee has zero VoIP-capable devices.
-    let _ = state.ext_push_tx.try_send(ExtensionPushEvent::Ring {
+    // sends the ring. Respond 200 once queued, even if the callee has zero VoIP-capable devices;
+    // 503 when the ring queue is full, so the caller can retry.
+    if let Err(flume::TrySendError::Full(_)) = state.ring_push_tx.try_send(ExtensionPushEvent::Ring {
         to_address,
         call_id: payload.call_id,
         kind: payload.kind,
@@ -1231,7 +1247,10 @@ async fn ring_call(
         sender: wallet.wallet_address,
         timestamp: unix_time_ms(),
         payload: payload.payload,
-    });
+    }) {
+        warn!("Push ring queue is full; refusing a ring");
+        return Err(PushApiError::unavailable("ring queue is full, try again").into_response());
+    }
 
     Ok(Json(serde_json::json!({})))
 }
@@ -1961,6 +1980,50 @@ fn unix_time_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+/// Rings per caller wallet and per callee address in a sliding minute. A signed caller with a
+/// registered device could otherwise ring a phone, or every phone, as often as it liked.
+const RING_WINDOW_MS: u64 = 60_000;
+const MAX_RINGS_PER_CALLER: usize = 20;
+const MAX_RINGS_PER_CALLEE: usize = 30;
+/// Past this many tracked addresses, ones with no ring in the window are forgotten.
+const RING_LIMITER_PRUNE_AT: usize = 10_000;
+
+#[derive(Default)]
+struct RingLimiter {
+    by_caller: HashMap<String, VecDeque<u64>>,
+    by_callee: HashMap<String, VecDeque<u64>>,
+}
+
+impl RingLimiter {
+    /// Counts the ring and returns true, or returns false (and counts nothing) when the caller
+    /// or the callee is already at its limit.
+    fn allow(&mut self, caller: &str, callee: &str, now_ms: u64) -> bool {
+        let cutoff = now_ms.saturating_sub(RING_WINDOW_MS);
+        for map in [&mut self.by_caller, &mut self.by_callee] {
+            if map.len() > RING_LIMITER_PRUNE_AT {
+                map.retain(|_, times| times.back().is_some_and(|&t| t > cutoff));
+            }
+        }
+        let recent = |times: &mut VecDeque<u64>| {
+            while times.front().is_some_and(|&t| t <= cutoff) {
+                times.pop_front();
+            }
+            times.len()
+        };
+        let caller_times = self.by_caller.entry(caller.to_string()).or_default();
+        if recent(caller_times) >= MAX_RINGS_PER_CALLER {
+            return false;
+        }
+        let callee_times = self.by_callee.entry(callee.to_string()).or_default();
+        if recent(callee_times) >= MAX_RINGS_PER_CALLEE {
+            return false;
+        }
+        callee_times.push_back(now_ms);
+        self.by_caller.entry(caller.to_string()).or_default().push_back(now_ms);
+        true
+    }
+}
+
 #[derive(Default)]
 struct NonceStore {
     expiries_by_nonce: HashMap<String, u64>,
@@ -2100,6 +2163,20 @@ impl PushApiError {
         }
     }
 
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -2213,6 +2290,26 @@ mod tests {
         let mut bad = ios_scheduled_body();
         bad["transaction"]["payload"] = serde_json::json!("zz");
         assert!(relay_rpc_transaction(bad).is_err());
+    }
+
+    #[test]
+    fn rings_are_limited_per_caller_and_per_callee() {
+        let mut limiter = RingLimiter::default();
+        for i in 0..MAX_RINGS_PER_CALLER as u64 {
+            assert!(limiter.allow("caller", &format!("callee{i}"), 1_000 + i));
+        }
+        assert!(!limiter.allow("caller", "callee-new", 2_000), "the caller is at its limit");
+        // A minute later the window has moved on.
+        assert!(limiter.allow("caller", "callee-new", 1_000 + RING_WINDOW_MS + 100));
+
+        // Many callers, one phone: the callee's limit holds.
+        let mut limiter = RingLimiter::default();
+        for i in 0..MAX_RINGS_PER_CALLEE as u64 {
+            assert!(limiter.allow(&format!("caller{i}"), "victim", 1_000 + i));
+        }
+        assert!(!limiter.allow("caller-new", "victim", 2_000));
+        // A refused ring isn't counted against the caller.
+        assert_eq!(limiter.by_caller.get("caller-new").map(VecDeque::len), Some(0));
     }
 
     #[test]

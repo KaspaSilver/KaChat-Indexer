@@ -318,11 +318,14 @@ async fn main() -> anyhow::Result<()> {
     let (push_tx, push_rx) = flume::bounded(2048);
     // KaChat fork: broadcast/KaPosts pushes injected by the K-processor over HTTP.
     let (ext_push_tx, ext_push_rx) = flume::bounded(1024);
+    // Call rings, on their own queue so other pushes can't delay them nor they crowd others out.
+    let (ring_push_tx, ring_push_rx) = flume::bounded(256);
     // Address Activity: funds-received events from the block processor to the push dispatcher.
     let (funds_push_tx, funds_push_rx) = flume::bounded(2048);
     let push_dispatcher = PushDispatcher::new(
         push_rx,
         ext_push_rx,
+        ring_push_rx,
         funds_push_rx,
         push_registry.clone(),
         &context,
@@ -498,6 +501,7 @@ async fn main() -> anyhow::Result<()> {
             context.network_type,
             context.config.push_auth_mode,
             ext_push_tx.clone(),
+            ring_push_tx,
             context.rpc_client.clone(),
         ),
         context.clone(),

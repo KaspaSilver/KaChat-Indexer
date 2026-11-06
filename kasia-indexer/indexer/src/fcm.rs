@@ -124,7 +124,7 @@ impl FcmClient {
             format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
 
         Ok(Some(Self {
-            client: reqwest::Client::builder().build()?,
+            client: crate::push::push_http_client()?,
             project_id,
             client_email: account.client_email,
             token_uri,
