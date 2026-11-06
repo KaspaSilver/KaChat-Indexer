@@ -323,8 +323,14 @@ impl KDbClient {
         // One vote per key per post (the x-only key, so the 02 and 03 forms of one key are the
         // same voter). Only the signature was unique, so one key could like a post any number
         // of times. Duplicates from before keep the newest.
+        // NOTE: not `idx_k_%` (where `_` matches any character), which the schema verifier
+        // counts. The first build named it idx_kachat_votes_one_per_sender, and the processor
+        // refused to start: rename that one.
+        sqlx::query("ALTER INDEX IF EXISTS idx_kachat_votes_one_per_sender RENAME TO kachat_votes_one_per_sender")
+            .execute(&self.pool)
+            .await?;
         let has_one_vote_index: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = 'idx_kachat_votes_one_per_sender')",
+            "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = 'kachat_votes_one_per_sender')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -343,7 +349,7 @@ impl KDbClient {
             .execute(&self.pool)
             .await?;
             sqlx::query(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_kachat_votes_one_per_sender ON k_votes \
+                "CREATE UNIQUE INDEX IF NOT EXISTS kachat_votes_one_per_sender ON k_votes \
                  (post_id, substring(sender_pubkey from octet_length(sender_pubkey) - 31))",
             )
             .execute(&self.pool)
