@@ -45,6 +45,12 @@ struct Args {
     /// its panel can reach the API over the stack's private network; it never publishes it.
     #[arg(long, default_value = "127.0.0.1:3081")]
     bind_address: String,
+    /// Shared token the caller must send as `x-admin-token` on every request. Set it whenever
+    /// the API is bound beyond loopback: the API has no login of its own, so without it any
+    /// container on that network can export or purge chat. Unset = no check (as before). Read
+    /// from env ADMIN_TOKEN so it stays off the command line.
+    #[arg(long, env = "ADMIN_TOKEN", hide_env_values = true)]
+    admin_token: Option<String>,
     /// URL of the vendored kasia (chat) indexer's metrics endpoint, proxied to the Chat tab.
     #[arg(long, default_value = "http://127.0.0.1:8600/metrics")]
     chat_metrics_url: String,
@@ -173,6 +179,20 @@ async fn main() -> anyhow::Result<()> {
     .execute(&pool)
     .await;
 
+    let admin_token: Option<std::sync::Arc<str>> = args
+        .admin_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(std::sync::Arc::from);
+    if admin_token.is_none() && !is_loopback_bind(&args.bind_address) {
+        tracing::warn!(
+            "ADMIN_TOKEN is not set and the admin API listens on {}: anything that can reach \
+             that address can use it",
+            args.bind_address
+        );
+    }
+
     let state = AppState {
         pool,
         last_tx_sample: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -213,12 +233,66 @@ async fn main() -> anyhow::Result<()> {
         // No CORS layer (kachat-audits IDX-003): the dashboard is same-origin or
         // proxied server-side by the panel, so other web origins get no access.
         .layer(axum::middleware::from_fn(refuse_cross_site))
+        .layer(axum::middleware::from_fn(move |req, next| {
+            require_admin_token(admin_token.clone(), req, next)
+        }))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind_address).await?;
     info!("kachat-admin dashboard listening on http://{}", args.bind_address);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// 401 unless the request carries `x-admin-token` equal to the configured token (constant
+/// time). With no token configured every request passes, as before.
+async fn require_admin_token(
+    token: Option<std::sync::Arc<str>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(token) = token {
+        let sent = req.headers().get("x-admin-token").map(|v| v.as_bytes());
+        if !sent.is_some_and(|sent| token_matches(sent, token.as_bytes())) {
+            return (StatusCode::UNAUTHORIZED, "admin token required").into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Constant-time equality: a wrong token takes as long to refuse whatever its prefix.
+fn token_matches(sent: &[u8], expected: &[u8]) -> bool {
+    if sent.len() != expected.len() {
+        return false;
+    }
+    sent.iter().zip(expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+fn is_loopback_bind(bind_address: &str) -> bool {
+    bind_address
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_loopback())
+}
+
+#[cfg(test)]
+mod admin_token_tests {
+    use super::{is_loopback_bind, token_matches};
+
+    #[test]
+    fn only_the_exact_token_matches() {
+        assert!(token_matches(b"s3cret-token", b"s3cret-token"));
+        assert!(!token_matches(b"s3cret-tokeN", b"s3cret-token"));
+        assert!(!token_matches(b"s3cret", b"s3cret-token"));
+        assert!(!token_matches(b"", b"s3cret-token"));
+    }
+
+    #[test]
+    fn a_network_bind_is_not_loopback() {
+        assert!(is_loopback_bind("127.0.0.1:3081"));
+        assert!(!is_loopback_bind("0.0.0.0:3081"));
+        assert!(!is_loopback_bind("kachat-app:3081"));
+    }
 }
 
 /// Refuses state-changing requests a browser sent from another site (kachat-audits
@@ -1308,7 +1382,8 @@ async fn kv_set(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error
 }
 
 /// Run `supervisorctl <action> <program>` inside this container (kachat-admin and the chat indexer
-/// share the same supervisord). Best-effort; returns the combined output for surfacing.
+/// share the same supervisord). Returns the combined output; a non-zero exit (no access to the
+/// socket, unknown program, failed start) is an Err carrying that output.
 fn supervisorctl(action: &str, program: &str) -> Result<String, String> {
     let out = std::process::Command::new("supervisorctl")
         .args(["-c", "/etc/supervisord.conf", action, program])
@@ -1316,7 +1391,26 @@ fn supervisorctl(action: &str, program: &str) -> Result<String, String> {
         .map_err(|e| format!("supervisorctl spawn failed: {e}"))?;
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
-    Ok(s)
+    // `status` exits 3 for a stopped program, which is an answer, not a failure; so is starting
+    // what already runs or stopping what is already stopped.
+    let already = (action == "start" && s.contains("already started"))
+        || (action == "stop" && s.contains("not running"));
+    if out.status.success() || already || (action == "status" && out.status.code() == Some(3)) {
+        Ok(s)
+    } else {
+        Err(format!("supervisorctl {action} {program} failed: {}", s.trim()))
+    }
+}
+
+/// Runs a supervisorctl action off the async runtime, as an API error when it fails.
+async fn supervise(action: &'static str, program: &'static str) -> Result<(), ApiError> {
+    let result = tokio::task::spawn_blocking(move || supervisorctl(action, program))
+        .await
+        .map_err(|e| ApiError::server(&format!("supervisorctl task: {e}")))?;
+    result.map(|_| ()).map_err(|e| {
+        error!("kachat-admin: {e}");
+        ApiError::server(&format!("settings saved, but {e}"))
+    })
 }
 
 /// Is the chat indexer process currently running under supervisord?
@@ -1487,7 +1581,7 @@ async fn post_settings(
         info!("kachat-admin set {} personal group id(s)", normalized.len());
     }
     if restart_chat {
-        let _ = tokio::task::spawn_blocking(|| supervisorctl("restart", "chat")).await;
+        supervise("restart", "chat").await?;
         info!("kachat-admin restarted chat indexer to reload personal-mode allowlist(s)");
     }
     if let Some(raw) = &req.kaposts_operator_address {
@@ -1522,7 +1616,7 @@ async fn post_settings(
     if let Some(b) = req.chat_indexer {
         // Start/stop the whole vendored chat indexer (1:1 + group + payments + handshakes).
         let action = if b { "start" } else { "stop" };
-        let _ = tokio::task::spawn_blocking(move || supervisorctl(action, "chat")).await;
+        supervise(action, "chat").await?;
         info!("kachat-admin {} chat indexer via supervisorctl", action);
     }
     Ok(get_settings(State(state)).await)
