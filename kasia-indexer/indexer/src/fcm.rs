@@ -205,21 +205,11 @@ impl FcmClient {
         data: &BTreeMap<String, String>,
         collapse_key: Option<&str>,
         include_notification: bool,
+        android_channel_id: Option<&str>,
     ) -> Result<(), FcmError> {
         let access_token = self.access_token().await?;
 
-        let android = AndroidConfig {
-            priority: "high",
-            // FCM caps collapse_key length; tx ids are well under it.
-            collapse_key: collapse_key.map(|c| c.to_string()),
-            // collapse_key only collapses messages FCM still holds for an offline device. A
-            // notification the OS already shows is replaced only by one with the same tag, so an
-            // OS-displayed push carries its collapse id as tag too - e.g. a KaPosts tip push
-            // replaces the app's own "Received X KAS" banner posted with tag = tx id (IDX-030).
-            notification: (include_notification && collapse_key.is_some()).then(|| AndroidNotification {
-                tag: collapse_key.map(|c| c.to_string()),
-            }),
-        };
+        let android = android_config(collapse_key, include_notification, android_channel_id);
         // Optional `notification` block. Included for public, display-ready content
         // (broadcast/KaPosts) so the OS shows it even when the app is dead. OMITTED for encrypted
         // DM/group content (data-only) so the app's handler runs and decrypts the body itself.
@@ -340,12 +330,38 @@ struct AndroidConfig {
     notification: Option<AndroidNotification>,
 }
 
-/// `android.notification` (FCM v1): only the tag, which makes a later notification with the
-/// same tag replace this one on the device.
+/// `android.notification` (FCM v1): the tag, which makes a later notification with the same tag
+/// replace this one on the device, and the channel, which sets its sound and vibration.
 #[derive(Serialize)]
 struct AndroidNotification {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_id: Option<String>,
+}
+
+fn android_config(
+    collapse_key: Option<&str>,
+    include_notification: bool,
+    android_channel_id: Option<&str>,
+) -> AndroidConfig {
+    AndroidConfig {
+        priority: "high",
+        // FCM caps collapse_key length; tx ids are well under it.
+        collapse_key: collapse_key.map(|c| c.to_string()),
+        // collapse_key only collapses messages FCM still holds for an offline device. A
+        // notification the OS already shows is replaced only by one with the same tag, so an
+        // OS-displayed push carries its collapse id as tag too - e.g. a KaPosts tip push
+        // replaces the app's own "Received X KAS" banner posted with tag = tx id (IDX-030).
+        // The channel makes an OS-drawn push follow the device's Sound & Vibration choice
+        // (docs/ANDROID_NOTIFICATION_CHANNEL.md); without one Android uses the app's default.
+        notification: (include_notification
+            && (collapse_key.is_some() || android_channel_id.is_some()))
+        .then(|| AndroidNotification {
+            tag: collapse_key.map(|c| c.to_string()),
+            channel_id: android_channel_id.map(|c| c.to_string()),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -357,7 +373,7 @@ mod android_tag_tests {
         let with = AndroidConfig {
             priority: "high",
             collapse_key: Some("ab12".into()),
-            notification: Some(AndroidNotification { tag: Some("ab12".into()) }),
+            notification: Some(AndroidNotification { tag: Some("ab12".into()), channel_id: None }),
         };
         assert_eq!(
             serde_json::to_value(&with).unwrap(),
@@ -365,6 +381,30 @@ mod android_tag_tests {
         );
         let without = AndroidConfig { priority: "high", collapse_key: None, notification: None };
         assert_eq!(serde_json::to_value(&without).unwrap(), serde_json::json!({"priority": "high"}));
+    }
+
+    #[test]
+    fn an_os_displayed_push_names_the_devices_channel() {
+        let silent = Some("kachat_messages_silent");
+        assert_eq!(
+            serde_json::to_value(android_config(Some("ab12"), true, silent)).unwrap(),
+            serde_json::json!({"priority": "high", "collapse_key": "ab12",
+                "notification": {"tag": "ab12", "channel_id": "kachat_messages_silent"}})
+        );
+        // No collapse id: still built, carrying only the channel.
+        assert_eq!(
+            serde_json::to_value(android_config(None, true, silent)).unwrap(),
+            serde_json::json!({"priority": "high", "notification": {"channel_id": "kachat_messages_silent"}})
+        );
+        // Data-only (DM, group): the app draws it, so no notification block.
+        assert_eq!(
+            serde_json::to_value(android_config(Some("ab12"), false, silent)).unwrap(),
+            serde_json::json!({"priority": "high", "collapse_key": "ab12"})
+        );
+        assert_eq!(
+            serde_json::to_value(android_config(None, true, None)).unwrap(),
+            serde_json::json!({"priority": "high"})
+        );
     }
 }
 

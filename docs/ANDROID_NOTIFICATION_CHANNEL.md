@@ -3,6 +3,15 @@
 **For:** the indexer session (`kasia-indexer`, the push service). **From:** the KaPost Android
 session (`KaspaSilver/KaPosts-Android`).
 
+> **Status (2026-11-06): §1 and §2 done in the indexer.**
+> - §1: `android_channel_id` on `/v1/push/register` and `/v1/push/update`
+>   (`normalize_android_channel_id`, `push.rs`). Absent on a later call keeps the stored one, like
+>   `apns_topic`.
+> - §2: `fcm::android_config` builds `android.notification` whenever there is a tag or a channel;
+>   the dispatcher looks up channels only for pushes with a notification block.
+> - Tests: `an_os_displayed_push_names_the_devices_channel` (`fcm.rs`) and
+>   `only_a_known_channel_on_android_is_kept` (`push.rs`).
+
 On Android, a push with a `notification` block (`kaposts` and `broadcast`) is drawn by the system
 when the app isn't running. The system then uses the app's default channel: KaPost's manifest names
 `kachat_messages_sound_vibrate`. So these pushes always play a sound and vibrate, whatever the person

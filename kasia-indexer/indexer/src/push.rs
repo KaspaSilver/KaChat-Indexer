@@ -120,6 +120,7 @@ impl PushRegistry {
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
+        android_channel_id: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -176,6 +177,8 @@ impl PushRegistry {
         // Same for the APNs topic; an unknown topic is dropped (then APNS_TOPIC is used).
         let normalized_apns_topic = normalize_apns_topic(apns_topic)
             .or_else(|| existing.as_ref().and_then(|reg| reg.apns_topic.clone()));
+        let normalized_android_channel_id =
+            normalize_android_channel_id(&platform, android_channel_id, existing.as_ref());
         let effective_wallet_binding = resolve_wallet_binding(existing.as_ref(), wallet_binding)?;
         let effective_wallet_pubkey = effective_wallet_binding
             .as_ref()
@@ -253,6 +256,7 @@ impl PushRegistry {
                     && reg.voip_token == normalized_voip_token
                     && reg.web_push == normalized_web_push
                     && reg.apns_topic == normalized_apns_topic
+                    && reg.android_channel_id == normalized_android_channel_id
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -301,6 +305,7 @@ impl PushRegistry {
             voip_token: normalized_voip_token,
             web_push: normalized_web_push,
             apns_topic: normalized_apns_topic,
+            android_channel_id: normalized_android_channel_id,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -453,6 +458,7 @@ impl PushRegistry {
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
+        android_channel_id: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -531,6 +537,8 @@ impl PushRegistry {
             .as_ref()
             .map(|reg| reg.platform.clone())
             .unwrap_or_else(|| "ios".to_string());
+        let normalized_android_channel_id =
+            normalize_android_channel_id(&platform, android_channel_id, existing.as_ref());
         let last_seen_refresh = existing
             .as_ref()
             .map(|reg| should_refresh_last_seen(&token, reg.last_seen, now))
@@ -585,6 +593,7 @@ impl PushRegistry {
                     && reg.voip_token == normalized_voip_token
                     && reg.web_push == normalized_web_push
                     && reg.apns_topic == normalized_apns_topic
+                    && reg.android_channel_id == normalized_android_channel_id
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -631,6 +640,7 @@ impl PushRegistry {
             voip_token: normalized_voip_token,
             web_push: normalized_web_push,
             apns_topic: normalized_apns_topic,
+            android_channel_id: normalized_android_channel_id,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -1217,6 +1227,19 @@ impl PushRegistry {
         Ok(map)
     }
 
+    fn android_channels_for_tokens(&self, tokens: &[String]) -> anyhow::Result<HashMap<String, String>> {
+        let mut map = HashMap::new();
+        for token in tokens {
+            if let Some(channel) = self
+                .get_registration(token)?
+                .and_then(|registration| registration.android_channel_id)
+            {
+                map.insert(token.clone(), channel);
+            }
+        }
+        Ok(map)
+    }
+
     fn web_push_for_tokens(
         &self,
         tokens: &[String],
@@ -1528,6 +1551,7 @@ enum PushRegistryCommand {
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
+        android_channel_id: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1549,6 +1573,7 @@ enum PushRegistryCommand {
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
+        android_channel_id: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1624,6 +1649,10 @@ enum PushRegistryCommand {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, Option<String>>>,
     },
+    AndroidChannelsForTokens {
+        tokens: Vec<String>,
+        response: RegistryResponse<HashMap<String, String>>,
+    },
     WebPushForTokens {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, Option<WebPushSubscription>>>,
@@ -1691,6 +1720,7 @@ impl PushRegistryActor {
                     voip_token,
                     web_push,
                     apns_topic,
+                    android_channel_id,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1713,6 +1743,7 @@ impl PushRegistryActor {
                         voip_token,
                         web_push,
                         apns_topic,
+                        android_channel_id,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1735,6 +1766,7 @@ impl PushRegistryActor {
                     voip_token,
                     web_push,
                     apns_topic,
+                    android_channel_id,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1756,6 +1788,7 @@ impl PushRegistryActor {
                         voip_token,
                         web_push,
                         apns_topic,
+                        android_channel_id,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1863,6 +1896,10 @@ impl PushRegistryActor {
                     let result = self.registry.apns_topics_for_tokens(&tokens);
                     let _ = response.send(result);
                 }
+                PushRegistryCommand::AndroidChannelsForTokens { tokens, response } => {
+                    let result = self.registry.android_channels_for_tokens(&tokens);
+                    let _ = response.send(result);
+                }
                 PushRegistryCommand::WebPushForTokens { tokens, response } => {
                     let result = self.registry.web_push_for_tokens(&tokens);
                     let _ = response.send(result);
@@ -1938,6 +1975,7 @@ impl PushRegistryHandle {
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
+        android_channel_id: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -1959,6 +1997,7 @@ impl PushRegistryHandle {
             voip_token,
             web_push,
             apns_topic,
+            android_channel_id,
             wallet_binding,
             device_key_binding,
             response,
@@ -1985,6 +2024,7 @@ impl PushRegistryHandle {
         voip_token: Option<String>,
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
+        android_channel_id: Option<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -2005,6 +2045,7 @@ impl PushRegistryHandle {
             voip_token,
             web_push,
             apns_topic,
+            android_channel_id,
             wallet_binding,
             device_key_binding,
             response,
@@ -2175,6 +2216,15 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// Map each Android token to the notification channel it registered (absent = default).
+    pub async fn android_channels_for_tokens(
+        &self,
+        tokens: Vec<String>,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        self.request(|response| PushRegistryCommand::AndroidChannelsForTokens { tokens, response })
+            .await
+    }
+
     /// Map each `web` token to its stored browser subscription (None if the record lacks one).
     pub async fn web_push_for_tokens(
         &self,
@@ -2325,6 +2375,11 @@ pub struct DeviceRegistration {
     // in APNS_ALLOWED_TOPICS are kept. Outside the auth preimage; value only.
     #[serde(default)]
     pub apns_topic: Option<String>,
+    // Android only: the notification channel the device's Sound & Vibration choice maps to, for
+    // system-drawn pushes (FCM android.notification.channel_id). Outside the auth preimage, like
+    // every optional field added after LegacyV1. Value only.
+    #[serde(default)]
+    pub android_channel_id: Option<String>,
     #[serde(default)]
     pub app_attest_key_id: Option<String>,
     #[serde(default)]
@@ -3047,11 +3102,23 @@ impl PushDispatcher {
         if let Some(fcm) = self.fcm.as_ref()
             && !fcm_tokens.is_empty()
         {
-            let results = stream::iter(fcm_tokens.into_iter().map(|token| async move {
-                let result = fcm
-                    .send_data(&token, fcm_data, collapse_id, fcm_notification)
-                    .await;
-                (token, DeliveryOutcome::from_fcm(result))
+            // Only an OS-drawn push uses the channel; data-only pushes are drawn by the app.
+            let channels = if fcm_notification {
+                self.registry
+                    .android_channels_for_tokens(fcm_tokens.clone())
+                    .await
+                    .unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
+            let results = stream::iter(fcm_tokens.into_iter().map(|token| {
+                let channel = channels.get(&token).cloned();
+                async move {
+                    let result = fcm
+                        .send_data(&token, fcm_data, collapse_id, fcm_notification, channel.as_deref())
+                        .await;
+                    (token, DeliveryOutcome::from_fcm(result))
+                }
             }))
             .buffer_unordered(FCM_SEND_CONCURRENCY)
             .collect::<Vec<_>>()
@@ -4441,6 +4508,36 @@ const KNOWN_APP_TOPICS: &[&str] = &[
 ];
 
 /// Keep a requested APNs topic only if it is a known or allowed one (exact bundle id).
+/// The notification channels KaChat, KaPay and KaPost Android create, one per Sound & Vibration
+/// choice (docs/ANDROID_NOTIFICATION_CHANNEL.md).
+const ANDROID_NOTIFICATION_CHANNELS: [&str; 4] = [
+    "kachat_messages_sound_vibrate",
+    "kachat_messages_sound_only",
+    "kachat_messages_vibrate_only",
+    "kachat_messages_silent",
+];
+
+/// A known channel on an Android device; any other value, or any value on another platform, is
+/// None. Absent keeps the stored one, like apns_topic.
+fn normalize_android_channel_id(
+    platform: &str,
+    requested: Option<String>,
+    existing: Option<&DeviceRegistration>,
+) -> Option<String> {
+    if platform != "android" {
+        return None;
+    }
+    match requested {
+        Some(channel) => {
+            let channel = channel.trim();
+            ANDROID_NOTIFICATION_CHANNELS
+                .contains(&channel)
+                .then(|| channel.to_string())
+        }
+        None => existing.and_then(|reg| reg.android_channel_id.clone()),
+    }
+}
+
 fn normalize_apns_topic(topic: Option<String>) -> Option<String> {
     let topic = topic?.trim().to_string();
     (KNOWN_APP_TOPICS.contains(&topic.as_str()) || allowed_apns_topics().contains(&topic))
@@ -4726,6 +4823,7 @@ mod tests {
             voip_token: None,
             web_push: None,
             apns_topic: None,
+            android_channel_id: None,
             created_at: 0,
             last_seen: 0,
         };
@@ -4793,6 +4891,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("registration succeeds");
@@ -4835,6 +4934,7 @@ mod tests {
                 None,
                 vec![],
                 vec![],
+                None,
                 None,
                 None,
                 None,
@@ -4913,6 +5013,7 @@ mod tests {
                     None,
                     vec![],
                     vec![],
+                    None,
                     None,
                     None,
                     None,
@@ -5062,6 +5163,38 @@ mod kaposts_watch_tests {
         assert_eq!(normalize_kaposts_watch_authors(many).len(), MAX_KAPOSTS_WATCH_AUTHORS);
     }
 
+
+    #[test]
+    fn only_a_known_channel_on_android_is_kept() {
+        use super::{DeviceRegistration, normalize_android_channel_id};
+        // A record stored before the field existed still loads, with no channel.
+        let old: DeviceRegistration = serde_json::from_value(serde_json::json!({
+            "device_token": "token", "platform": "android", "watched_addresses": [],
+            "created_at": 0, "last_seen": 0,
+        }))
+        .expect("an old record loads");
+        assert_eq!(old.android_channel_id, None);
+        let mut stored = old;
+        stored.android_channel_id = Some("kachat_messages_vibrate_only".into());
+        let silent = || Some("kachat_messages_silent".to_string());
+        assert_eq!(
+            normalize_android_channel_id("android", silent(), None).as_deref(),
+            Some("kachat_messages_silent")
+        );
+        assert_eq!(normalize_android_channel_id("android", Some("my_channel".into()), None), None);
+        assert_eq!(normalize_android_channel_id("ios", silent(), None), None);
+        // An old client sends nothing: no channel, or the one stored before.
+        assert_eq!(normalize_android_channel_id("android", None, None), None);
+        assert_eq!(
+            normalize_android_channel_id("android", None, Some(&stored)).as_deref(),
+            Some("kachat_messages_vibrate_only")
+        );
+        // A known value replaces the stored one.
+        assert_eq!(
+            normalize_android_channel_id("android", silent(), Some(&stored)).as_deref(),
+            Some("kachat_messages_silent")
+        );
+    }
     #[tokio::test]
     async fn a_wallet_registers_watch_only_and_keeps_an_allowed_topic() {
         // Only this test passes an apns_topic, so it is the first to read the allow-list.
@@ -5111,6 +5244,7 @@ mod kaposts_watch_tests {
                         None,
                         None,
                         topic,
+                        None, // no android channel
                         None,
                         None,
                     )
@@ -5263,6 +5397,7 @@ mod kaposts_watch_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("watch-only registration");
@@ -5337,6 +5472,7 @@ mod kaposts_watch_tests {
                     None,
                     watch,
                     vec![],
+                    None,
                     None,
                     None,
                     None,

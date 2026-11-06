@@ -185,6 +185,11 @@ pub struct PushRegistrationRequest {
     // auth preimage; absent on update keeps the stored one.
     #[serde(default)]
     pub apns_topic: Option<String>,
+    // Android: the notification channel for system-drawn pushes, one of the four the apps
+    // create. Anything else is stored as None. Outside the auth preimage; absent on update keeps
+    // the stored one.
+    #[serde(default)]
+    pub android_channel_id: Option<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -307,6 +312,11 @@ pub struct PushUpdateRequest {
     // auth preimage; absent on update keeps the stored one.
     #[serde(default)]
     pub apns_topic: Option<String>,
+    // Android: the notification channel for system-drawn pushes, one of the four the apps
+    // create. Anything else is stored as None. Outside the auth preimage; absent on update keeps
+    // the stored one.
+    #[serde(default)]
+    pub android_channel_id: Option<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -956,6 +966,7 @@ async fn register_device(
             payload.voip_token,
             web_push,
             payload.apns_topic,
+            payload.android_channel_id,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )
@@ -1057,6 +1068,7 @@ async fn update_registration(
             payload.voip_token,
             web_push,
             payload.apns_topic,
+            payload.android_channel_id,
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )
@@ -1243,16 +1255,7 @@ fn authenticate_push_request(
                 "Signed auth is required for group push registration",
             ));
         }
-        return match state.auth_mode {
-            PushAuthMode::Strict => Err(PushApiError::unauthorized(
-                "Signed auth is required for push mutations",
-            )),
-            PushAuthMode::Legacy | PushAuthMode::Mixed => Ok(VerifiedPushAuth {
-                wallet_binding: None,
-                device_binding: None,
-                capabilities: Vec::new(),
-            }),
-        };
+        return unsigned_push_auth(state.auth_mode, primary_address);
     };
 
     let now_ms = unix_time_ms();
@@ -1276,15 +1279,7 @@ fn authenticate_push_request(
         aliases,
         auth,
     )?;
-    if capabilities
-        .iter()
-        .any(|capability| capability == GROUP_V1_CAPABILITY)
-        && normalized_primary != wallet_binding.wallet_address
-    {
-        return Err(PushApiError::unauthorized(
-            "primary_address must match the authenticated wallet for group push",
-        ));
-    }
+    check_primary_binding(&capabilities, &normalized_primary, &wallet_binding.wallet_address)?;
     let device_binding =
         verify_device_key_binding_from_auth(method, path, &normalized_device_token, auth)?;
 
@@ -1295,6 +1290,49 @@ fn authenticate_push_request(
         device_binding,
         capabilities,
     })
+}
+
+/// An unsigned mutation. A primary address routes VoIP rings, group adds and name events to the
+/// device, so in mixed mode only a wallet that signed for it may claim one. Unsigned watching of
+/// addresses (on-chain, public) stays as it was.
+fn unsigned_push_auth(
+    mode: PushAuthMode,
+    primary_address: Option<&str>,
+) -> Result<VerifiedPushAuth, PushApiError> {
+    let claims_primary = primary_address.is_some_and(|p| !p.trim().is_empty());
+    match mode {
+        PushAuthMode::Strict => Err(PushApiError::unauthorized(
+            "Signed auth is required for push mutations",
+        )),
+        PushAuthMode::Mixed if claims_primary => Err(PushApiError::unauthorized(
+            "Signed auth is required to register a primary_address",
+        )),
+        PushAuthMode::Legacy | PushAuthMode::Mixed => Ok(VerifiedPushAuth {
+            wallet_binding: None,
+            device_binding: None,
+            capabilities: Vec::new(),
+        }),
+    }
+}
+
+/// Every push routed by primary address goes to the wallet that signed, never to an address
+/// someone else typed in. Group push needs the primary address set.
+fn check_primary_binding(
+    capabilities: &[String],
+    normalized_primary: &str,
+    wallet_address: &str,
+) -> Result<(), PushApiError> {
+    let groups = capabilities
+        .iter()
+        .any(|capability| capability == GROUP_V1_CAPABILITY);
+    if (groups || !normalized_primary.is_empty()) && normalized_primary != wallet_address {
+        return Err(PushApiError::unauthorized(if groups {
+            "primary_address must match the authenticated wallet for group push"
+        } else {
+            "primary_address must match the authenticated wallet"
+        }));
+    }
+    Ok(())
 }
 
 fn authenticate_unregister_request(
@@ -2175,6 +2213,27 @@ mod tests {
         let mut bad = ios_scheduled_body();
         bad["transaction"]["payload"] = serde_json::json!("zz");
         assert!(relay_rpc_transaction(bad).is_err());
+    }
+
+    #[test]
+    fn an_unsigned_device_cant_claim_a_primary_address_in_mixed_mode() {
+        let primary = Some("kaspa:qqvictim");
+        assert!(unsigned_push_auth(PushAuthMode::Mixed, primary).is_err());
+        assert!(unsigned_push_auth(PushAuthMode::Mixed, Some("  ")).is_ok());
+        assert!(unsigned_push_auth(PushAuthMode::Mixed, None).is_ok());
+        assert!(unsigned_push_auth(PushAuthMode::Legacy, primary).is_ok());
+        assert!(unsigned_push_auth(PushAuthMode::Strict, None).is_err());
+    }
+
+    #[test]
+    fn a_signed_primary_address_must_be_the_signers() {
+        let none: Vec<String> = Vec::new();
+        let groups = vec![GROUP_V1_CAPABILITY.to_string()];
+        assert!(check_primary_binding(&none, "kaspa:qqme", "kaspa:qqme").is_ok());
+        assert!(check_primary_binding(&none, "", "kaspa:qqme").is_ok());
+        assert!(check_primary_binding(&none, "kaspa:qqvictim", "kaspa:qqme").is_err());
+        assert!(check_primary_binding(&groups, "kaspa:qqme", "kaspa:qqme").is_ok());
+        assert!(check_primary_binding(&groups, "", "kaspa:qqme").is_err());
     }
 
     #[test]
