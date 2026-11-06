@@ -31,16 +31,19 @@ impl BlockCompactHeaderPartition {
         ))
     }
 
-    pub fn insert_compact_header(
+    /// Records the block's header inside the block's own write transaction, so "already
+    /// processed" commits together with the block's content. Committed on its own, a block whose
+    /// write then hit a conflict, or a crash, was skipped on the retry and its txs were lost.
+    pub fn insert_compact_header_wtx(
         &self,
+        wtx: &mut WriteTransaction,
         block_hash: &[u8; 32],
         blue_work: [u8; 24],
         daa_score: impl Into<U64>,
     ) -> Result<AlreadyExist> {
         let daa_score: U64 = daa_score.into();
-        Ok(self
-            .0
-            .fetch_update(block_hash, move |_| {
+        Ok(wtx
+            .fetch_update(&self.0, block_hash, move |_| {
                 Some(
                     CompactHeader {
                         blue_work,
@@ -104,3 +107,30 @@ impl BlockCompactHeaderPartition {
 }
 
 type AlreadyExist = bool;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_block_whose_write_is_dropped_is_not_marked_processed() {
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let keyspace = fjall::Config::new(dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let headers = BlockCompactHeaderPartition::new(&keyspace).expect("headers");
+        let hash = [9u8; 32];
+
+        // The block's write never commits (a conflict or a crash): the retry must process it.
+        let mut wtx = keyspace.write_tx().expect("wtx");
+        assert!(!headers.insert_compact_header_wtx(&mut wtx, &hash, [0; 24], 5u64).expect("insert"));
+        drop(wtx);
+        let mut wtx = keyspace.write_tx().expect("wtx");
+        assert!(!headers.insert_compact_header_wtx(&mut wtx, &hash, [0; 24], 5u64).expect("insert"));
+        wtx.commit().expect("commit").expect("no conflict");
+
+        // Once it commits with the block, a second sighting is skipped.
+        let mut wtx = keyspace.write_tx().expect("wtx");
+        assert!(headers.insert_compact_header_wtx(&mut wtx, &hash, [0; 24], 5u64).expect("insert"));
+    }
+}

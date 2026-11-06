@@ -37,6 +37,7 @@ use indexer_db::metadata::MetadataPartition;
 use indexer_db::migration::apply_migrations;
 use indexer_db::processing::accepting_block_to_txs::AcceptingBlockToTxIDPartition;
 use indexer_db::processing::pending_senders::PendingSenderResolutionPartition;
+use indexer_db::processing::output0_owner::TxOutput0OwnerPartition;
 use indexer_db::processing::tx_id_to_acceptance::TxIDToAcceptancePartition;
 use indexer_db::processing::watched_outpoints::{
     WatchedOutpointPartition, WatchedOutpointSpendPartition,
@@ -233,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
     let group_control_by_recipient_partition = GroupControlByRecipientPartition::new(&tx_keyspace)?;
     let tx_id_to_group_control_partition = TxIdToGroupControlPartition::new(&tx_keyspace)?;
     let tx_id_to_acceptance_partition = TxIDToAcceptancePartition::new(&tx_keyspace)?;
+    let tx_output0_owner_partition = TxOutput0OwnerPartition::new(&tx_keyspace)?;
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
     let acceptance_to_tx_id_partition = AcceptingBlockToTxIDPartition::new(&tx_keyspace)?;
     let pending_sender_resolution_partition = PendingSenderResolutionPartition::new(&tx_keyspace)?;
@@ -375,6 +377,7 @@ async fn main() -> anyhow::Result<()> {
         .group_control_by_recipient_partition(group_control_by_recipient_partition.clone())
         .tx_id_to_group_control_partition(tx_id_to_group_control_partition.clone())
         .tx_id_to_acceptance_partition(tx_id_to_acceptance_partition.clone())
+        .tx_output0_owner_partition(tx_output0_owner_partition)
         .shared_metrics(metrics.clone())
         .push_tx(push_tx.clone())
         .push_funds_tx(funds_push_tx.clone())

@@ -35,6 +35,7 @@ use indexer_db::messages::self_stash::{
     SelfStashByOwnerPartition, SelfStashKeyByOwner, SelfStashScope, TxIdToSelfStashPartition,
 };
 use indexer_db::metadata::MetadataPartition;
+use indexer_db::processing::output0_owner::TxOutput0OwnerPartition;
 use indexer_db::processing::tx_id_to_acceptance::{
     AcceptanceKey, Action, InsertionEntry, TxIDToAcceptancePartition,
 };
@@ -88,6 +89,8 @@ pub struct BlockProcessor {
     group_control_by_recipient_partition: GroupControlByRecipientPartition,
     tx_id_to_group_control_partition: TxIdToGroupControlPartition,
     tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
+    // Who owns output 0 of a tx when that isn't its receiver, so sender resolution is exact.
+    tx_output0_owner_partition: TxOutput0OwnerPartition,
     shared_metrics: SharedMetrics,
     push_tx: Option<flume::Sender<PushEvent>>,
     // Address Activity: accepted txs crediting a watched (owned) address are forwarded here.
@@ -352,7 +355,8 @@ impl BlockProcessor {
         wtx: &mut WriteTransaction,
         block: &RpcBlock,
     ) -> anyhow::Result<()> {
-        let already_processed = self.block_compact_header_partition.insert_compact_header(
+        let already_processed = self.block_compact_header_partition.insert_compact_header_wtx(
+            wtx,
             block.header.hash.as_ref(),
             block.header.blue_work.to_le_bytes(),
             block.header.daa_score,
@@ -516,11 +520,26 @@ impl BlockProcessor {
                 .tx_id_to_acceptance_partition
                 .key_by_tx_id(sender_outpoint.transaction_id.as_ref())?
         {
-            Some(acceptance_key.receiver)
+            let parent_id = sender_outpoint.transaction_id.as_bytes();
+            let owner = self.tx_output0_owner_partition.get_wtx(wtx, &parent_id)?;
+            output0_owner(acceptance_key.receiver, owner)
         } else {
             None
         };
         let (amount, receiver) = resolve_primary_receiver(&tx.outputs, sender)?;
+        // The next tx spending our output 0 takes its owner as sender: note it when it isn't the
+        // receiver (or isn't a standard address at all).
+        let output0 = tx
+            .outputs
+            .first()
+            .and_then(|output| AddressPayload::try_from(&output.script_public_key).ok());
+        if output0 != Some(receiver) {
+            self.tx_output0_owner_partition.insert_wtx(
+                wtx,
+                &tx_id.as_bytes(),
+                &output0.unwrap_or_default(),
+            );
+        }
         debug!(receiver=?receiver, "Handling transaction");
         let mut entries: SmallVec<[_; 1]> = SmallVec::new();
         // Personal indexing mode: when an allowlist is configured, only store chat content that is
@@ -1196,6 +1215,19 @@ fn decode_fixed_hex<const N: usize>(hex_bytes: &[u8]) -> anyhow::Result<[u8; N]>
     Ok(out)
 }
 
+/// The owner of a parent tx's output 0: the recorded one when there is a record (empty = not a
+/// standard address, so unknown), otherwise the parent's receiver.
+fn output0_owner(
+    parent_receiver: AddressPayload,
+    recorded: Option<AddressPayload>,
+) -> Option<AddressPayload> {
+    match recorded {
+        Some(owner) if owner == AddressPayload::default() => None,
+        Some(owner) => Some(owner),
+        None => Some(parent_receiver),
+    }
+}
+
 fn resolve_primary_receiver(
     outputs: &[RpcTransactionOutput],
     sender: Option<AddressPayload>,
@@ -1245,5 +1277,26 @@ impl From<BlockNotification> for NotificationOrGapResult {
 impl From<GapFillingProgress> for NotificationOrGapResult {
     fn from(value: GapFillingProgress) -> Self {
         Self::GapFilling(value)
+    }
+}
+
+#[cfg(test)]
+mod sender_tests {
+    use super::*;
+
+    fn addr(byte: u8) -> AddressPayload {
+        AddressPayload::from_xonly_pubkey([byte; 32])
+    }
+
+    #[test]
+    fn spending_change_at_output_0_is_not_sent_by_the_receiver() {
+        let (mallory, victim) = (addr(1), addr(2));
+        // T1 paid [Mallory change, Victim dust]: its receiver is Victim, but output 0 is
+        // Mallory's, and a tx spending it is Mallory's.
+        assert_eq!(output0_owner(victim, Some(mallory)), Some(mallory));
+        // Ordered [receiver, change], or indexed before the record existed: the receiver.
+        assert_eq!(output0_owner(victim, None), Some(victim));
+        // Output 0 pays no standard address: unknown, left to the node.
+        assert_eq!(output0_owner(victim, Some(AddressPayload::default())), None);
     }
 }
