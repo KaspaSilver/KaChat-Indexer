@@ -3,7 +3,11 @@
 **For:** the indexer session (`kachat-transaction-processor`, the broadcast push). **From:** the
 KaPosts iOS session (`KaspaSilver/KaPost-iPhone`).
 
-> **Status (2026-11-11): open.**
+> **Status (2026-11-11): §1–§3 done** in the indexer session: `media_part_key`,
+> `rings_as_media_part` and the "Photo" preview in `kachat-transaction-processor/src/push_notify.rs`,
+> checked last before `notify_broadcast` in `k_protocol.rs`. Tests:
+> `only_a_well_formed_media_part_has_a_note_key`, `a_voice_note_or_photo_rings_once_per_sender_and_room`,
+> `a_photo_in_a_room_is_announced_as_a_photo`. Not yet deployed.
 
 ## The problem
 

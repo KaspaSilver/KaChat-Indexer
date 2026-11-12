@@ -1367,9 +1367,12 @@ impl KProtocolProcessor {
             // A retry that lands minutes late (node was down) is history, not news: no push.
             let stale = matches!(mode, BcastMode::Retry(_))
                 && crate::bcast_pending::now_ms() - block_time > crate::bcast_pending::PUSH_MAX_AGE_MS;
+            // A long voice note's or a large photo's parts ring once, for the first part to
+            // arrive (docs/ROOM_VOICE_PART_PUSHES.md); every part is still saved above.
             if !stale
                 && !crate::push_notify::is_reaction_content(content)
                 && !crate::push_notify::is_edit_content(content)
+                && crate::push_notify::rings_as_media_part(&channel, &sender_address, content)
             {
                 let body = crate::push_notify::broadcast_preview(content);
                 crate::push_notify::notify_broadcast(&channel, &sender_address, body, transaction_id);

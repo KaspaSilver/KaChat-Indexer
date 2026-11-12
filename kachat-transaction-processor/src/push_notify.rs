@@ -147,8 +147,8 @@ pub fn kachat_snippet(base64_message: &str) -> Option<String> {
     Some(truncate_chars(body.trim(), 140))
 }
 
-/// Build a broadcast notification body: reply envelope → inner text; file/audio → "Voice message";
-/// else the text verbatim (~150 chars).
+/// Build a broadcast notification body: reply envelope → inner text; an image file → "Photo";
+/// any other file/audio → "Voice message"; else the text verbatim (~150 chars).
 pub fn broadcast_preview(content: &str) -> String {
     let trimmed = content.trim();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -169,7 +169,11 @@ pub fn broadcast_preview(content: &str) -> String {
                     return truncate_chars(inner, 150);
                 }
             }
-            "file" | "audio" => return "Voice message".to_string(),
+            "file" | "audio" => {
+                let image = v.get("mimeType").and_then(|m| m.as_str()).is_some_and(|m| m.starts_with("image/"))
+                    || v.get("content").and_then(|c| c.as_str()).is_some_and(|c| c.starts_with("data:image/"));
+                return if image { "Photo" } else { "Voice message" }.to_string();
+            }
             _ => {}
         }
     }
@@ -198,6 +202,80 @@ pub fn is_edit_content(content: &str) -> bool {
         .ok()
         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "edit"))
         .unwrap_or(false)
+}
+
+/// The note or photo a Public Chats media part belongs to: its kind (`voice` or `photo`), its
+/// lowercased id and its `count`, or None for anything that isn't a well-formed part (a plain
+/// voice message or photo pushes as before). KaChat's long voice notes and large photos go out as
+/// up to 12 parts, one message each, tagged `voicePart` on `audio/*` and `mediaPart` on `image/*`
+/// (docs/ROOM_VOICE_PART_PUSHES.md, KaChat iPhone MESSAGING.md). A tag under the other kind's key
+/// is no tag.
+pub fn media_part_key(content: &str) -> Option<(&'static str, String, u32)> {
+    let v = serde_json::from_str::<serde_json::Value>(content.trim()).ok()?;
+    if v.get("type")?.as_str()? != "file" {
+        return None;
+    }
+    let mime = v.get("mimeType")?.as_str()?;
+    let (kind, tag) = if mime.starts_with("audio/") {
+        ("voice", "voicePart")
+    } else if mime.starts_with("image/") {
+        ("photo", "mediaPart")
+    } else {
+        return None;
+    };
+    let part = v.get(tag)?.as_object()?;
+    let id = part.get("id")?.as_str()?;
+    if !(16..=64).contains(&id.len()) || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let count = part.get("count")?.as_u64()?;
+    let index = part.get("index")?.as_u64()?;
+    ((2..=12).contains(&count) && (1..=count).contains(&index))
+        .then(|| (kind, id.to_ascii_lowercase(), count as u32))
+}
+
+/// How long a note's (or photo's) first push holds back its other parts. A whole note is out within a minute
+/// or two; a retried part rarely lands later than this.
+const MEDIA_NOTE_PUSHED_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// A part's note: (channel, sender, kind, id, count).
+type MediaNoteKey = (String, String, &'static str, String, u32);
+
+/// Notes and photos that have already rung. In memory only: after a restart a note mid-send
+/// rings once more, which is fine.
+#[derive(Default)]
+struct MediaNotesPushed {
+    at: std::collections::HashMap<MediaNoteKey, std::time::Instant>,
+}
+
+impl MediaNotesPushed {
+    /// True for the first part of a note to arrive (it rings); false for the rest.
+    fn first(&mut self, key: MediaNoteKey, now: std::time::Instant) -> bool {
+        self.at.retain(|_, pushed| now.duration_since(*pushed) < MEDIA_NOTE_PUSHED_TTL);
+        match self.at.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(now);
+                true
+            }
+        }
+    }
+}
+
+static MEDIA_NOTES_PUSHED: Lazy<std::sync::Mutex<MediaNotesPushed>> = Lazy::new(Default::default);
+
+/// Whether a room message should ring as far as media parts go: anything that isn't a part does,
+/// and a part does only when it is the first of its note or photo seen here. Call it last, just
+/// before pushing, so a part that wasn't going to push anyway doesn't use up its one push.
+pub fn rings_as_media_part(channel: &str, sender_address: &str, content: &str) -> bool {
+    let Some((kind, id, count)) = media_part_key(content) else {
+        return true;
+    };
+    let key = (channel.to_string(), sender_address.to_string(), kind, id, count);
+    MEDIA_NOTES_PUSHED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .first(key, std::time::Instant::now())
 }
 
 /// Notify the push service of a new broadcast in a tracked channel.
@@ -336,6 +414,76 @@ pub fn notify_kaposts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_well_formed_media_part_has_a_note_key() {
+        let part = |tag: &str, mime: &str| {
+            format!(
+                r#"{{"type":"file","name":"part-2of12","size":30807,"mimeType":"{mime}",{tag}"content":"data:{mime};base64,AAAA"}}"#
+            )
+        };
+        let tagged = |key: &str, mime: &str, id: &str, index: &str, count: &str| {
+            part(&format!(r#""{key}":{{"id":"{id}","index":{index},"count":{count}}},"#), mime)
+        };
+        let voice = |id: &str, index: &str, count: &str| tagged("voicePart", "audio/webm", id, index, count);
+        let id = "3F9A0B1C2D3E4F5061728394A5B6C7D8";
+        let lower = id.to_ascii_lowercase();
+        assert_eq!(super::media_part_key(&voice(id, "2", "12")), Some(("voice", lower.clone(), 12)));
+        assert!(super::media_part_key(&voice(id, "1", "2")).is_some());
+        assert_eq!(
+            super::media_part_key(&tagged("mediaPart", "image/jpeg", id, "2", "6")),
+            Some(("photo", lower, 6))
+        );
+        for (id, index, count) in [
+            (id, "0", "12"),
+            (id, "13", "12"),
+            (id, "1", "1"),
+            (id, "1", "13"),
+            ("0123456789", "1", "2"),
+            ("zz9a0b1c2d3e4f5061728394a5b6c7d8", "1", "2"),
+            (id, "true", "2"),
+            (id, r#""1""#, "2"),
+            (id, "1.5", "2"),
+        ] {
+            assert_eq!(super::media_part_key(&voice(id, index, count)), None, "{id} {index}/{count}");
+        }
+        // A tag under the other kind's key is no tag.
+        assert_eq!(super::media_part_key(&tagged("voicePart", "image/jpeg", id, "1", "2")), None);
+        assert_eq!(super::media_part_key(&tagged("mediaPart", "audio/webm", id, "1", "2")), None);
+        assert_eq!(super::media_part_key(&tagged("voicePart", "video/mp4", id, "1", "2")), None);
+        assert_eq!(super::media_part_key(&part("", "audio/webm")), None);
+        assert_eq!(super::media_part_key("gm"), None);
+    }
+
+    #[test]
+    fn a_voice_note_or_photo_rings_once_per_sender_and_room() {
+        let mut pushed = super::MediaNotesPushed::default();
+        let key = |channel: &str, sender: &str, kind: &'static str| {
+            (channel.to_string(), sender.to_string(), kind, "3f9a0b1c2d3e4f50".to_string(), 3)
+        };
+        let start = std::time::Instant::now();
+        assert!(pushed.first(key("kaspa", "kaspa:alice", "voice"), start));
+        assert!(!pushed.first(key("kaspa", "kaspa:alice", "voice"), start));
+        // The same id from someone else, in another room, or for a photo is another note.
+        assert!(pushed.first(key("kaspa", "kaspa:bob", "voice"), start));
+        assert!(pushed.first(key("general", "kaspa:alice", "voice"), start));
+        assert!(pushed.first(key("kaspa", "kaspa:alice", "photo"), start));
+        assert!(!pushed.first(key("kaspa", "kaspa:alice", "photo"), start));
+        // Once the entry expires the key rings again.
+        let later = start + super::MEDIA_NOTE_PUSHED_TTL;
+        assert!(pushed.first(key("kaspa", "kaspa:alice", "voice"), later));
+    }
+
+    #[test]
+    fn a_photo_in_a_room_is_announced_as_a_photo() {
+        let file = |mime: &str, data: &str| {
+            format!(r#"{{"type":"file","name":"f","size":1,"mimeType":"{mime}","content":"data:{data};base64,AAAA"}}"#)
+        };
+        assert_eq!(super::broadcast_preview(&file("image/jpeg", "image/jpeg")), "Photo");
+        assert_eq!(super::broadcast_preview(&file("application/octet-stream", "image/png")), "Photo");
+        assert_eq!(super::broadcast_preview(&file("audio/webm", "audio/webm")), "Voice message");
+        assert_eq!(super::broadcast_preview(&file("application/pdf", "application/pdf")), "Voice message");
+    }
+
     use super::*;
 
     #[test]
