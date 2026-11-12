@@ -1,5 +1,9 @@
 # iPhone KaChat has no calls any more: stop keeping and ringing its VoIP tokens (2026-11-11)
 
+**Status (2026-11-11, indexer session):** §1 is done (`normalize_stored_voip_token` in
+`indexer/src/push.rs`, test `an_apple_device_that_stops_sending_its_voip_token_is_not_rung`). §2's
+one-off cleanup was skipped: devices clear on their next launch. §3 needed no change.
+
 **For:** the indexer session (`kasia-indexer`, the push service). **From:** the KaChat iOS
 session (`KaspaSilver/KaChat-iPhone`).
 

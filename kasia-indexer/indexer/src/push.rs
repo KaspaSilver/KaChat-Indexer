@@ -182,8 +182,8 @@ impl PushRegistry {
         // Keep the stored value when the request omits these (don't clobber on a partial update).
         let normalized_apns_environment = requested_apns_environment
             .or_else(|| existing.as_ref().and_then(|reg| reg.apns_environment.clone()));
-        let normalized_voip_token = requested_voip_token
-            .or_else(|| existing.as_ref().and_then(|reg| reg.voip_token.clone()));
+        let normalized_voip_token =
+            normalize_stored_voip_token(&platform, requested_voip_token, existing.as_ref());
         // An absent web_push keeps the stored subscription (partial updates must not clobber).
         let normalized_web_push =
             web_push.or_else(|| existing.as_ref().and_then(|reg| reg.web_push.clone()));
@@ -519,8 +519,6 @@ impl PushRegistry {
         // Keep the stored value when the request omits these (don't clobber on a partial update).
         let normalized_apns_environment = requested_apns_environment
             .or_else(|| existing.as_ref().and_then(|reg| reg.apns_environment.clone()));
-        let normalized_voip_token = requested_voip_token
-            .or_else(|| existing.as_ref().and_then(|reg| reg.voip_token.clone()));
         // An absent web_push keeps the stored subscription (partial updates must not clobber).
         let normalized_web_push =
             web_push.or_else(|| existing.as_ref().and_then(|reg| reg.web_push.clone()));
@@ -550,6 +548,8 @@ impl PushRegistry {
             .as_ref()
             .map(|reg| reg.platform.clone())
             .unwrap_or_else(|| "ios".to_string());
+        let normalized_voip_token =
+            normalize_stored_voip_token(&platform, requested_voip_token, existing.as_ref());
         let normalized_android_channel_id =
             normalize_android_channel_id(&platform, android_channel_id, existing.as_ref());
         let last_seen_refresh = existing
@@ -4567,6 +4567,20 @@ fn normalize_android_channel_id(
     }
 }
 
+/// KaChat for iPhone and Mac dropped calls on 2026-11-11, and its calling builds sent their VoIP
+/// token on every register and update, so on an Apple device a missing token means "no calls"
+/// and clears the stored one (docs/IOS_CALLS_RETIRED.md). Elsewhere absent keeps it.
+fn normalize_stored_voip_token(
+    platform: &str,
+    requested: Option<String>,
+    existing: Option<&DeviceRegistration>,
+) -> Option<String> {
+    if matches!(platform, "ios" | "macos") {
+        return requested;
+    }
+    requested.or_else(|| existing.and_then(|reg| reg.voip_token.clone()))
+}
+
 fn normalize_apns_topic(topic: Option<String>) -> Option<String> {
     let topic = topic?.trim().to_string();
     (KNOWN_APP_TOPICS.contains(&topic.as_str()) || allowed_apns_topics().contains(&topic))
@@ -5224,6 +5238,100 @@ mod kaposts_watch_tests {
             Some("kachat_messages_silent")
         );
     }
+    #[test]
+    fn an_apple_device_that_stops_sending_its_voip_token_is_not_rung() {
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let mut registry = PushRegistry::new(
+            tx_keyspace.clone(),
+            DeviceRegistrationPartition::new(&tx_keyspace).expect("device partition"),
+            WatchedAddressPartition::new(&tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(&tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(&tx_keyspace).expect("primary partition"),
+            create_shared_metrics(),
+        );
+        let address = Address::new(Prefix::Mainnet, Version::PubKey, &[9u8; 32]).to_string();
+        let register = |registry: &mut PushRegistry, platform: &str, token: &str, voip: Option<&str>| {
+            registry.register(
+                token.to_string(),
+                platform.to_string(),
+                vec![address.clone()],
+                vec![],
+                vec![],
+                Some(address.clone()),
+                vec![],
+                vec![],
+                Default::default(),
+                None,
+                None,
+                vec![],
+                vec![],
+                None,
+                voip.map(str::to_string),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let update = |registry: &mut PushRegistry, token: &str, voip: Option<&str>| {
+            registry.update(
+                token.to_string(),
+                vec![address.clone()],
+                vec![],
+                vec![],
+                Some(address.clone()),
+                vec![],
+                vec![],
+                Default::default(),
+                None,
+                None,
+                vec![],
+                vec![],
+                None,
+                voip.map(str::to_string),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let rung = |registry: &PushRegistry| -> Vec<String> {
+            let mut tokens: Vec<String> = registry
+                .voip_tokens_for_primary_address(&address)
+                .expect("voip lookup")
+                .into_iter()
+                .map(|(device, _, _)| device)
+                .collect();
+            tokens.sort();
+            tokens
+        };
+        let iphone = "ab".repeat(32);
+        let mac = "cd".repeat(32);
+        let android = &format!("fcm-{}", "a".repeat(140));
+        for (platform, token) in [("ios", iphone.as_str()), ("macos", mac.as_str()), ("android", android.as_str())] {
+            register(&mut registry, platform, token, Some("voip")).expect("registered with calls");
+        }
+        assert_eq!(rung(&registry).len(), 3);
+
+        // The iPhone registers without a VoIP token (the build with no calls): it's cleared.
+        register(&mut registry, "ios", &iphone, None).expect("re-registered");
+        // The Mac updates without one: also cleared.
+        update(&mut registry, &mac, None).expect("updated");
+        // Android leaving it out is a partial update, so its token stays.
+        register(&mut registry, "android", android, None).expect("re-registered");
+        update(&mut registry, android, None).expect("updated");
+        assert_eq!(rung(&registry), vec![android.to_string()]);
+
+        // An older calling build puts its token back on its next update.
+        update(&mut registry, &iphone, Some("voip")).expect("updated");
+        assert_eq!(rung(&registry).len(), 2);
+    }
+
     #[tokio::test]
     async fn a_wallet_registers_watch_only_and_keeps_an_allowed_topic() {
         // Only this test passes an apns_topic, so it is the first to read the allow-list.
