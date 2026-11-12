@@ -1,4 +1,4 @@
-# Room voice notes: one push per note, not one per part (2026-11-11)
+# Room voice notes and photos: one push per note or photo, not one per part (2026-11-11)
 
 **For:** the indexer session (`kachat-transaction-processor`, the broadcast push). **From:** the
 KaPosts iOS session (`KaspaSilver/KaPost-iPhone`).
@@ -18,7 +18,7 @@ hold back the later parts itself. While the app is open it lists them quietly, b
 background or closed iOS shows every push as it arrives. Room messages are plaintext, so the
 indexer can see the part tag and is the one place this can be fixed.
 
-## 1. Push only the first part of a note to arrive (required)
+## 1. Voice notes: push only the first part of a note to arrive (required)
 
 **The rule:** a broadcast whose content is a tagged voice part rings only when it is the first
 part of its note the indexer has seen. Later parts of the same note save as usual (room history
@@ -63,10 +63,39 @@ returning the lowercased id and count, keeps the parsing testable. The body stay
 - The push for an untagged voice message, or for a part with a malformed tag.
 - `apns-collapse-id` (still the tx id of the part that rang).
 
-## 2. Nothing for 1:1 or groups
+## 2. Multi-part photos: the same rule (required)
 
-KaChat's 1:1 and group voice parts are encrypted, so the server can't see their tag. KaChat's
-own notification extension handles those (KaChat `CLAUDE.md`, "Parts arrive as bare txIds").
+KaChat also sends large photos as parts: raw JPEG chunks of up to 31,000 bytes, up to 12, each
+its own message, tagged `mediaPart` instead of `voicePart`, with the same rules for `id`,
+`index` and `count` (KaChat `MESSAGING.md`, "Photos: quality tiers and multi-part photos"):
+
+```json
+{"type":"file","name":"photo-2of6.jpg","size":31000,"mimeType":"image/jpeg",
+ "mediaPart":{"id":"…(32 hex)","index":2,"count":6},
+ "content":"data:image/jpeg;base64,…"}
+```
+
+Today KaChat sends these in 1:1 and groups only, and KaPost sends no photos in rooms. But any
+client that sends one to a room would ring every part, so treat it the same:
+
+- Read `mediaPart` on `image/*` only, and `voicePart` on `audio/*` only. A tag under the other
+  kind's key is no tag.
+- The note key adds the kind, so a photo and a voice note can't share one: (channel, sender,
+  `voice` or `photo`, lowercased `id`, `count`).
+- The first part of a photo to arrive rings; the rest save without a push.
+
+## 3. The preview for a photo says "Photo" (recommended)
+
+`broadcast_preview` returns "Voice message" for every `"type":"file"` envelope, so a photo in
+a room is announced as a voice message. Return "Photo" when `mimeType` (or the `data:` URL)
+is `image/*`; keep "Voice message" for `audio/*` and any other file. KaPost already treats both
+"Voice message" and "Photo" as media for its in-app burst rule.
+
+## 4. Nothing for 1:1 or groups
+
+KaChat's 1:1 and group voice and photo parts are encrypted, so the server can't see their
+tags. KaChat's own notification extension handles those (KaChat `CLAUDE.md`, "Parts arrive as
+bare txIds"). KaPost never gets those pushes (`KAPOSTS_PUSH_TYPES`).
 
 ## Where the format is defined
 
@@ -83,9 +112,10 @@ bubble (`PublicChatVoiceParts`), and lists later parts quietly while open
 
 ## Testing
 
-- Unit tests for the tag reader: a valid part returns its key; index 0, index > count, count 1,
-  count 13, a 10-character id, a non-hex id, a boolean or string `index`, an image `mimeType`,
-  and no `voicePart` key each return none.
+- Unit tests for the tag reader: a valid voice part and a valid photo part each return their
+  key; index 0, index > count, count 1, count 13, a 10-character id, a non-hex id, a boolean or
+  string `index`, `voicePart` on an image, `mediaPart` on audio, and no tag each return none.
+- `broadcast_preview` of an `image/jpeg` file is "Photo"; of `audio/webm`, "Voice message".
 - Two parts with the same key: the first pushes, the second doesn't. The same id from another
   sender or another channel pushes. After the entry expires, the key pushes again.
 - On a room with the bell on: send a 30 s note from KaPost (3 parts) and expect one push
