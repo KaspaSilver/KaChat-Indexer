@@ -1,6 +1,6 @@
 use crate::config::PushAuthMode;
 use crate::push::{
-    DeviceKeyBinding, GROUP_V1_CAPABILITY, KaPostsNotify, PushRegistryHandle, WalletBinding,
+    DeviceKeyBinding, DevicePrefs, GROUP_V1_CAPABILITY, KaPostsNotify, PushRegistryHandle, WalletBinding,
 };
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -197,6 +197,15 @@ pub struct PushRegistrationRequest {
     // the stored one.
     #[serde(default)]
     pub android_channel_id: Option<String>,
+    // KaPost (KAPOSTS_AUDIT_SERVER_SIDE.md): the Mentions switch, everyone the owner blocked
+    // (66-hex keys; the list replaces the stored one) and the "Play sound" switch. Outside the
+    // auth preimage; absent keeps the stored value.
+    #[serde(default)]
+    pub kaposts_notify_mentions: Option<bool>,
+    #[serde(default)]
+    pub kaposts_blocked_pubkeys: Option<Vec<String>>,
+    #[serde(default)]
+    pub notify_sound: Option<bool>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -324,6 +333,15 @@ pub struct PushUpdateRequest {
     // the stored one.
     #[serde(default)]
     pub android_channel_id: Option<String>,
+    // KaPost (KAPOSTS_AUDIT_SERVER_SIDE.md): the Mentions switch, everyone the owner blocked
+    // (66-hex keys; the list replaces the stored one) and the "Play sound" switch. Outside the
+    // auth preimage; absent keeps the stored value.
+    #[serde(default)]
+    pub kaposts_notify_mentions: Option<bool>,
+    #[serde(default)]
+    pub kaposts_blocked_pubkeys: Option<Vec<String>>,
+    #[serde(default)]
+    pub notify_sound: Option<bool>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -460,6 +478,16 @@ pub(super) fn secret_matches(presented: &[u8], secret: &[u8]) -> bool {
 
 #[cfg(test)]
 mod internal_secret_tests {
+    #[test]
+    fn the_mentions_switch_alone_is_a_kaposts_preference() {
+        let n = super::resolve_kaposts_notify(None, None, None, None, None, None, Some(false))
+            .expect("a flat field was sent");
+        assert!(!n.mentions && n.likes && n.follows);
+        assert!(super::resolve_kaposts_notify(None, None, None, None, None, None, None).is_none());
+        let n = super::resolve_kaposts_notify(None, Some(false), None, None, None, None, None).unwrap();
+        assert!(n.mentions && !n.likes);
+    }
+
     use super::secret_matches;
 
     #[test]
@@ -833,12 +861,14 @@ fn resolve_kaposts_notify(
     comments: Option<bool>,
     reposts: Option<bool>,
     follows: Option<bool>,
+    mentions: Option<bool>,
 ) -> Option<KaPostsNotify> {
     let any_flat = likes.is_some()
         || dislikes.is_some()
         || comments.is_some()
         || reposts.is_some()
-        || follows.is_some();
+        || follows.is_some()
+        || mentions.is_some();
     if !any_flat {
         return nested;
     }
@@ -848,6 +878,7 @@ fn resolve_kaposts_notify(
         reposts: true,
         comments: true,
         follows: true,
+        mentions: true,
     });
     Some(KaPostsNotify {
         likes: likes.unwrap_or(base.likes),
@@ -855,6 +886,7 @@ fn resolve_kaposts_notify(
         comments: comments.unwrap_or(base.comments),
         reposts: reposts.unwrap_or(base.reposts),
         follows: follows.unwrap_or(base.follows),
+        mentions: mentions.unwrap_or(base.mentions),
     })
 }
 
@@ -936,11 +968,12 @@ async fn register_device(
         payload.kaposts_notify_comments,
         payload.kaposts_notify_reposts,
         payload.kaposts_notify_follows,
+        payload.kaposts_notify_mentions,
     );
     if let Some(n) = kaposts_notify {
         tracing::info!(
-            "[Push] register kaposts_notify likes={} dislikes={} comments={} reposts={} follows={}",
-            n.likes, n.dislikes, n.comments, n.reposts, n.follows
+            "[Push] register kaposts_notify likes={} dislikes={} comments={} reposts={} follows={} mentions={}",
+            n.likes, n.dislikes, n.comments, n.reposts, n.follows, n.mentions
         );
     }
 
@@ -974,6 +1007,10 @@ async fn register_device(
             web_push,
             payload.apns_topic,
             payload.android_channel_id,
+            DevicePrefs {
+                kaposts_blocked_pubkeys: payload.kaposts_blocked_pubkeys,
+                notify_sound: payload.notify_sound,
+            },
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )
@@ -1049,6 +1086,7 @@ async fn update_registration(
         payload.kaposts_notify_comments,
         payload.kaposts_notify_reposts,
         payload.kaposts_notify_follows,
+        payload.kaposts_notify_mentions,
     );
 
     let web_push = match validate_web_push(None, &payload.device_token, payload.web_push.as_ref()) {
@@ -1076,6 +1114,10 @@ async fn update_registration(
             web_push,
             payload.apns_topic,
             payload.android_channel_id,
+            DevicePrefs {
+                kaposts_blocked_pubkeys: payload.kaposts_blocked_pubkeys,
+                notify_sound: payload.notify_sound,
+            },
             verified_auth.wallet_binding,
             verified_auth.device_binding,
         )

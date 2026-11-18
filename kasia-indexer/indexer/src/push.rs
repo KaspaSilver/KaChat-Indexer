@@ -134,6 +134,7 @@ impl PushRegistry {
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
         android_channel_id: Option<String>,
+        device_prefs: DevicePrefs,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -192,6 +193,11 @@ impl PushRegistry {
             .or_else(|| existing.as_ref().and_then(|reg| reg.apns_topic.clone()));
         let normalized_android_channel_id =
             normalize_android_channel_id(&platform, android_channel_id, existing.as_ref());
+        let normalized_kaposts_blocked =
+            normalize_kaposts_blocked(device_prefs.kaposts_blocked_pubkeys, existing.as_ref());
+        let normalized_notify_sound = device_prefs
+            .notify_sound
+            .or_else(|| existing.as_ref().and_then(|reg| reg.notify_sound));
         let effective_wallet_binding = resolve_wallet_binding(existing.as_ref(), wallet_binding)?;
         let effective_wallet_pubkey = effective_wallet_binding
             .as_ref()
@@ -270,6 +276,8 @@ impl PushRegistry {
                     && reg.web_push == normalized_web_push
                     && reg.apns_topic == normalized_apns_topic
                     && reg.android_channel_id == normalized_android_channel_id
+                    && reg.kaposts_blocked_pubkeys == normalized_kaposts_blocked
+                    && reg.notify_sound == normalized_notify_sound
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -319,6 +327,8 @@ impl PushRegistry {
             web_push: normalized_web_push,
             apns_topic: normalized_apns_topic,
             android_channel_id: normalized_android_channel_id,
+            kaposts_blocked_pubkeys: normalized_kaposts_blocked,
+            notify_sound: normalized_notify_sound,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -472,6 +482,7 @@ impl PushRegistry {
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
         android_channel_id: Option<String>,
+        device_prefs: DevicePrefs,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -552,6 +563,11 @@ impl PushRegistry {
             normalize_stored_voip_token(&platform, requested_voip_token, existing.as_ref());
         let normalized_android_channel_id =
             normalize_android_channel_id(&platform, android_channel_id, existing.as_ref());
+        let normalized_kaposts_blocked =
+            normalize_kaposts_blocked(device_prefs.kaposts_blocked_pubkeys, existing.as_ref());
+        let normalized_notify_sound = device_prefs
+            .notify_sound
+            .or_else(|| existing.as_ref().and_then(|reg| reg.notify_sound));
         let last_seen_refresh = existing
             .as_ref()
             .map(|reg| should_refresh_last_seen(&token, reg.last_seen, now))
@@ -607,6 +623,8 @@ impl PushRegistry {
                     && reg.web_push == normalized_web_push
                     && reg.apns_topic == normalized_apns_topic
                     && reg.android_channel_id == normalized_android_channel_id
+                    && reg.kaposts_blocked_pubkeys == normalized_kaposts_blocked
+                    && reg.notify_sound == normalized_notify_sound
             })
             .unwrap_or(false);
         let watch_only_changed = existing
@@ -654,6 +672,8 @@ impl PushRegistry {
             web_push: normalized_web_push,
             apns_topic: normalized_apns_topic,
             android_channel_id: normalized_android_channel_id,
+            kaposts_blocked_pubkeys: normalized_kaposts_blocked,
+            notify_sound: normalized_notify_sound,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -1025,7 +1045,8 @@ impl PushRegistry {
                 continue;
             };
             let pk = kaposts_xonly(pk);
-            if pk == target && pk != actor {
+            // No push from someone this device's owner blocked (KAPOSTS_AUDIT_SERVER_SIDE.md §3).
+            if pk == target && pk != actor && !reg.kaposts_blocked_pubkeys.contains(&actor) {
                 tokens.push(reg.device_token);
             }
         }
@@ -1053,7 +1074,9 @@ impl PushRegistry {
             if reg.kaposts_pubkey.as_deref().map(kaposts_xonly).as_deref() == Some(author.as_str()) {
                 continue;
             }
-            if reg.kaposts_watch_authors.iter().any(|a| kaposts_xonly(a) == author) {
+            if reg.kaposts_watch_authors.iter().any(|a| kaposts_xonly(a) == author)
+                && !reg.kaposts_blocked_pubkeys.contains(&author)
+            {
                 tokens.push(reg.device_token);
             }
         }
@@ -1238,6 +1261,17 @@ impl PushRegistry {
             }
         }
         Ok(map)
+    }
+
+    /// The tokens whose owner turned sound off (`notify_sound` = false).
+    fn silent_tokens(&self, tokens: &[String]) -> anyhow::Result<HashSet<String>> {
+        let mut silent = HashSet::new();
+        for token in tokens {
+            if self.get_registration(token)?.and_then(|registration| registration.notify_sound) == Some(false) {
+                silent.insert(token.clone());
+            }
+        }
+        Ok(silent)
     }
 
     fn android_channels_for_tokens(&self, tokens: &[String]) -> anyhow::Result<HashMap<String, String>> {
@@ -1565,6 +1599,7 @@ enum PushRegistryCommand {
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
         android_channel_id: Option<String>,
+        device_prefs: DevicePrefs,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1587,6 +1622,7 @@ enum PushRegistryCommand {
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
         android_channel_id: Option<String>,
+        device_prefs: DevicePrefs,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
         response: RegistryResponse<()>,
@@ -1662,6 +1698,10 @@ enum PushRegistryCommand {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, Option<String>>>,
     },
+    SilentTokens {
+        tokens: Vec<String>,
+        response: RegistryResponse<HashSet<String>>,
+    },
     AndroidChannelsForTokens {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, String>>,
@@ -1734,6 +1774,7 @@ impl PushRegistryActor {
                     web_push,
                     apns_topic,
                     android_channel_id,
+                    device_prefs,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1757,6 +1798,7 @@ impl PushRegistryActor {
                         web_push,
                         apns_topic,
                         android_channel_id,
+                        device_prefs,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1780,6 +1822,7 @@ impl PushRegistryActor {
                     web_push,
                     apns_topic,
                     android_channel_id,
+                    device_prefs,
                     wallet_binding,
                     device_key_binding,
                     response,
@@ -1802,6 +1845,7 @@ impl PushRegistryActor {
                         web_push,
                         apns_topic,
                         android_channel_id,
+                        device_prefs,
                         wallet_binding,
                         device_key_binding,
                     );
@@ -1909,6 +1953,10 @@ impl PushRegistryActor {
                     let result = self.registry.apns_topics_for_tokens(&tokens);
                     let _ = response.send(result);
                 }
+                PushRegistryCommand::SilentTokens { tokens, response } => {
+                    let result = self.registry.silent_tokens(&tokens);
+                    let _ = response.send(result);
+                }
                 PushRegistryCommand::AndroidChannelsForTokens { tokens, response } => {
                     let result = self.registry.android_channels_for_tokens(&tokens);
                     let _ = response.send(result);
@@ -1989,6 +2037,7 @@ impl PushRegistryHandle {
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
         android_channel_id: Option<String>,
+        device_prefs: DevicePrefs,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -2011,6 +2060,7 @@ impl PushRegistryHandle {
             web_push,
             apns_topic,
             android_channel_id,
+            device_prefs,
             wallet_binding,
             device_key_binding,
             response,
@@ -2038,6 +2088,7 @@ impl PushRegistryHandle {
         web_push: Option<WebPushSubscription>,
         apns_topic: Option<String>,
         android_channel_id: Option<String>,
+        device_prefs: DevicePrefs,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
@@ -2059,6 +2110,7 @@ impl PushRegistryHandle {
             web_push,
             apns_topic,
             android_channel_id,
+            device_prefs,
             wallet_binding,
             device_key_binding,
             response,
@@ -2229,6 +2281,12 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// The tokens whose owner turned sound off.
+    pub async fn silent_tokens(&self, tokens: Vec<String>) -> anyhow::Result<HashSet<String>> {
+        self.request(|response| PushRegistryCommand::SilentTokens { tokens, response })
+            .await
+    }
+
     /// Map each Android token to the notification channel it registered (absent = default).
     pub async fn android_channels_for_tokens(
         &self,
@@ -2310,6 +2368,9 @@ pub struct KaPostsNotify {
     pub comments: bool,
     #[serde(default = "kaposts_notify_default")]
     pub follows: bool,
+    // KaPost's Mentions switch (KAPOSTS_AUDIT_SERVER_SIDE.md §2). Absent on older clients = on.
+    #[serde(default = "kaposts_notify_default")]
+    pub mentions: bool,
 }
 
 fn kaposts_notify_default() -> bool {
@@ -2317,7 +2378,7 @@ fn kaposts_notify_default() -> bool {
 }
 
 impl KaPostsNotify {
-    /// Whether a push for `action` (like/dislike/repost/comment/follow) is enabled. Unknown action
+    /// Whether a push for `action` (like/dislike/repost/comment/follow/mention) is enabled. Unknown action
     /// kinds always notify (fail open).
     pub fn allows(&self, action: &str) -> bool {
         match action {
@@ -2326,9 +2387,20 @@ impl KaPostsNotify {
             "repost" => self.reposts,
             "comment" => self.comments,
             "follow" => self.follows,
+            "mention" => self.mentions,
             _ => true,
         }
     }
+}
+
+/// Device settings that came after the long list of register/update arguments. Each one absent
+/// keeps the stored value (KAPOSTS_AUDIT_SERVER_SIDE.md §3, §5).
+#[derive(Debug, Clone, Default)]
+pub struct DevicePrefs {
+    /// KaPost: everyone the owner blocked, as 66-hex keys. Replaces the stored list.
+    pub kaposts_blocked_pubkeys: Option<Vec<String>>,
+    /// false = this device's alerts play no sound.
+    pub notify_sound: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2393,6 +2465,14 @@ pub struct DeviceRegistration {
     // every optional field added after LegacyV1. Value only.
     #[serde(default)]
     pub android_channel_id: Option<String>,
+    // KaPost: the x-only keys (64 hex) of everyone the owner blocked. No `kaposts` push whose actor
+    // is one of them (KAPOSTS_AUDIT_SERVER_SIDE.md §3). Value only, outside the auth preimage.
+    #[serde(default)]
+    pub kaposts_blocked_pubkeys: Vec<String>,
+    // Some(false) = send this device's APNs alerts with no sound (KaPost's "Play sound" off).
+    // None = sound, as before (§5). Value only, outside the auth preimage.
+    #[serde(default)]
+    pub notify_sound: Option<bool>,
     #[serde(default)]
     pub app_attest_key_id: Option<String>,
     #[serde(default)]
@@ -2634,6 +2714,7 @@ impl PushDispatcher {
                     },
                     post_id: None,
                     kaposts_kind: None,
+                    actor_pubkey: None,
                 };
                 // FCM data-only mirror (Android builds the notification from these fields).
                 let mut data = BTreeMap::new();
@@ -2659,6 +2740,7 @@ impl PushDispatcher {
             } => {
                 let target_tail = key_tail(&target_pubkey);
                 let kind_label = kaposts_kind.clone().unwrap_or_default();
+                let actor_key = actor_pubkey.trim().to_ascii_lowercase();
                 let mut tokens = self
                     .registry
                     .matching_tokens_for_kaposts(target_pubkey, actor_pubkey)
@@ -2707,6 +2789,7 @@ impl PushDispatcher {
                     },
                     post_id: post_id.clone(),
                     kaposts_kind: kaposts_kind.clone(),
+                    actor_pubkey: Some(actor_key.clone()),
                 };
                 let mut data = BTreeMap::new();
                 data.insert("type".to_string(), "kaposts".to_string());
@@ -2721,6 +2804,7 @@ impl PushDispatcher {
                 if let Some(kaposts_kind) = kaposts_kind {
                     data.insert("kaposts_kind".to_string(), kaposts_kind);
                 }
+                data.insert("actor_pubkey".to_string(), actor_key);
                 let wanted = tokens.len();
                 let t = self.deliver(tokens, &payload, &data, Some(&tx_id), true).await;
                 info!(
@@ -2739,6 +2823,7 @@ impl PushDispatcher {
                 // PUSH_EXTENSIONS.md §3a: every device whose bell list holds the author, except the
                 // author's own devices. Not filtered by the per-kind switches (the bell is the switch).
                 let author_tail = key_tail(&author_pubkey);
+                let author_key = author_pubkey.trim().to_ascii_lowercase();
                 let mut tokens = self
                     .registry
                     .matching_tokens_for_kaposts_watchers(author_pubkey)
@@ -2766,6 +2851,7 @@ impl PushDispatcher {
                     },
                     post_id: Some(post_id.clone()),
                     kaposts_kind: Some("post".to_string()),
+                    actor_pubkey: Some(author_key.clone()),
                 };
                 let mut data = BTreeMap::new();
                 data.insert("type".to_string(), "kaposts".to_string());
@@ -2776,6 +2862,7 @@ impl PushDispatcher {
                 data.insert("tx_id".to_string(), tx_id.clone());
                 data.insert("post_id".to_string(), post_id.clone());
                 data.insert("kaposts_kind".to_string(), "post".to_string());
+                data.insert("actor_pubkey".to_string(), author_key);
                 let wanted = tokens.len();
                 // apns-collapse-id = the post's txid.
                 let t = self.deliver(tokens, &payload, &data, Some(&post_id), true).await;
@@ -2959,6 +3046,7 @@ impl PushDispatcher {
                 },
                 post_id: None,
                 kaposts_kind: None,
+                actor_pubkey: None,
             };
             let mut data = BTreeMap::new();
             data.insert("type".to_string(), "address_activity".to_string());
@@ -3102,12 +3190,23 @@ impl PushDispatcher {
             for (topic, n) in &by_topic {
                 info!("[Push][APNs] {event_type} send topic={topic} devices={n}");
             }
+            // A device with sound off gets the same alert without `aps.sound`
+            // (KAPOSTS_AUDIT_SERVER_SIDE.md §5).
+            let silent = self
+                .registry
+                .silent_tokens(apns_tokens.clone())
+                .await
+                .unwrap_or_default();
+            let loud_payload = serde_json::to_value(apns_payload).unwrap_or_default();
+            let quiet_payload = without_sound(&loud_payload);
+            let (loud_payload, quiet_payload) = (&loud_payload, &quiet_payload);
             let results = stream::iter(apns_tokens.into_iter().map(|token| {
                 let stored_env = envs.get(&token).cloned().flatten();
                 let topic = topics.get(&token).cloned().flatten();
+                let payload = if silent.contains(&token) { quiet_payload } else { loud_payload };
                 async move {
                     let (result, learned) = apns
-                        .send_routed(&token, apns_payload, collapse_id, stored_env.as_deref(), topic.as_deref())
+                        .send_routed(&token, payload, collapse_id, stored_env.as_deref(), topic.as_deref())
                         .await;
                     (token, DeliveryOutcome::from_apns(result), learned)
                 }
@@ -3584,6 +3683,10 @@ struct ExtensionPayload {
     // KaPosts fine kind (vote_up/reply/quote/...) forwarded to the client; omitted for broadcasts.
     #[serde(rename = "kaposts_kind", skip_serializing_if = "Option::is_none")]
     kaposts_kind: Option<String>,
+    // KaPosts: the acting user's 66-hex key, so the open app can drop a push from someone the
+    // owner blocked (KAPOSTS_AUDIT_SERVER_SIDE.md §3b). Omitted for other pushes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor_pubkey: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4581,6 +4684,43 @@ fn normalize_stored_voip_token(
     requested.or_else(|| existing.and_then(|reg| reg.voip_token.clone()))
 }
 
+/// How many blocked people one device may list.
+const MAX_KAPOSTS_BLOCKED: usize = 5_000;
+
+/// A requested block list as x-only keys (64 lowercase hex), deduped; keys that aren't a 66-hex
+/// compressed key (or a bare 64-hex x-only one) are dropped. Absent keeps the stored list.
+fn normalize_kaposts_blocked(
+    requested: Option<Vec<String>>,
+    existing: Option<&DeviceRegistration>,
+) -> Vec<String> {
+    let Some(requested) = requested else {
+        return existing.map(|reg| reg.kaposts_blocked_pubkeys.clone()).unwrap_or_default();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for key in requested {
+        let key = key.trim().to_ascii_lowercase();
+        let valid = key.bytes().all(|b| b.is_ascii_hexdigit())
+            && (key.len() == 64 || (key.len() == 66 && (key.starts_with("02") || key.starts_with("03"))));
+        let xonly = kaposts_xonly(&key);
+        if valid && !out.contains(&xonly) {
+            out.push(xonly);
+        }
+        if out.len() == MAX_KAPOSTS_BLOCKED {
+            break;
+        }
+    }
+    out
+}
+
+/// An APNs payload without `aps.sound`, for a device with sound off.
+fn without_sound(payload: &serde_json::Value) -> serde_json::Value {
+    let mut quiet = payload.clone();
+    if let Some(aps) = quiet.get_mut("aps").and_then(serde_json::Value::as_object_mut) {
+        aps.remove("sound");
+    }
+    quiet
+}
+
 fn normalize_apns_topic(topic: Option<String>) -> Option<String> {
     let topic = topic?.trim().to_string();
     (KNOWN_APP_TOPICS.contains(&topic.as_str()) || allowed_apns_topics().contains(&topic))
@@ -4841,6 +4981,8 @@ mod tests {
     #[test]
     fn resolve_wallet_binding_enforces_existing_binding() {
         let existing = DeviceRegistration {
+            kaposts_blocked_pubkeys: Vec::new(),
+            notify_sound: None,
             device_token: "token".to_string(),
             platform: "ios".to_string(),
             watched_addresses: vec![],
@@ -4933,6 +5075,7 @@ mod tests {
                 None,
                 None,
                 None,
+                Default::default(),
                 None,
                 None,
             )
@@ -4982,6 +5125,7 @@ mod tests {
                 None,
                 None,
                 None,
+                Default::default(),
                 None,
                 None,
             )
@@ -5061,6 +5205,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    Default::default(),
                     None,
                     None,
                 )
@@ -5239,6 +5384,90 @@ mod kaposts_watch_tests {
         );
     }
     #[test]
+    fn kapost_blocks_mentions_and_sound_are_kept_per_device() {
+        use super::{DevicePrefs, KaPostsNotify, without_sound};
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let mut registry = PushRegistry::new(
+            tx_keyspace.clone(),
+            DeviceRegistrationPartition::new(&tx_keyspace).expect("device partition"),
+            WatchedAddressPartition::new(&tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(&tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(&tx_keyspace).expect("primary partition"),
+            create_shared_metrics(),
+        );
+        let address = Address::new(Prefix::Mainnet, Version::PubKey, &[5u8; 32]).to_string();
+        let me = format!("03{}", "a".repeat(64));
+        let troll = format!("03{}", "b".repeat(64));
+        let friend = format!("02{}", "c".repeat(64));
+        let token = "ab".repeat(32);
+        let register = |registry: &mut PushRegistry, prefs: DevicePrefs, watch: Vec<String>| {
+            registry.register(
+                token.clone(),
+                "ios".to_string(),
+                vec![],
+                vec![],
+                vec![],
+                Some(address.clone()),
+                vec![],
+                vec![],
+                Default::default(),
+                Some(me.clone()),
+                None,
+                watch,
+                vec![],
+                None,
+                None,
+                None,
+                Some("com.kachat.kaposts".to_string()),
+                None,
+                prefs,
+                None,
+                None,
+            )
+        };
+        // The phone sends the blocked key with the other parity (an address-derived `02+x`).
+        let blocked = DevicePrefs {
+            kaposts_blocked_pubkeys: Some(vec![format!("02{}", "B".repeat(64)), "not a key".into()]),
+            notify_sound: Some(false),
+        };
+        register(&mut registry, blocked, vec![troll.clone(), friend.clone()]).expect("registered");
+        let reg = registry.get_registration(&token).unwrap().unwrap();
+        assert_eq!(reg.kaposts_blocked_pubkeys, vec!["b".repeat(64)]);
+        assert!(registry.tokens_for_kaposts(&me, &troll).unwrap().is_empty());
+        assert_eq!(registry.tokens_for_kaposts(&me, &friend).unwrap(), vec![token.clone()]);
+        // The bell on a blocked author stays quiet too.
+        assert!(registry.tokens_for_kaposts_watchers(&troll).unwrap().is_empty());
+        assert_eq!(registry.tokens_for_kaposts_watchers(&friend).unwrap(), vec![token.clone()]);
+        assert!(registry.silent_tokens(&[token.clone()]).unwrap().contains(&token));
+
+        // An older client sends neither field: both stay as stored.
+        register(&mut registry, DevicePrefs::default(), vec![]).expect("re-registered");
+        let reg = registry.get_registration(&token).unwrap().unwrap();
+        assert_eq!(reg.kaposts_blocked_pubkeys, vec!["b".repeat(64)]);
+        assert_eq!(reg.notify_sound, Some(false));
+        // Unblocking everyone sends an empty list, and sound back on.
+        let cleared = DevicePrefs { kaposts_blocked_pubkeys: Some(vec![]), notify_sound: Some(true) };
+        register(&mut registry, cleared, vec![]).expect("re-registered");
+        assert_eq!(registry.tokens_for_kaposts(&me, &troll).unwrap(), vec![token.clone()]);
+        assert!(registry.silent_tokens(&[token.clone()]).unwrap().is_empty());
+
+        // The Mentions switch, and a stored record from before it existed (mentions on).
+        let old: KaPostsNotify = serde_json::from_value(serde_json::json!({"likes": false})).unwrap();
+        assert!(old.allows("mention") && !old.allows("like"));
+        let off: KaPostsNotify = serde_json::from_value(serde_json::json!({"mentions": false})).unwrap();
+        assert!(!off.allows("mention") && off.allows("comment"));
+
+        let loud = serde_json::json!({"aps": {"alert": {"title": "KaPosts"}, "sound": "default"}, "postId": "x"});
+        assert_eq!(
+            without_sound(&loud),
+            serde_json::json!({"aps": {"alert": {"title": "KaPosts"}}, "postId": "x"})
+        );
+    }
+
+    #[test]
     fn an_apple_device_that_stops_sending_its_voip_token_is_not_rung() {
         let db_dir = tempfile::tempdir().expect("temporary database directory");
         let tx_keyspace = fjall::Config::new(db_dir.path())
@@ -5273,6 +5502,7 @@ mod kaposts_watch_tests {
                 None,
                 None,
                 None,
+                Default::default(),
                 None,
                 None,
             )
@@ -5296,6 +5526,7 @@ mod kaposts_watch_tests {
                 None,
                 None,
                 None,
+                Default::default(),
                 None,
                 None,
             )
@@ -5382,6 +5613,7 @@ mod kaposts_watch_tests {
                         None,
                         topic,
                         None, // no android channel
+                        Default::default(),
                         None,
                         None,
                     )
@@ -5533,6 +5765,7 @@ mod kaposts_watch_tests {
                     None,
                     None,
                     None,
+                    Default::default(),
                     None,
                     None,
                 )
@@ -5614,6 +5847,7 @@ mod kaposts_watch_tests {
                     None,
                     None,
                     None,
+                    Default::default(),
                     None,
                     None,
                 )

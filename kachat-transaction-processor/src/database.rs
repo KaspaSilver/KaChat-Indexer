@@ -469,6 +469,11 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        // The hash of the text a translation was made from, so an edited post is translated
+        // again (KAPOSTS_AUDIT_SERVER_SIDE.md §4). Rows from before it are NULL.
+        sqlx::query("ALTER TABLE post_translations ADD COLUMN IF NOT EXISTS source_hash BYTEA")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

@@ -1,8 +1,9 @@
 //! Post-translation endpoint (`POST /translate`, `GET /translate/languages`).
 //!
-//! A thin layer in front of a self-hosted LibreTranslate that (a) caches translations of immutable
-//! KaPosts by `(txid, target)` forever and (b) only ever caches the server's OWN verified copy of a
-//! post — never text supplied in the request (cache-poisoning rule). Privacy-critical: this endpoint
+//! A thin layer in front of a self-hosted LibreTranslate that (a) caches translations of KaPosts by
+//! `(txid, target)`, each tied to a hash of the text it was made from, so an edited post is
+//! translated again (KAPOSTS_AUDIT_SERVER_SIDE.md §4), and (b) only ever caches the server's OWN
+//! verified copy of a post — never text supplied in the request (cache-poisoning rule). Privacy-critical: this endpoint
 //! takes no identity (no requesterPubkey / auth), and must not log request bodies or post text.
 
 use axum::{
@@ -299,16 +300,26 @@ pub(crate) async fn handle_translate(
     Ok(Json(TranslateResponse { translations }))
 }
 
+/// A post id as sent, without an optional edit stamp (`<txid>@<editedAtMs>`). The stamp itself
+/// isn't needed: the cache already checks the server's own current text.
+fn post_id_without_edit_stamp(id: &str) -> String {
+    match id.split_once('@') {
+        Some((txid, stamp)) if !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()) => txid.to_string(),
+        _ => id.to_string(),
+    }
+}
+
 /// Translate a single entry. Never fails the batch — returns a TranslationOut with an error on
 /// per-entry problems.
 async fn translate_one(app: &AppState, target: &str, p: TranslatePostIn) -> TranslationOut {
     let id_out = p.id.clone();
 
     // Resolve the text to translate + whether we may cache under a txid.
-    // cache_id = Some(normalized hex) only when we hold the server's OWN verified copy.
-    let (text, cache_id): (String, Option<String>) = match &p.id {
+    // cache_id = Some((normalized hex, hash of the text)) only when we hold the server's OWN
+    // verified copy.
+    let (text, cache_id): (String, Option<(String, Vec<u8>)>) = match &p.id {
         Some(raw_id) => {
-            let idn = raw_id.trim().to_lowercase();
+            let idn = post_id_without_edit_stamp(&raw_id.trim().to_lowercase());
             if !is_hex64(&idn) {
                 return entry_err(
                     id_out,
@@ -316,23 +327,26 @@ async fn translate_one(app: &AppState, target: &str, p: TranslatePostIn) -> Tran
                     "INVALID_POST_ID",
                 );
             }
-            // Cache hit? (only possible when a verified copy was cached before)
-            if let Ok(Some((source, cached_text))) =
-                app.db.get_cached_translation(&idn, target).await
-            {
-                return TranslationOut {
-                    id: Some(idn),
-                    source: Some(source),
-                    target: Some(target.to_string()),
-                    text: Some(cached_text),
-                    cached: Some(true),
-                    ..Default::default()
-                };
-            }
-            // Prefer the server's own verified copy; only cache that.
+            // Prefer the server's own verified copy; only cache that, and only for the text it
+            // holds now (an edit changes the hash, so the old translation is skipped).
             match app.db.get_post_base64_message(&idn).await {
-                Ok(Some(b64)) => match decode_post_text(&b64) {
-                    Some(t) => (t, Some(idn)),
+                Ok(Some((b64, edited))) => match decode_post_text(&b64) {
+                    Some(t) => {
+                        let hash = blake3::hash(t.as_bytes()).as_bytes().to_vec();
+                        if let Ok(Some((source, cached_text))) =
+                            app.db.get_cached_translation(&idn, target, &hash, edited).await
+                        {
+                            return TranslationOut {
+                                id: id_out,
+                                source: Some(source),
+                                target: Some(target.to_string()),
+                                text: Some(cached_text),
+                                cached: Some(true),
+                                ..Default::default()
+                            };
+                        }
+                        (t, Some((idn, hash)))
+                    }
                     // Post is held but undecodable — fall back to supplied text, do not cache.
                     None => match p.text {
                         Some(t) => (t, None),
@@ -405,10 +419,10 @@ async fn translate_one(app: &AppState, target: &str, p: TranslatePostIn) -> Tran
                 };
             }
             // Cache only the server's own verified copy.
-            if let Some(idn) = &cache_id {
+            if let Some((idn, hash)) = &cache_id {
                 let _ = app
                     .db
-                    .insert_translation(idn, target, &source, &translated, now_ms())
+                    .insert_translation(idn, target, &source, &translated, hash, now_ms())
                     .await;
             }
             TranslationOut {
@@ -472,4 +486,17 @@ pub(crate) async fn handle_translate_languages(
         target.into_iter().collect()
     };
     Ok(Json(LanguagesResponse { source, target }))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn an_edit_stamp_is_dropped_from_the_post_id() {
+        let txid = "ab".repeat(32);
+        assert_eq!(super::post_id_without_edit_stamp(&format!("{txid}@1763400000000")), txid);
+        assert_eq!(super::post_id_without_edit_stamp(&txid), txid);
+        // Anything else after `@` leaves the id as it was, so it fails the 64-hex check.
+        assert_eq!(super::post_id_without_edit_stamp(&format!("{txid}@x")), format!("{txid}@x"));
+        assert_eq!(super::post_id_without_edit_stamp(&format!("{txid}@")), format!("{txid}@"));
+    }
 }

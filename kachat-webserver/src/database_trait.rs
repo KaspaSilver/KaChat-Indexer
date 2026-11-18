@@ -271,22 +271,29 @@ pub trait DatabaseInterface: Send + Sync {
     // The server's own copy of a post's message (raw stored base64, marker not stripped), by txid.
     // None if the post is not in the indexer's k_contents. Used to translate the VERIFIED text and
     // never trust request-supplied text under a txid.
-    async fn get_post_base64_message(&self, tx_id_hex: &str) -> DatabaseResult<Option<String>>;
+    // The post's current base64 message, and whether it was ever edited.
+    async fn get_post_base64_message(&self, tx_id_hex: &str) -> DatabaseResult<Option<(String, bool)>>;
 
-    // Cached translation of (txid, target_lang), if any. Returns (source_lang, text).
+    // Cached translation of (txid, target_lang) made from the text whose hash is `source_hash`,
+    // if any. A row cached before hashes existed counts only while the post is unedited.
+    // Returns (source_lang, text).
     async fn get_cached_translation(
         &self,
         tx_id_hex: &str,
         target_lang: &str,
+        source_hash: &[u8],
+        edited: bool,
     ) -> DatabaseResult<Option<(String, String)>>;
 
-    // Insert a verified translation into the permanent (txid, target) cache. Idempotent.
+    // Store a verified translation in the (txid, target) cache, replacing one made from an
+    // older version of the post.
     async fn insert_translation(
         &self,
         tx_id_hex: &str,
         target_lang: &str,
         source_lang: &str,
         text: &str,
+        source_hash: &[u8],
         created_at_ms: i64,
     ) -> DatabaseResult<()>;
 }

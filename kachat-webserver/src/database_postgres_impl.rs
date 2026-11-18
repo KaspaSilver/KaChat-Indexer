@@ -4591,29 +4591,35 @@ impl DatabaseInterface for PostgresDbManager {
         Ok(trending_hashtags)
     }
 
-    async fn get_post_base64_message(&self, tx_id_hex: &str) -> DatabaseResult<Option<String>> {
+    async fn get_post_base64_message(&self, tx_id_hex: &str) -> DatabaseResult<Option<(String, bool)>> {
         let tx_id = Self::decode_hex_to_bytes(tx_id_hex)?;
         let row = sqlx::query(
-            "SELECT base64_encoded_message FROM k_contents WHERE transaction_id = $1 LIMIT 1",
+            "SELECT base64_encoded_message, edited_at IS NOT NULL AS edited FROM k_contents \
+             WHERE transaction_id = $1 LIMIT 1",
         )
         .bind(tx_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch post message: {}", e)))?;
-        Ok(row.map(|r| r.get::<String, _>("base64_encoded_message")))
+        Ok(row.map(|r| (r.get::<String, _>("base64_encoded_message"), r.get::<bool, _>("edited"))))
     }
 
     async fn get_cached_translation(
         &self,
         tx_id_hex: &str,
         target_lang: &str,
+        source_hash: &[u8],
+        edited: bool,
     ) -> DatabaseResult<Option<(String, String)>> {
         let tx_id = Self::decode_hex_to_bytes(tx_id_hex)?;
         let row = sqlx::query(
-            "SELECT source_lang, text FROM post_translations WHERE post_id = $1 AND target_lang = $2",
+            "SELECT source_lang, text FROM post_translations WHERE post_id = $1 AND target_lang = $2 \
+             AND (source_hash = $3 OR (source_hash IS NULL AND NOT $4))",
         )
         .bind(tx_id)
         .bind(target_lang)
+        .bind(source_hash)
+        .bind(edited)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch cached translation: {}", e)))?;
@@ -4626,18 +4632,22 @@ impl DatabaseInterface for PostgresDbManager {
         target_lang: &str,
         source_lang: &str,
         text: &str,
+        source_hash: &[u8],
         created_at_ms: i64,
     ) -> DatabaseResult<()> {
         let tx_id = Self::decode_hex_to_bytes(tx_id_hex)?;
         sqlx::query(
-            "INSERT INTO post_translations (post_id, target_lang, source_lang, text, created_at) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (post_id, target_lang) DO NOTHING",
+            "INSERT INTO post_translations (post_id, target_lang, source_lang, text, created_at, source_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (post_id, target_lang) DO UPDATE \
+             SET source_lang = EXCLUDED.source_lang, text = EXCLUDED.text, \
+                 created_at = EXCLUDED.created_at, source_hash = EXCLUDED.source_hash",
         )
         .bind(tx_id)
         .bind(target_lang)
         .bind(source_lang)
         .bind(text)
         .bind(created_at_ms)
+        .bind(source_hash)
         .execute(&self.pool)
         .await
         .map_err(|e| DatabaseError::QueryError(format!("Failed to insert translation: {}", e)))?;

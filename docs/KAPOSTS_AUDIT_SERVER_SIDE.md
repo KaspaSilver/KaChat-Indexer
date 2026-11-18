@@ -3,7 +3,26 @@
 **For:** the indexer session (KaPosts, push, translation). **From:** the KaPosts iOS session
 (`KaspaSilver/KaPost-iPhone`).
 
-> **Status (2026-11-13): open.** Everything below is already done on the phone (uncommitted in the
+> **Status (2026-11-18): all five done in the indexer session** (not yet deployed).
+>
+> - **§1** needed no change: push delivery (`tokens_for_kaposts`), the notifications query and the
+>   self-mention and duplicate checks (`mention_push_targets`) already compare the x-only key.
+> - **§2** `kaposts_notify_mentions` is read on register and update (`KaPostsNotify.mentions`,
+>   default on; `allows("mention")`).
+> - **§3 (a) and (b)** both done. Register and update take `kaposts_blocked_pubkeys` (66-hex, or
+>   64-hex x-only; the list replaces the stored one, absent keeps it, `[]` clears it, up to
+>   5,000). No `kaposts` push, and no new-post bell push, comes from a blocked key, compared on
+>   the x-only part. Every `kaposts` push now carries a top-level `actor_pubkey` (the APNs payload
+>   and the FCM/Web data), the author's key for a new-post push. **The phone can start sending
+>   the list now.**
+> - **§4** each cached translation stores a blake3 hash of the text it was made from
+>   (`post_translations.source_hash`); a lookup uses the server's current copy, so an edited post
+>   is translated again and cached. The phone can send the plain txid for an edited post again.
+>   `<txid>@<editedAtMs>` is accepted too (the stamp is ignored). Rows cached before this count
+>   only while the post is unedited.
+> - **§5** register and update take `notify_sound` (bool, absent keeps the stored value). A device
+>   with `notify_sound: false` gets its APNs alerts without `aps.sound`; every other device is
+>   unchanged. Android's sound is still its notification channel. Everything below is already done on the phone (uncommitted in the
 > KaPost repo as of this doc). It is safe without the server: the phone sends nothing the server
 > rejects. These changes make the phone side work fully.
 
