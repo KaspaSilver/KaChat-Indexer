@@ -89,3 +89,23 @@ footer now says so.
   only. `authenticate_unregister_request` already accepts that.
 - **Room history paging:** the phone now pages with `before = oldest + 1` and dedupes by txid, so
   rows of one block on a page edge are no longer skipped. The SQL stays `block_time < before`.
+
+## Android (KaPost Android, `kapost.kachat.app`, 2026-11-17)
+
+KaPost Android now does the same as the phone above (port of KaPost iOS 369794e, pushed as
+KaPost-Android 0f86d47), so items 1-3 cover it too. The 2026-11-18 indexer work above already covers
+both Android details below (the field is read; `actor_pubkey` is in the FCM data); they are kept as
+the record of what Android relies on:
+
+- **Item 2:** Android sends `kaposts_notify_mentions` in register and update as well, from the same
+  Settings switch. No Android-specific work beyond item 2.
+- **Item 3 (b):** Android reads `actor_pubkey` from the FCM **data** map of a `kaposts` push
+  (`KaChatFirebaseMessagingService`) and drops the push when that key (x-only compare) is muted or
+  blocked. That only works for a data message: a push sent with a `notification` block is drawn by
+  the system and never reaches the app in the background. So put `actor_pubkey` in the data map of
+  every `kaposts` FCM message, next to the fields the app already reads.
+- **Unregister on Log Out:** Android signs the retried sign-out unregister with the account's
+  chatting key while the account is still on the phone. After Delete Account there is no key, and
+  Android binds no device push key, so that retry goes unsigned and is refused; the token's record
+  then stays until the token is rotated or the server prunes it. Optional: accept an unregister for
+  an Android token with no signature when the token itself is the only thing being removed.
