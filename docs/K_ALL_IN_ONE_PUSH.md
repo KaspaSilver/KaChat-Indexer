@@ -93,7 +93,7 @@ expected; nothing to dedupe across apps.
 > check, so existing installs update once); the extension shows `name_event` while signed in; a
 > tapped name push opens K's .kachat section, a tapped `address_activity` push the address's
 > history. Today's server ignores the unknown `app` field and still filters K to chat kinds, so
-> sending it early is safe. The K commit will be named here once it's pushed.
+> sending it early is safe. K commit: `428a797b` (KaspaSilver/K-iPhone, 2026-11-22).
 
 ## Testing
 
