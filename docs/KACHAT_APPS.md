@@ -7,6 +7,12 @@ its own repo, its own push topic and its own slice of this indexer. Read this be
 anything an app depends on, and before deciding a feature is unused: a route one app dropped
 may still be called by another.
 
+> **Update (2026-11-22): K.** The KaChat iPhone app is now **K**, the all-in-one app (chats,
+> Wallet, KaPost, rooms, KaPlay, `.kachat`), and KaPost, KaPay and KaPlay are being retired. K
+> keeps the `com.kachat.app` topic and sends `"app": "k"`, which takes every kind of push
+> (`K_ALL_IN_ONE_PUSH.md`). Old KaChat builds and KaChat Android send no `app` and keep the KaChat
+> row below.
+
 ## The apps
 
 | App | What it is | iPhone repo | Android repo | iPhone APNs topic | Android `apns_topic` (package) | Pushes it may get |

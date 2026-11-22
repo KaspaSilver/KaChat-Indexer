@@ -3,6 +3,21 @@
 **For:** the indexer session (`kachat-transaction-processor`, `kachat-webserver`). **From:** the KaPost
 iOS session (`KaspaSilver/KaPost-iPhone`).
 
+> **Status (2026-11-22): done in the indexer session** (not yet deployed).
+>
+> - **Steps 1 and 2:** the processor writes the `'follow'` `k_mentions` row in the same statement
+>   as the `k_follows` insert, so a repeat follow adds neither. An unfollow deletes the row of each
+>   follow it removes.
+> - **Steps 3 and 4:** `get_notifications` joins `k_follows`, so a follow row has an `id` and an
+>   empty message. The handler sends `contentType: "follow"` with `contentId`, `voteType`,
+>   `votedContent` and `tipAmountSompi` null, `postContent` empty, the follow tx as `id` and the
+>   follower as `userPublicKey`. The count needed no change.
+> - **Step 5:** the processor backfills a row for every follow without one on startup. The live
+>   database has 707 follows and no follow rows yet, so all of them appear after the rebuild, at
+>   their original times.
+> - Checked against a throwaway Postgres: backfill (runs once), follow, repeat follow (no second
+>   row), the full notifications query, and unfollow.
+
 ## What's wrong
 
 The owner was followed and nothing showed on KaPost's Notifications screen.

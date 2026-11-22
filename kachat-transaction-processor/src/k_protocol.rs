@@ -3525,15 +3525,24 @@ impl KProtocolProcessor {
                     return Ok(());
                 }
 
-                // Insert follow record (skip if same sender already follows this user)
+                // Insert follow record (skip if same sender already follows this user). The
+                // k_mentions row (content_type 'follow', content_id = the follow tx) lists the
+                // follow in the followed user's KaPosts notifications (get-notifications); written
+                // in the same statement, as for tips, so a repeat follow adds neither.
                 let result = sqlx::query(
                     r#"
-                    INSERT INTO k_follows (
-                        transaction_id, block_time, sender_pubkey, sender_signature,
-                        following_action, followed_user_pubkey
-                    ) VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (sender_pubkey, (substring(followed_user_pubkey from 2)))
-                    DO NOTHING
+                    WITH follow_insert AS (
+                        INSERT INTO k_follows (
+                            transaction_id, block_time, sender_pubkey, sender_signature,
+                            following_action, followed_user_pubkey
+                        ) VALUES ($1, $2, $3, $4, $5, $6)
+                        ON CONFLICT (sender_pubkey, (substring(followed_user_pubkey from 2)))
+                        DO NOTHING
+                        RETURNING transaction_id, block_time, sender_pubkey, followed_user_pubkey
+                    )
+                    INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey)
+                    SELECT fi.transaction_id, 'follow', fi.followed_user_pubkey, fi.block_time, fi.sender_pubkey
+                    FROM follow_insert fi
                     "#,
                 )
                 .bind(&transaction_id_bytes)
@@ -3579,27 +3588,37 @@ impl KProtocolProcessor {
                     info!("Unfollow {} is older than a later follow of the same person, skipping", transaction_id);
                     return Ok(());
                 }
-                // Delete the follow for the same sender and followed user, unless it is newer.
-                let delete_result = sqlx::query(
+                // Delete the follow for the same sender and followed user, unless it is newer,
+                // and its notification row with it (as an unvote does).
+                let deleted: i64 = sqlx::query_scalar(
                     r#"
-                    DELETE FROM k_follows
-                    WHERE sender_pubkey = $1
-                    AND substring(followed_user_pubkey from 2) = substring($2 from 2)
-                    AND following_action = 'follow'
-                    AND block_time <= $3
+                    WITH deleted_follows AS (
+                        DELETE FROM k_follows
+                        WHERE sender_pubkey = $1
+                        AND substring(followed_user_pubkey from 2) = substring($2 from 2)
+                        AND following_action = 'follow'
+                        AND block_time <= $3
+                        RETURNING transaction_id
+                    ),
+                    deleted_mentions AS (
+                        DELETE FROM k_mentions
+                        WHERE content_type = 'follow'
+                          AND content_id IN (SELECT transaction_id FROM deleted_follows)
+                    )
+                    SELECT COUNT(*) FROM deleted_follows
                     "#,
                 )
                 .bind(&sender_pubkey_bytes)
                 .bind(&followed_user_pubkey_bytes)
                 .bind(block_time)
-                .execute(&self.db_pool)
+                .fetch_one(&self.db_pool)
                 .await?;
 
                 info!(
                     "Processed K unfollow: {} unfollowed {} (deleted {} existing follow records)",
                     hex::encode(&sender_pubkey_bytes),
                     hex::encode(&followed_user_pubkey_bytes),
-                    delete_result.rows_affected()
+                    deleted
                 );
             }
             _ => {

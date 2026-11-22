@@ -3,6 +3,25 @@
 **For:** the indexer session (`kasia-indexer`, the push service). **From:** the K iOS session
 (`KaspaSilver/KaChat-iPhone`, now `K-iPhone`).
 
+> **Status (2026-11-22): §1 to §3 done in the indexer session** (not yet deployed; K should send
+> `"app": "k"` only against a server with this build, though an older one simply ignores it).
+>
+> - **§1:** register and update take `"app"`. `"k"` (any case) is stored, any other value clears
+>   it, and absent keeps the stored one. It's outside the auth preimage. A device with `app` = `k`
+>   takes every kind of push (`device_takes_push`); everything else is routed by topic as before.
+> - **§2, one push per tx:** a tx that carries a chat operation (message, `kchat:1:dm`, payment in
+>   a chat, handshake, group, self-stash) gives no `address_activity` push to a device that takes
+>   chat pushes (K, or a wildcard topic). KaPay on the same wallet still gets its "Funds
+>   received".
+> - **§2, self-sends:** a device's `watched_addresses` (the chatting address) now count as its
+>   own, alongside `watch_only_addresses`. The block processor records outputs paying the chatting
+>   address of any device with watch-only addresses (without announcing them), so a later send
+>   from it is a self-send. This only covers outputs that arrive after the deploy: the first send
+>   from a chatting address funded before then can still ping once.
+> - **§3:** nothing extra; `name_event` reaches K once §1 is in.
+> - Payload fields are unchanged: `tx_id` in chat, group and `address_activity` data; the room
+>   txid as collapse id; `postId`, `actor_pubkey` and `kaposts_kind` on `kaposts`.
+
 ## Why
 
 The KaChat iPhone app is now **K**, the all-in-one app (owner, 2026-11-20): chats, groups,

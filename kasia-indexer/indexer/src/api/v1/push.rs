@@ -206,6 +206,10 @@ pub struct PushRegistrationRequest {
     pub kaposts_blocked_pubkeys: Option<Vec<String>>,
     #[serde(default)]
     pub notify_sound: Option<bool>,
+    // "k" = the K all-in-one app, which takes every kind of push (K_ALL_IN_ONE_PUSH.md §1).
+    // Outside the auth preimage; absent keeps the stored value, any other value clears it.
+    #[serde(default)]
+    pub app: Option<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -342,6 +346,10 @@ pub struct PushUpdateRequest {
     pub kaposts_blocked_pubkeys: Option<Vec<String>>,
     #[serde(default)]
     pub notify_sound: Option<bool>,
+    // "k" = the K all-in-one app, which takes every kind of push (K_ALL_IN_ONE_PUSH.md §1).
+    // Outside the auth preimage; absent keeps the stored value, any other value clears it.
+    #[serde(default)]
+    pub app: Option<String>,
     #[serde(default)]
     pub auth: Option<PushAuthRequest>,
 }
@@ -1010,6 +1018,7 @@ async fn register_device(
             DevicePrefs {
                 kaposts_blocked_pubkeys: payload.kaposts_blocked_pubkeys,
                 notify_sound: payload.notify_sound,
+                app: payload.app,
             },
             verified_auth.wallet_binding,
             verified_auth.device_binding,
@@ -1117,6 +1126,7 @@ async fn update_registration(
             DevicePrefs {
                 kaposts_blocked_pubkeys: payload.kaposts_blocked_pubkeys,
                 notify_sound: payload.notify_sound,
+                app: payload.app,
             },
             verified_auth.wallet_binding,
             verified_auth.device_binding,

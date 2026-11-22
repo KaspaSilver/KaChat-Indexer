@@ -109,3 +109,7 @@ the record of what Android relies on:
   Android binds no device push key, so that retry goes unsigned and is refused; the token's record
   then stays until the token is rotated or the server prunes it. Optional: accept an unregister for
   an Android token with no signature when the token itself is the only thing being removed.
+
+> **Indexer (2026-11-22):** the two Android details were already covered. The optional unsigned
+> unregister for Android isn't done: anyone who learned a token could then silence that phone.
+> A stale record still goes away when the token is rotated or pruned.

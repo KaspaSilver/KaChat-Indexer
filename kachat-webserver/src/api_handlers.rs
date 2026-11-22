@@ -1130,6 +1130,10 @@ impl ApiHandlers {
                         post.vote_type = None;
                         post.tip_amount_sompi = Some(amount);
                     }
+                    // A follow: "<name> followed you", no post.
+                    if notification_record.is_follow {
+                        post = post.into_follow();
+                    }
                     post
                 }
             })

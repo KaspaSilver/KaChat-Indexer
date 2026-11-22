@@ -115,6 +115,9 @@ pub struct FundsPushEvent {
     pub tx_id: [u8; 32],
     pub timestamp: u64,
     pub daa_score: u64,
+    /// The tx carries a chat operation (message, payment in a chat, group message, handshake,
+    /// self-stash). A device that takes chat pushes hears about it from that push instead.
+    pub chat_tx: bool,
 }
 
 #[derive(Debug, Clone)]

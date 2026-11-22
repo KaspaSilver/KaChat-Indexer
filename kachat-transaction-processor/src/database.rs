@@ -636,6 +636,19 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        // Same for follows indexed before they were notifications (KAPOSTS_FOLLOW_NOTIFICATIONS.md).
+        sqlx::query(
+            r#"
+            INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey)
+            SELECT f.transaction_id, 'follow', f.followed_user_pubkey, f.block_time, f.sender_pubkey
+            FROM k_follows f
+            WHERE NOT EXISTS (
+                SELECT 1 FROM k_mentions km WHERE km.content_id = f.transaction_id AND km.content_type = 'follow'
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

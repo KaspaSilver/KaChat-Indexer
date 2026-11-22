@@ -77,6 +77,27 @@ pub fn watch_only_contains(addr: &AddressPayload) -> bool {
         .unwrap_or(false)
 }
 
+/// The chatting addresses of the devices that watch owned addresses. Not announced when credited,
+/// but what pays them is recorded, so a later send from one counts as a self-send
+/// (K_ALL_IN_ONE_PUSH.md §2). Kept in sync by the push registry with the set above.
+static SELF_SEND_ADDRESSES: LazyLock<RwLock<HashSet<AddressPayload>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// Replace the self-send address set (called by the push registry with the watch-only set).
+pub fn set_self_send_addresses(addrs: HashSet<AddressPayload>) {
+    if let Ok(mut guard) = SELF_SEND_ADDRESSES.write() {
+        *guard = addrs;
+    }
+}
+
+/// Whether `addr` is a chatting address of a device that watches owned addresses.
+pub fn self_send_contains(addr: &AddressPayload) -> bool {
+    SELF_SEND_ADDRESSES
+        .read()
+        .map(|g| g.contains(addr))
+        .unwrap_or(false)
+}
+
 /// Replace the personal-mode address allowlist. An empty vec turns personal mode OFF.
 pub fn set_personal_addresses(addrs: Vec<AddressPayload>) {
     if let Ok(mut guard) = PERSONAL_ADDRESSES.write() {

@@ -198,6 +198,7 @@ impl PushRegistry {
         let normalized_notify_sound = device_prefs
             .notify_sound
             .or_else(|| existing.as_ref().and_then(|reg| reg.notify_sound));
+        let normalized_app = normalize_app(device_prefs.app, existing.as_ref());
         let effective_wallet_binding = resolve_wallet_binding(existing.as_ref(), wallet_binding)?;
         let effective_wallet_pubkey = effective_wallet_binding
             .as_ref()
@@ -278,11 +279,15 @@ impl PushRegistry {
                     && reg.android_channel_id == normalized_android_channel_id
                     && reg.kaposts_blocked_pubkeys == normalized_kaposts_blocked
                     && reg.notify_sound == normalized_notify_sound
+                    && reg.app == normalized_app
             })
             .unwrap_or(false);
         let watch_only_changed = existing
             .as_ref()
-            .map(|reg| reg.watch_only_addresses != normalized_watch_only)
+            .map(|reg| {
+                reg.watch_only_addresses != normalized_watch_only
+                    || (!normalized_watch_only.is_empty() && reg.watched_addresses != addresses)
+            })
             .unwrap_or(!normalized_watch_only.is_empty());
         if addresses_unchanged
             && group_ids_unchanged
@@ -329,6 +334,7 @@ impl PushRegistry {
             android_channel_id: normalized_android_channel_id,
             kaposts_blocked_pubkeys: normalized_kaposts_blocked,
             notify_sound: normalized_notify_sound,
+            app: normalized_app,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -568,6 +574,7 @@ impl PushRegistry {
         let normalized_notify_sound = device_prefs
             .notify_sound
             .or_else(|| existing.as_ref().and_then(|reg| reg.notify_sound));
+        let normalized_app = normalize_app(device_prefs.app, existing.as_ref());
         let last_seen_refresh = existing
             .as_ref()
             .map(|reg| should_refresh_last_seen(&token, reg.last_seen, now))
@@ -625,11 +632,15 @@ impl PushRegistry {
                     && reg.android_channel_id == normalized_android_channel_id
                     && reg.kaposts_blocked_pubkeys == normalized_kaposts_blocked
                     && reg.notify_sound == normalized_notify_sound
+                    && reg.app == normalized_app
             })
             .unwrap_or(false);
         let watch_only_changed = existing
             .as_ref()
-            .map(|reg| reg.watch_only_addresses != normalized_watch_only)
+            .map(|reg| {
+                reg.watch_only_addresses != normalized_watch_only
+                    || (!normalized_watch_only.is_empty() && reg.watched_addresses != addresses)
+            })
             .unwrap_or(!normalized_watch_only.is_empty());
         if addresses_unchanged
             && group_ids_unchanged
@@ -674,6 +685,7 @@ impl PushRegistry {
             android_channel_id: normalized_android_channel_id,
             kaposts_blocked_pubkeys: normalized_kaposts_blocked,
             notify_sound: normalized_notify_sound,
+            app: normalized_app,
             app_attest_key_id: None,
             app_attest_public_key_spki_b64: None,
             app_attest_sign_count: None,
@@ -1084,12 +1096,15 @@ impl PushRegistry {
     }
 
     /// Address Activity: recompute the union of every device's `watch_only_addresses` and hand it
-    /// to the block processor's global gate. Called after any registration change that touched the
-    /// watch-only set, and once at startup. Scans all registrations (registration changes are
-    /// infrequent vs. blocks, so no incremental index is kept).
+    /// to the block processor's global gate, with the `watched_addresses` (the chatting address)
+    /// of those same devices: a send from one of those is a self-send too (K_ALL_IN_ONE_PUSH.md
+    /// §2), so the block processor records what pays them without announcing it. Called after any
+    /// registration change that touched either, and once at startup. Scans all registrations
+    /// (registration changes are infrequent vs. blocks, so no incremental index is kept).
     pub fn rebuild_watch_only_global(&self) {
         let rtx = self.tx_keyspace.read_tx();
         let mut set: HashSet<AddressPayload> = HashSet::new();
+        let mut own: HashSet<AddressPayload> = HashSet::new();
         for entry in self.device_partition.iter_values_rtx(&rtx) {
             let Ok(value) = entry else { continue };
             let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
@@ -1100,14 +1115,23 @@ impl PushRegistry {
                     set.insert(payload);
                 }
             }
+            if reg.watch_only_addresses.is_empty() {
+                continue;
+            }
+            for address in &reg.watched_addresses {
+                if let Ok(payload) = address_to_payload(address) {
+                    own.insert(payload);
+                }
+            }
         }
         indexer_actors::set_watch_only_addresses(set);
+        indexer_actors::set_self_send_addresses(own);
     }
 
     /// Address Activity: devices to notify that `address` was credited. Matches devices whose
     /// `watch_only_addresses` include `address`, and drops any device that also watches one of
     /// `senders` (a self-send: the owner funded their own address, so no ping;
-    /// docs/KACHAT_WALLET_PUSH.md §1). Iterates all registrations (funds events are gated on the
+    /// docs/KACHAT_WALLET_PUSH.md §1), counting its `watched_addresses` as its own too. Iterates all registrations (funds events are gated on the
     /// global watch-only set, so this only runs for real hits).
     pub fn watch_only_tokens(
         &self,
@@ -1132,7 +1156,13 @@ impl PushRegistry {
             if !payloads.iter().any(|p| p == address) {
                 continue;
             }
-            if payloads.iter().any(|p| senders.contains(p)) {
+            if payloads.iter().any(|p| senders.contains(p))
+                || reg
+                    .watched_addresses
+                    .iter()
+                    .filter_map(|a| address_to_payload(a).ok())
+                    .any(|p| senders.contains(&p))
+            {
                 continue;
             }
             tokens.push(reg.device_token);
@@ -1261,6 +1291,17 @@ impl PushRegistry {
             }
         }
         Ok(map)
+    }
+
+    /// The tokens registered by K (`app` = "k").
+    fn k_tokens(&self, tokens: &[String]) -> anyhow::Result<HashSet<String>> {
+        let mut k = HashSet::new();
+        for token in tokens {
+            if self.get_registration(token)?.and_then(|registration| registration.app).as_deref() == Some(K_APP) {
+                k.insert(token.clone());
+            }
+        }
+        Ok(k)
     }
 
     /// The tokens whose owner turned sound off (`notify_sound` = false).
@@ -1702,6 +1743,10 @@ enum PushRegistryCommand {
         tokens: Vec<String>,
         response: RegistryResponse<HashSet<String>>,
     },
+    KTokens {
+        tokens: Vec<String>,
+        response: RegistryResponse<HashSet<String>>,
+    },
     AndroidChannelsForTokens {
         tokens: Vec<String>,
         response: RegistryResponse<HashMap<String, String>>,
@@ -1955,6 +2000,10 @@ impl PushRegistryActor {
                 }
                 PushRegistryCommand::SilentTokens { tokens, response } => {
                     let result = self.registry.silent_tokens(&tokens);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::KTokens { tokens, response } => {
+                    let result = self.registry.k_tokens(&tokens);
                     let _ = response.send(result);
                 }
                 PushRegistryCommand::AndroidChannelsForTokens { tokens, response } => {
@@ -2281,6 +2330,12 @@ impl PushRegistryHandle {
             .await
     }
 
+    /// The tokens registered by K, which take every kind of push.
+    pub async fn k_tokens(&self, tokens: Vec<String>) -> anyhow::Result<HashSet<String>> {
+        self.request(|response| PushRegistryCommand::KTokens { tokens, response })
+            .await
+    }
+
     /// The tokens whose owner turned sound off.
     pub async fn silent_tokens(&self, tokens: Vec<String>) -> anyhow::Result<HashSet<String>> {
         self.request(|response| PushRegistryCommand::SilentTokens { tokens, response })
@@ -2401,6 +2456,8 @@ pub struct DevicePrefs {
     pub kaposts_blocked_pubkeys: Option<Vec<String>>,
     /// false = this device's alerts play no sound.
     pub notify_sound: Option<bool>,
+    /// "k" = the K all-in-one app (K_ALL_IN_ONE_PUSH.md), which takes every kind of push.
+    pub app: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2473,6 +2530,11 @@ pub struct DeviceRegistration {
     // None = sound, as before (§5). Value only, outside the auth preimage.
     #[serde(default)]
     pub notify_sound: Option<bool>,
+    // Some("k") = the K all-in-one app (K_ALL_IN_ONE_PUSH.md §1): it shares KaChat's topic but
+    // takes every kind of push. None = route by topic, as before. Value only, outside the auth
+    // preimage.
+    #[serde(default)]
+    pub app: Option<String>,
     #[serde(default)]
     pub app_attest_key_id: Option<String>,
     #[serde(default)]
@@ -3021,6 +3083,22 @@ impl PushDispatcher {
                 .await?;
             tokens.sort_unstable();
             tokens.dedup();
+            // One push per tx per device (K_ALL_IN_ONE_PUSH.md §2): a chat tx (a message, a
+            // payment in a chat, a group message) is announced by its chat push, so a device that
+            // takes those gets no "Funds received" for it as well.
+            if event.chat_tx && !tokens.is_empty() {
+                let topics = self
+                    .registry
+                    .apns_topics_for_tokens(tokens.clone())
+                    .await
+                    .unwrap_or_default();
+                let k_tokens = self
+                    .registry
+                    .k_tokens(tokens.clone())
+                    .await
+                    .unwrap_or_default();
+                tokens.retain(|t| !takes_chat_push(k_tokens.contains(t), topics.get(t).cloned().flatten().as_deref()));
+            }
             let now = Instant::now();
             tokens.retain(|token| self.allow_watch_only_push(token, now));
             if tokens.is_empty() {
@@ -3121,12 +3199,17 @@ impl PushDispatcher {
             .apns_topics_for_tokens(tokens.clone())
             .await
             .unwrap_or_default();
+        let k_tokens = self
+            .registry
+            .k_tokens(tokens.clone())
+            .await
+            .unwrap_or_default();
         let event_type = fcm_data.get("type").map(String::as_str).unwrap_or("");
         let tokens: Vec<String> = tokens
             .into_iter()
             .filter(|t| {
                 let topic = topics.get(t).cloned().flatten();
-                let ok = topic_takes_push(topic.as_deref(), event_type);
+                let ok = device_takes_push(k_tokens.contains(t), topic.as_deref(), event_type);
                 if !ok {
                     match topic.as_deref() {
                         Some(t) if WALLET_APNS_TOPICS.contains(&t) => tally.wallet_filtered += 1,
@@ -4684,6 +4767,15 @@ fn normalize_stored_voip_token(
     requested.or_else(|| existing.and_then(|reg| reg.voip_token.clone()))
 }
 
+/// The one app value a device may send: "k" (K_ALL_IN_ONE_PUSH.md §1). Any other value is stored
+/// as none; absent keeps the stored one, like apns_topic.
+fn normalize_app(requested: Option<String>, existing: Option<&DeviceRegistration>) -> Option<String> {
+    match requested {
+        Some(app) => app.trim().eq_ignore_ascii_case(K_APP).then(|| K_APP.to_string()),
+        None => existing.and_then(|reg| reg.app.clone()),
+    }
+}
+
 /// How many blocked people one device may list.
 const MAX_KAPOSTS_BLOCKED: usize = 5_000;
 
@@ -4752,6 +4844,21 @@ const KACHAT_PUSH_TYPES: &[&str] = &[
     "group_message",
     "group_control",
 ];
+
+/// K, the all-in-one app (K_ALL_IN_ONE_PUSH.md): KaChat's bundle id and no topic, so it says so
+/// with `"app": "k"` and takes every kind of push.
+const K_APP: &str = "k";
+
+/// Whether a device takes a push of this `type`: a K device takes every kind, anything else goes
+/// by its APNs topic.
+fn device_takes_push(is_k: bool, topic: Option<&str>, event_type: &str) -> bool {
+    is_k || topic_takes_push(topic, event_type)
+}
+
+/// Whether a device takes the chat pushes (messages, payments in a chat, groups).
+fn takes_chat_push(is_k: bool, topic: Option<&str>) -> bool {
+    device_takes_push(is_k, topic, "payment")
+}
 
 /// Whether a device on this APNs topic takes a push of this `type`. A topic outside the apps'
 /// own (only possible through APNS_ALLOWED_TOPICS) takes every kind.
@@ -4983,6 +5090,7 @@ mod tests {
         let existing = DeviceRegistration {
             kaposts_blocked_pubkeys: Vec::new(),
             notify_sound: None,
+            app: None,
             device_token: "token".to_string(),
             platform: "ios".to_string(),
             watched_addresses: vec![],
@@ -5432,6 +5540,7 @@ mod kaposts_watch_tests {
         let blocked = DevicePrefs {
             kaposts_blocked_pubkeys: Some(vec![format!("02{}", "B".repeat(64)), "not a key".into()]),
             notify_sound: Some(false),
+            app: None,
         };
         register(&mut registry, blocked, vec![troll.clone(), friend.clone()]).expect("registered");
         let reg = registry.get_registration(&token).unwrap().unwrap();
@@ -5449,7 +5558,7 @@ mod kaposts_watch_tests {
         assert_eq!(reg.kaposts_blocked_pubkeys, vec!["b".repeat(64)]);
         assert_eq!(reg.notify_sound, Some(false));
         // Unblocking everyone sends an empty list, and sound back on.
-        let cleared = DevicePrefs { kaposts_blocked_pubkeys: Some(vec![]), notify_sound: Some(true) };
+        let cleared = DevicePrefs { kaposts_blocked_pubkeys: Some(vec![]), notify_sound: Some(true), app: None };
         register(&mut registry, cleared, vec![]).expect("re-registered");
         assert_eq!(registry.tokens_for_kaposts(&me, &troll).unwrap(), vec![token.clone()]);
         assert!(registry.silent_tokens(&[token.clone()]).unwrap().is_empty());
@@ -5796,6 +5905,92 @@ mod kaposts_watch_tests {
 
         drop(handle);
         actor_thread.join().expect("actor exits cleanly");
+    }
+
+    #[test]
+    fn k_takes_every_push_and_its_chatting_address_counts_as_its_own() {
+        use super::{DevicePrefs, device_takes_push, takes_chat_push};
+        use indexer_db::AddressPayload;
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let mut registry = PushRegistry::new(
+            tx_keyspace.clone(),
+            DeviceRegistrationPartition::new(&tx_keyspace).expect("device partition"),
+            WatchedAddressPartition::new(&tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(&tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(&tx_keyspace).expect("primary partition"),
+            create_shared_metrics(),
+        );
+        let addr = |b: u8| Address::new(Prefix::Mainnet, Version::PubKey, &[b; 32]);
+        let (chatting, spending) = (addr(1), addr(2));
+        let payload = |a: &Address| AddressPayload::try_from(a).expect("payload");
+        let (k, kapay) = ("ab".repeat(32), "cd".repeat(32));
+        let register = |registry: &mut PushRegistry, token: &str, watched: Vec<String>, app: Option<&str>| {
+            registry.register(
+                token.to_string(),
+                "ios".to_string(),
+                watched,
+                vec![],
+                vec![],
+                Some(chatting.to_string()),
+                vec![],
+                vec![],
+                Default::default(),
+                None,
+                None,
+                vec![],
+                vec![spending.to_string()],
+                None,
+                None,
+                None,
+                None,
+                None,
+                DevicePrefs { app: app.map(str::to_string), ..Default::default() },
+                None,
+                None,
+            )
+        };
+        register(&mut registry, &k, vec![chatting.to_string()], Some(" K ")).expect("K registered");
+        assert_eq!(registry.get_registration(&k).unwrap().unwrap().app.as_deref(), Some("k"));
+        assert!(registry.k_tokens(&[k.clone()]).unwrap().contains(&k));
+
+        // K takes every kind; KaChat (no topic, no app) keeps only the chat kinds.
+        for kind in [
+            "contextual", "handshake", "payment", "group_message", "group_control",
+            "kaposts", "broadcast", "address_activity", "name_event",
+        ] {
+            assert!(device_takes_push(true, None, kind), "{kind}");
+        }
+        assert!(device_takes_push(false, None, "payment"));
+        for kind in ["kaposts", "broadcast", "address_activity", "name_event"] {
+            assert!(!device_takes_push(false, None, kind), "{kind}");
+            assert!(!device_takes_push(false, Some("com.kachat.app"), kind), "{kind}");
+        }
+        // A chat tx gives K its chat push only; KaPay (no chat pushes) still gets "Funds received".
+        assert!(takes_chat_push(true, None));
+        assert!(!takes_chat_push(false, Some("com.kachat.wallet")));
+        assert!(!takes_chat_push(false, Some("kapay.kachat.app")));
+
+        // KaPay on the same wallet watches the spending address only.
+        register(&mut registry, &kapay, vec![], None).expect("KaPay registered");
+        let matched = |registry: &PushRegistry, senders: Vec<AddressPayload>| {
+            let mut tokens = registry.watch_only_tokens(&payload(&spending), &senders).unwrap();
+            tokens.sort();
+            tokens
+        };
+        assert_eq!(matched(&registry, vec![]), vec![k.clone(), kapay.clone()]);
+        // K sends KAS from its chatting address to its spending address: a self-send for K.
+        assert_eq!(matched(&registry, vec![payload(&chatting)]), vec![kapay.clone()]);
+        assert!(matched(&registry, vec![payload(&spending)]).is_empty());
+
+        // An update without the field keeps K; an unknown value clears it.
+        register(&mut registry, &k, vec![chatting.to_string()], None).expect("re-registered");
+        assert_eq!(registry.get_registration(&k).unwrap().unwrap().app.as_deref(), Some("k"));
+        register(&mut registry, &k, vec![chatting.to_string()], Some("kapost")).expect("re-registered");
+        assert_eq!(registry.get_registration(&k).unwrap().unwrap().app, None);
+        assert!(registry.k_tokens(&[k.clone()]).unwrap().is_empty());
     }
 
     #[tokio::test]

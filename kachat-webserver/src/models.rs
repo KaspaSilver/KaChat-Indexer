@@ -182,6 +182,8 @@ pub struct NotificationContentRecord {
     pub is_reply_mention: bool,
     /// Tip rows only (k_mentions content_type 'tip', §5.11): the sompi the tip paid the author.
     pub tip_amount_sompi: Option<u64>,
+    /// Follow rows only (k_mentions content_type 'follow'): someone followed the requester.
+    pub is_follow: bool,
 }
 
 // Referenced content data for quotes (only the original content being quoted)
@@ -603,6 +605,19 @@ impl NotificationPost {
             tip_amount_sompi: None,
         }
     }
+
+    /// A follow rides the vote record; it has no post, so only who and when are left
+    /// (KAPOSTS_FOLLOW_NOTIFICATIONS.md).
+    pub fn into_follow(mut self) -> Self {
+        self.content_type = "follow".to_string();
+        self.post_content = String::new();
+        self.vote_type = None;
+        self.content_id = None;
+        self.post_id = None;
+        self.voted_content = None;
+        self.tip_amount_sompi = None;
+        self
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -812,5 +827,42 @@ impl ServerReply {
             tips_count: record.tips_count.unwrap_or(0),
             poll: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_follow_notification_names_the_follower_and_no_post() {
+        let record = KVoteRecord {
+            id: 7,
+            transaction_id: "ab".repeat(32),
+            block_time: 1_700_000_000_000,
+            sender_pubkey: format!("03{}", "cd".repeat(32)),
+            sender_signature: String::new(),
+            post_id: String::new(),
+            vote: String::new(),
+            mention_block_time: Some(1_700_000_000_000),
+            voted_content: Some(String::new()),
+            user_nickname: Some("QWxpY2U=".into()),
+            user_profile_image: None,
+        };
+        let post = NotificationPost::from_k_vote_record_with_mention_cursor(
+            &record, 42, 1_700_000_000_000, String::new(), record.user_nickname.clone(), None,
+        )
+        .into_follow();
+        let json = serde_json::to_value(&post).unwrap();
+        assert_eq!(json["contentType"], "follow");
+        assert_eq!(json["id"], "ab".repeat(32));
+        assert_eq!(json["userPublicKey"], format!("03{}", "cd".repeat(32)));
+        assert_eq!(json["timestamp"], 1_700_000_000_000u64);
+        assert_eq!(json["postContent"], "");
+        assert!(json["contentId"].is_null());
+        assert!(json["voteType"].is_null());
+        assert!(json["votedContent"].is_null());
+        assert!(json.get("tipAmountSompi").is_none());
+        assert_eq!(json["cursor"], "1700000000000_42");
     }
 }

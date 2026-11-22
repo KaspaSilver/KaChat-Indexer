@@ -3934,6 +3934,7 @@ impl DatabaseInterface for PostgresDbManager {
                         WHEN 'quote' THEN c.id
                         WHEN 'vote' THEN v.id
                         WHEN 'tip' THEN t.id
+                        WHEN 'follow' THEN f.id
                     END as id,
                     fn.content_id as transaction_id,
                     fn.block_time,
@@ -3944,6 +3945,7 @@ impl DatabaseInterface for PostgresDbManager {
                         WHEN 'quote' THEN c.base64_encoded_message
                         WHEN 'vote' THEN ''
                         WHEN 'tip' THEN ''
+                        WHEN 'follow' THEN ''
                     END as base64_encoded_message,
                     fn.notification_id,
                     COALESCE(b.base64_encoded_nickname, '') as user_nickname,
@@ -3973,6 +3975,8 @@ impl DatabaseInterface for PostgresDbManager {
                 -- Tips: k_mentions.content_id is the tip tx; the tipped content comes from k_tips
                 LEFT JOIN k_tips t ON fn.content_type = 'tip' AND fn.content_id = t.transaction_id
                 LEFT JOIN k_contents tc ON fn.content_type = 'tip' AND t.post_id = tc.transaction_id
+                -- Follows: k_mentions.content_id is the follow tx; an unfollow deletes both rows
+                LEFT JOIN k_follows f ON fn.content_type = 'follow' AND fn.content_id = f.transaction_id
                 -- Get user profile for sender
                 LEFT JOIN LATERAL (
                     SELECT base64_encoded_nickname, base64_encoded_profile_image
@@ -4076,6 +4080,7 @@ impl DatabaseInterface for PostgresDbManager {
                     mention_block_time: block_time as u64,
                     is_reply_mention: false,
                     tip_amount_sompi: None,
+                    is_follow: false,
                 });
             } else if content_type == "quote" {
                 // Handle quote notifications - someone quoted my content
@@ -4115,6 +4120,7 @@ impl DatabaseInterface for PostgresDbManager {
                     mention_block_time: block_time as u64,
                     is_reply_mention: false,
                     tip_amount_sompi: None,
+                    is_follow: false,
                 });
             } else if content_type == "reply" {
                 let reply_record = KReplyRecord {
@@ -4149,8 +4155,9 @@ impl DatabaseInterface for PostgresDbManager {
                         .flatten()
                         .unwrap_or(false),
                     tip_amount_sompi: None,
+                    is_follow: false,
                 });
-            } else if content_type == "vote" || content_type == "tip" {
+            } else if content_type == "vote" || content_type == "tip" || content_type == "follow" {
                 let vote_record = KVoteRecord {
                     id: row.get::<i64, _>("id"),
                     transaction_id: Self::encode_bytes_to_hex(&transaction_id),
@@ -4175,7 +4182,9 @@ impl DatabaseInterface for PostgresDbManager {
                     mention_block_time: block_time as u64,
                     is_reply_mention: false,
                     // A tip rides the vote shape (who, which post, its content) plus its amount;
-                    // the handler surfaces it as contentType "tip".
+                    // the handler surfaces it as contentType "tip". A follow rides it too, with
+                    // no post, and is surfaced as contentType "follow".
+                    is_follow: content_type == "follow",
                     tip_amount_sompi: if content_type == "tip" {
                         row.try_get::<Option<i64>, _>("tip_amount")
                             .ok()

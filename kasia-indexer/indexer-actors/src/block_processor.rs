@@ -457,9 +457,13 @@ impl BlockProcessor {
         let tx_id_bytes = tx_id.as_bytes();
         let mut credited: Vec<(AddressPayload, u64)> = Vec::new();
         for (index, output) in tx.outputs.iter().enumerate() {
-            if let Ok(addr) = AddressPayload::try_from(&output.script_public_key)
-                && crate::watch_only_contains(&addr)
-            {
+            let Ok(addr) = AddressPayload::try_from(&output.script_public_key) else {
+                continue;
+            };
+            let credits = crate::watch_only_contains(&addr);
+            // A chatting address of a watching device is recorded, not announced: spending it
+            // later is a self-send (K_ALL_IN_ONE_PUSH.md §2).
+            if credits || crate::self_send_contains(&addr) {
                 self.watched_outpoint_partition.insert_wtx(
                     wtx,
                     &WatchedOutpointKey {
@@ -468,6 +472,8 @@ impl BlockProcessor {
                     },
                     &addr,
                 );
+            }
+            if credits {
                 credited.push((addr, output.value));
             }
         }
@@ -480,6 +486,7 @@ impl BlockProcessor {
             tx_id: tx_id_bytes,
             timestamp: block_header.timestamp,
             daa_score: block_header.daa_score,
+            chat_tx: parse_sealed_operation(&tx.payload).is_some(),
         };
         if funds_tx.try_send(event).is_err() {
             warn!("Dropping funds push event; queue is full");
