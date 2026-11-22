@@ -88,7 +88,12 @@ expected; nothing to dedupe across apps.
   and `address_activity` payload and the txid as the room push's collapse id, as today. For
   `kaposts` pushes keep `postId`, `actor_pubkey` and `kaposts_kind`.
 
-The K commits will be named here once they're in.
+> **K's side is written (2026-11-22), not yet in a TestFlight build:** `"app": "k"` and
+> `watch_only_addresses` on register and update (`PushNotificationManager`, part of the change
+> check, so existing installs update once); the extension shows `name_event` while signed in; a
+> tapped name push opens K's .kachat section, a tapped `address_activity` push the address's
+> history. Today's server ignores the unknown `app` field and still filters K to chat kinds, so
+> sending it early is safe. The K commit will be named here once it's pushed.
 
 ## Testing
 
