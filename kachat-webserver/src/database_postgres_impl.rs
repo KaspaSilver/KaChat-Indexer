@@ -152,6 +152,19 @@ impl PostgresDbManager {
             .collect())
     }
 
+    /// One `kachat_broadcasts` row (id, tx, sender_address, block_time, content) as (id, row).
+    fn channel_row(row: &sqlx::postgres::PgRow) -> (i64, crate::chess::ArenaRow) {
+        (
+            row.get::<i64, _>("id"),
+            crate::chess::ArenaRow {
+                tx_id: row.get("tx"),
+                sender: row.get("sender_address"),
+                block_time: row.get("block_time"),
+                content: row.get("content"),
+            },
+        )
+    }
+
     fn parse_compound_cursor(cursor: &str) -> DatabaseResult<(u64, i64)> {
         if cursor.contains('_') {
             let parts: Vec<&str> = cursor.split('_').collect();
@@ -2841,12 +2854,58 @@ impl DatabaseInterface for PostgresDbManager {
         self.chess_channel_rows(crate::chess::ARENA_CHANNEL).await
     }
 
-    async fn get_chess_bots_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>> {
-        self.chess_channel_rows(crate::chess::BOTS_CHANNEL).await
+    async fn get_channel_rows_after(
+        &self,
+        channel: &str,
+        after_id: i64,
+        limit: i64,
+    ) -> DatabaseResult<Vec<(i64, crate::chess::ArenaRow)>> {
+        let rows = sqlx::query(
+            "SELECT id, encode(transaction_id, 'hex') AS tx, sender_address, block_time, content \
+             FROM kachat_broadcasts WHERE channel = $1 AND id > $2 ORDER BY id LIMIT $3",
+        )
+        .bind(channel)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch #{}: {}", channel, e)))?;
+        Ok(rows.iter().map(Self::channel_row).collect())
     }
 
-    async fn get_arcade_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>> {
-        self.chess_channel_rows(crate::arcade::ARCADE_CHANNEL).await
+    async fn count_channel_rows(&self, channel: &str, up_to_id: i64) -> DatabaseResult<i64> {
+        sqlx::query_scalar("SELECT count(*) FROM kachat_broadcasts WHERE channel = $1 AND id <= $2")
+            .bind(channel)
+            .bind(up_to_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DatabaseError::QueryError(format!("Failed to count #{}: {}", channel, e)))
+    }
+
+    async fn get_channel_tx_ids(&self, channel: &str) -> DatabaseResult<Vec<String>> {
+        sqlx::query_scalar("SELECT encode(transaction_id, 'hex') FROM kachat_broadcasts WHERE channel = $1")
+            .bind(channel)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DatabaseError::QueryError(format!("Failed to list #{}: {}", channel, e)))
+    }
+
+    async fn get_channel_rows_by_tx(
+        &self,
+        channel: &str,
+        tx_ids: &[String],
+    ) -> DatabaseResult<Vec<(i64, crate::chess::ArenaRow)>> {
+        let ids: Vec<Vec<u8>> = tx_ids.iter().filter_map(|t| hex::decode(t).ok()).collect();
+        let rows = sqlx::query(
+            "SELECT id, encode(transaction_id, 'hex') AS tx, sender_address, block_time, content \
+             FROM kachat_broadcasts WHERE channel = $1 AND transaction_id = ANY($2::bytea[])",
+        )
+        .bind(channel)
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::QueryError(format!("Failed to fetch #{}: {}", channel, e)))?;
+        Ok(rows.iter().map(Self::channel_row).collect())
     }
 
     async fn get_content_by_id(

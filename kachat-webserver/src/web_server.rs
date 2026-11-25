@@ -25,6 +25,7 @@ use tracing::{error as log_error, info as log_info};
 use crate::api_handlers::ApiHandlers;
 use crate::config::ServerConfig;
 use crate::database_trait::DatabaseInterface;
+use crate::snapshot::{RowMemo, SnapshotCache};
 use crate::models::{
     ApiError, BroadcastChannelsResponse, BroadcastsResponse, ChessBotBoard, ChessBotLeaderboardResponse,
     ChessBotPlayerRow, ChessLeaderboardResponse, ChessPlayerRow, ChessTournamentRow,
@@ -51,41 +52,28 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Separate per-IP limiter for /translate (requests + posts).
     pub translate_rate_limit_map: crate::translate::TranslateRateLimitMap,
-    /// Chess leaderboard: replaying the whole arena is expensive, so cache the two derived views.
-    pub chess_cache: Arc<RwLock<ChessCache>>,
-    /// Chess bot leaderboards: the chess-bots replay, cached the same way.
-    pub chess_bots_cache: Arc<RwLock<ChessBotsCache>>,
-    /// KaPlay Arcade boards: the kplay-arcade replay, cached the same way.
-    pub arcade_cache: Arc<RwLock<ArcadeCache>>,
+    /// Chess leaderboard: replaying the whole arena is expensive, so cache the derived views
+    /// (one refresh at a time, never a failed one: crate::snapshot).
+    pub chess_cache: Arc<SnapshotCache<ChessSnapshot>>,
+    /// Chess bot leaderboards: each chess-bots row replayed once (RowMemo), cached the same way.
+    pub chess_bots_cache: Arc<SnapshotCache<ChessBotsSnapshot, RowMemo<crate::chess::BotClaim>>>,
+    /// KaPlay Arcade boards: each kplay-arcade row replayed once, cached the same way.
+    pub arcade_cache: Arc<SnapshotCache<crate::arcade::ArcadeSnapshot, RowMemo<crate::arcade::CheckedStamp>>>,
     /// §5.10: direct pool handle for the scheduled-posts store (raw SQL).
     pub scheduled_pool: sqlx::PgPool,
     /// .kachat names registry module (testnet). Off unless KACHAT_NAMES_MANIFEST is set.
     pub names: crate::names::NamesState,
 }
 
-/// Cached result of one arena replay (see chess.rs). Recomputed when older than CHESS_CACHE_TTL.
-#[derive(Default)]
-pub struct ChessCache {
-    computed_at: Option<Instant>,
-    players: Vec<ChessPlayerRow>,
-    players_since: i64,
-    monthly_players: Vec<ChessPlayerRow>,
-    monthly_since: i64,
-    tournaments: Vec<ChessTournamentRow>,
-    games_started: u64,
-}
-
+/// How long a leaderboard snapshot is served before it is refreshed.
 const CHESS_CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// Cached result of one chess-bots replay (chess::compute_bots), both periods.
-#[derive(Default)]
-pub struct ChessBotsCache {
-    computed_at: Option<Instant>,
-    snapshot: ChessBotsSnapshot,
-}
+/// Rows read per query while bringing a room's RowMemo up to date.
+const ROOM_PAGE_ROWS: i64 = 20_000;
 
+/// Both periods of the bot boards, from one chess-bots snapshot.
 #[derive(Clone, Default)]
-struct ChessBotsSnapshot {
+pub struct ChessBotsSnapshot {
     bots: Vec<ChessBotBoard>,
     since: i64,
     monthly_bots: Vec<ChessBotBoard>,
@@ -100,89 +88,136 @@ impl ChessBotsSnapshot {
             _ => (self.bots, self.since, "all"),
         }
     }
-}
 
-/// Cached result of one kplay-arcade replay (arcade::compute), both games and periods.
-#[derive(Default)]
-pub struct ArcadeCache {
-    computed_at: Option<Instant>,
-    snapshot: crate::arcade::ArcadeSnapshot,
-}
-
-/// Serve the arcade boards from cache, replaying the kplay-arcade rows when stale.
-async fn arcade_snapshot(state: &AppState) -> crate::arcade::ArcadeSnapshot {
-    {
-        let cache = state.arcade_cache.read().await;
-        if cache.computed_at.is_some_and(|at| at.elapsed() < CHESS_CACHE_TTL) {
-            return cache.snapshot.clone();
+    fn from_boards(snap: crate::chess::BotSnapshot) -> Self {
+        let to_boards = |boards: Vec<crate::chess::BotBoard>| -> Vec<ChessBotBoard> {
+            boards
+                .into_iter()
+                .map(|b| ChessBotBoard {
+                    level: b.level,
+                    games: b.games,
+                    players: b
+                        .players
+                        .into_iter()
+                        .map(|p| ChessBotPlayerRow {
+                            address: p.address,
+                            moves: p.moves,
+                            at: p.at,
+                            game_id: p.game_id,
+                            tx_id: p.tx_id,
+                        })
+                        .collect(),
+                })
+                .collect()
+        };
+        ChessBotsSnapshot {
+            bots: to_boards(snap.all_time),
+            since: snap.all_time_since,
+            monthly_bots: to_boards(snap.monthly),
+            monthly_since: snap.monthly_since,
         }
     }
-    let rows = state.db.get_arcade_rows().await.unwrap_or_default();
-    let rows: Vec<crate::chess::ArenaRow> = rows
-        .into_iter()
-        .map(|(tx_id, sender, block_time, content)| crate::chess::ArenaRow {
-            tx_id,
-            sender,
-            block_time,
-            content,
-        })
-        .collect();
-    let snapshot = crate::arcade::compute(rows, now_ms());
-    let mut cache = state.arcade_cache.write().await;
-    cache.computed_at = Some(Instant::now());
-    cache.snapshot = snapshot.clone();
-    snapshot
 }
 
-/// Serve the bot boards from cache, replaying the chess-bots rows when stale.
-async fn chess_bots_snapshot(state: &AppState) -> ChessBotsSnapshot {
-    {
-        let cache = state.chess_bots_cache.read().await;
-        if cache.computed_at.is_some_and(|at| at.elapsed() < CHESS_CACHE_TTL) {
-            return cache.snapshot.clone();
+/// 503 for a board that could not be computed and has no earlier answer to serve.
+fn board_unavailable() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError { error: "leaderboard unavailable, try again shortly".to_string(), code: "NOT_READY".to_string() }),
+    )
+}
+
+/// Run `f` on the room's memo on the blocking pool (replays are CPU work). The memo moves there
+/// and back; if the task fails it is left empty, and the next refresh reads the room afresh.
+async fn on_memo<V: Send + 'static, R: Send + 'static>(
+    memo: &mut RowMemo<V>,
+    f: impl FnOnce(&mut RowMemo<V>) -> R + Send + 'static,
+) -> Result<R, String> {
+    let mut taken = std::mem::take(memo);
+    let (taken, out) = tokio::task::spawn_blocking(move || {
+        let out = f(&mut taken);
+        (taken, out)
+    })
+    .await
+    .map_err(|e| format!("replay task: {e}"))?;
+    *memo = taken;
+    Ok(out)
+}
+
+/// Bring a KaPlay room's memo up to date and build its boards: judge only the rows added since
+/// the last refresh (and any the count says were missed), forget deleted ones, then `build`.
+async fn refresh_room<V: Send + 'static, T: Send + 'static>(
+    db: &Arc<dyn DatabaseInterface>,
+    channel: &'static str,
+    memo: &mut RowMemo<V>,
+    judge: fn(&crate::chess::ArenaRow) -> Option<V>,
+    build: fn(&RowMemo<V>, i64) -> T,
+) -> Result<T, String> {
+    let mut after = memo.fetch_after();
+    loop {
+        let page = db.get_channel_rows_after(channel, after, ROOM_PAGE_ROWS).await.map_err(|e| format!("{e:?}"))?;
+        let full = page.len() as i64 >= ROOM_PAGE_ROWS;
+        after = page.last().map_or(after, |(id, _)| *id);
+        let fresh = memo.unseen(page);
+        if !fresh.is_empty() {
+            on_memo(memo, move |m| m.judge(fresh, judge)).await?;
+        }
+        if !full {
+            break;
         }
     }
-    let rows = state.db.get_chess_bots_rows().await.unwrap_or_default();
-    let rows: Vec<crate::chess::ArenaRow> = rows
-        .into_iter()
-        .map(|(tx_id, sender, block_time, content)| crate::chess::ArenaRow {
-            tx_id,
-            sender,
-            block_time,
-            content,
+    // Up to the highest id read, the room holds exactly the memo's rows unless some were deleted
+    // (an admin delete, a blocklist purge) or committed below the overlap window. A count that
+    // differs lists the room's tx ids and reconciles.
+    let stored = db.count_channel_rows(channel, memo.last_id()).await.map_err(|e| format!("{e:?}"))?;
+    if stored != memo.len() as i64 {
+        let ids = db.get_channel_tx_ids(channel).await.map_err(|e| format!("{e:?}"))?;
+        let missing: Vec<String> = memo.missing(&ids).into_iter().cloned().collect();
+        let mut late = Vec::new();
+        for chunk in missing.chunks(ROOM_PAGE_ROWS as usize) {
+            late.extend(db.get_channel_rows_by_tx(channel, chunk).await.map_err(|e| format!("{e:?}"))?);
+        }
+        let late = memo.unseen(late);
+        on_memo(memo, move |m| {
+            m.keep_only(&ids);
+            m.judge(late, judge);
         })
-        .collect();
-    let snap = crate::chess::compute_bots(rows, now_ms());
-    let to_boards = |boards: Vec<crate::chess::BotBoard>| -> Vec<ChessBotBoard> {
-        boards
-            .into_iter()
-            .map(|b| ChessBotBoard {
-                level: b.level,
-                games: b.games,
-                players: b
-                    .players
-                    .into_iter()
-                    .map(|p| ChessBotPlayerRow {
-                        address: p.address,
-                        moves: p.moves,
-                        at: p.at,
-                        game_id: p.game_id,
-                        tx_id: p.tx_id,
-                    })
-                    .collect(),
+        .await?;
+    }
+    let now = now_ms();
+    on_memo(memo, move |m| build(m, now)).await
+}
+
+/// Serve the arcade boards from cache, bringing the kplay-arcade memo up to date when stale.
+async fn arcade_snapshot(state: &AppState) -> Option<crate::arcade::ArcadeSnapshot> {
+    let db = state.db.clone();
+    state
+        .arcade_cache
+        .get(CHESS_CACHE_TTL, "arcade boards", move |memo| {
+            Box::pin(async move {
+                refresh_room(&db, crate::arcade::ARCADE_CHANNEL, memo, crate::arcade::check_row, |m, now| {
+                    crate::arcade::snapshot(m.counted(), now)
+                })
+                .await
             })
-            .collect()
-    };
-    let out = ChessBotsSnapshot {
-        bots: to_boards(snap.all_time),
-        since: snap.all_time_since,
-        monthly_bots: to_boards(snap.monthly),
-        monthly_since: snap.monthly_since,
-    };
-    let mut cache = state.chess_bots_cache.write().await;
-    cache.computed_at = Some(Instant::now());
-    cache.snapshot = out.clone();
-    out
+        })
+        .await
+}
+
+/// Serve the bot boards from cache, bringing the chess-bots memo up to date when stale.
+async fn chess_bots_snapshot(state: &AppState) -> Option<ChessBotsSnapshot> {
+    let db = state.db.clone();
+    state
+        .chess_bots_cache
+        .get(CHESS_CACHE_TTL, "chess bot boards", move |memo| {
+            Box::pin(async move {
+                refresh_room(&db, crate::chess::BOTS_CHANNEL, memo, crate::chess::bot_claim, |m, now| {
+                    ChessBotsSnapshot::from_boards(crate::chess::bots_snapshot(m.counted(), now))
+                })
+                .await
+            })
+        })
+        .await
 }
 
 fn now_ms() -> i64 {
@@ -194,7 +229,7 @@ fn now_ms() -> i64 {
 
 /// One cached replay: both leaderboard periods, the lobby and the games-started count.
 #[derive(Clone)]
-struct ChessSnapshot {
+pub struct ChessSnapshot {
     players: Vec<ChessPlayerRow>,
     players_since: i64,
     monthly_players: Vec<ChessPlayerRow>,
@@ -212,86 +247,74 @@ impl ChessSnapshot {
             _ => (self.players, self.players_since, "all"),
         }
     }
+
+    /// The arena replay (the reducer folds every event in order, so the whole room each time),
+    /// on the blocking pool.
+    async fn compute(db: Arc<dyn DatabaseInterface>) -> Result<ChessSnapshot, String> {
+        let rows = db.get_chess_arena_rows().await.map_err(|e| format!("{e:?}"))?;
+        let arena: Vec<crate::chess::ArenaRow> = rows
+            .into_iter()
+            .map(|(tx_id, sender, block_time, content)| crate::chess::ArenaRow {
+                tx_id,
+                sender,
+                block_time,
+                content,
+            })
+            .collect();
+        tokio::task::spawn_blocking(move || Self::from_arena(crate::chess::compute_all(arena, now_ms())))
+            .await
+            .map_err(|e| format!("replay task: {e}"))
+    }
+
+    fn from_arena(snap: crate::chess::ArenaSnapshot) -> Self {
+        let to_rows = |board: Vec<crate::chess::LeaderboardRow>| -> Vec<ChessPlayerRow> {
+            board
+                .into_iter()
+                .map(|r| ChessPlayerRow {
+                    address: r.address,
+                    wins: r.wins,
+                    losses: r.losses,
+                    duel_wins: r.duel_wins,
+                    duel_losses: r.duel_losses,
+                    tournament_game_wins: r.tournament_game_wins,
+                    tournament_game_losses: r.tournament_game_losses,
+                    tournaments_played: r.tournaments_played,
+                    tournaments_won: r.tournaments_won,
+                    tournaments_lost: r.tournaments_lost,
+                    last_played_at: r.last_played_at,
+                })
+                .collect()
+        };
+        let tournaments: Vec<ChessTournamentRow> = snap
+            .lobby
+            .into_iter()
+            .map(|s| ChessTournamentRow {
+                id: s.id,
+                status: s.status,
+                capacity: s.capacity,
+                players: s.players,
+                started_at: s.started_at,
+                champion: s.champion,
+            })
+            .collect();
+        ChessSnapshot {
+            players: to_rows(snap.all_time),
+            players_since: snap.all_time_since,
+            monthly_players: to_rows(snap.monthly),
+            monthly_since: snap.monthly_since,
+            tournaments,
+            games_started: snap.games_started,
+        }
+    }
 }
 
 /// Serve the leaderboard + lobby from cache, recomputing from the DB when stale.
-async fn chess_snapshot(state: &AppState) -> ChessSnapshot {
-    {
-        let cache = state.chess_cache.read().await;
-        if let Some(at) = cache.computed_at {
-            if at.elapsed() < CHESS_CACHE_TTL {
-                return ChessSnapshot {
-                    players: cache.players.clone(),
-                    players_since: cache.players_since,
-                    monthly_players: cache.monthly_players.clone(),
-                    monthly_since: cache.monthly_since,
-                    tournaments: cache.tournaments.clone(),
-                    games_started: cache.games_started,
-                };
-            }
-        }
-    }
-    let rows = state.db.get_chess_arena_rows().await.unwrap_or_default();
-    let arena: Vec<crate::chess::ArenaRow> = rows
-        .into_iter()
-        .map(|(tx_id, sender, block_time, content)| crate::chess::ArenaRow {
-            tx_id,
-            sender,
-            block_time,
-            content,
-        })
-        .collect();
-    let snap = crate::chess::compute_all(arena, now_ms());
-    let to_rows = |board: Vec<crate::chess::LeaderboardRow>| -> Vec<ChessPlayerRow> {
-        board
-            .into_iter()
-            .map(|r| ChessPlayerRow {
-                address: r.address,
-                wins: r.wins,
-                losses: r.losses,
-                duel_wins: r.duel_wins,
-                duel_losses: r.duel_losses,
-                tournament_game_wins: r.tournament_game_wins,
-                tournament_game_losses: r.tournament_game_losses,
-                tournaments_played: r.tournaments_played,
-                tournaments_won: r.tournaments_won,
-                tournaments_lost: r.tournaments_lost,
-                last_played_at: r.last_played_at,
-            })
-            .collect()
-    };
-    let players = to_rows(snap.all_time);
-    let monthly_players = to_rows(snap.monthly);
-    let games_started = snap.games_started;
-    let tournaments: Vec<ChessTournamentRow> = snap
-        .lobby
-        .into_iter()
-        .map(|s| ChessTournamentRow {
-            id: s.id,
-            status: s.status,
-            capacity: s.capacity,
-            players: s.players,
-            started_at: s.started_at,
-            champion: s.champion,
-        })
-        .collect();
-    let out = ChessSnapshot {
-        players,
-        players_since: snap.all_time_since,
-        monthly_players,
-        monthly_since: snap.monthly_since,
-        tournaments,
-        games_started,
-    };
-    let mut cache = state.chess_cache.write().await;
-    cache.computed_at = Some(Instant::now());
-    cache.players = out.players.clone();
-    cache.players_since = out.players_since;
-    cache.monthly_players = out.monthly_players.clone();
-    cache.monthly_since = out.monthly_since;
-    cache.tournaments = out.tournaments.clone();
-    cache.games_started = out.games_started;
-    out
+async fn chess_snapshot(state: &AppState) -> Option<ChessSnapshot> {
+    let db = state.db.clone();
+    state
+        .chess_cache
+        .get(CHESS_CACHE_TTL, "chess leaderboard", move |_| Box::pin(ChessSnapshot::compute(db)))
+        .await
 }
 
 pub struct WebServer {
@@ -562,9 +585,9 @@ impl WebServer {
             db,
             http,
             translate_rate_limit_map,
-            chess_cache: Arc::new(RwLock::new(ChessCache::default())),
-            chess_bots_cache: Arc::new(RwLock::new(ChessBotsCache::default())),
-            arcade_cache: Arc::new(RwLock::new(ArcadeCache::default())),
+            chess_cache: Arc::new(SnapshotCache::new(())),
+            chess_bots_cache: Arc::new(SnapshotCache::new(RowMemo::default())),
+            arcade_cache: Arc::new(SnapshotCache::new(RowMemo::default())),
             scheduled_pool,
             names: crate::names::NamesState::from_env(),
         });
@@ -1319,8 +1342,10 @@ async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
     let (k, v) = cat("arcadeScores", arcade); categories.insert(k, v);
 
     // chessGames: games started per the leaderboard reducer (reuses the cached chess snapshot).
-    let games_started = chess_snapshot(app_state).await.games_started;
-    categories.insert("chessGames".to_string(), serde_json::json!({ "total": games_started }));
+    // Left out while the arena cannot be read, rather than counted as 0.
+    if let Some(snapshot) = chess_snapshot(app_state).await {
+        categories.insert("chessGames".to_string(), serde_json::json!({ "total": snapshot.games_started }));
+    }
 
     // .kachat (KACHAT_NAMES_REGISTRY_V3.md §10): counted from the names follower's history, one
     // per transaction, never the price record's. Only where the names module is on.
@@ -1381,22 +1406,22 @@ struct ExplorerQuery {
     period: Option<String>,
 }
 
-/// The Explorer answers, cached 60 s per (endpoint, period) like `/stats`.
-static EXPLORER_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(&'static str, &'static str), (std::time::Instant, serde_json::Value)>>> =
+/// The Explorer answers, cached 60 s per (endpoint, period) like `/stats`, one refresh at a time
+/// and never a failed one (crate::snapshot). `None` is the fees endpoint's "nothing counted yet".
+type ExplorerCache = SnapshotCache<Option<serde_json::Value>>;
+
+static EXPLORER_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(&'static str, &'static str), Arc<ExplorerCache>>>> =
     std::sync::OnceLock::new();
 
-fn explorer_cached(endpoint: &'static str, period: crate::explorer::Period) -> Option<serde_json::Value> {
-    let cache = EXPLORER_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let guard = cache.lock().ok()?;
-    let (at, value) = guard.get(&(endpoint, period.name()))?;
-    (at.elapsed() < STATS_TTL).then(|| value.clone())
+fn explorer_cache(endpoint: &'static str, period: crate::explorer::Period) -> Arc<ExplorerCache> {
+    let caches = EXPLORER_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = caches.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.entry((endpoint, period.name())).or_insert_with(|| Arc::new(SnapshotCache::new(()))).clone()
 }
 
-fn explorer_store(endpoint: &'static str, period: crate::explorer::Period, value: &serde_json::Value) {
-    let cache = EXPLORER_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert((endpoint, period.name()), (std::time::Instant::now(), value.clone()));
-    }
+/// 503: an Explorer answer that could not be computed and has no earlier one to serve.
+fn explorer_unavailable(error: &str) -> (StatusCode, Json<ApiError>) {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { error: error.to_string(), code: "NOT_READY".to_string() }))
 }
 
 fn explorer_period(value: Option<&str>) -> Result<crate::explorer::Period, (StatusCode, Json<ApiError>)> {
@@ -1417,20 +1442,26 @@ async fn handle_stats_activity(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     check_rate_limit(&app_state, addr).await?;
     let period = explorer_period(params.period.as_deref())?;
-    if let Some(value) = explorer_cached("activity", period) {
-        return Ok(Json(value));
+    let (http, pool) = (app_state.http.clone(), app_state.scheduled_pool.clone());
+    let value = explorer_cache("activity", period)
+        .get(STATS_TTL, "explorer activity", move |_| {
+            Box::pin(async move {
+                let url = format!(
+                    "{}/buckets",
+                    std::env::var("CHAT_STATS_URL").unwrap_or_else(|_| "http://127.0.0.1:8600/stats".to_string())
+                );
+                let chat = match http.get(&url).timeout(Duration::from_secs(5)).send().await {
+                    Ok(resp) if resp.status().is_success() => resp.json::<crate::explorer::ChatBuckets>().await.ok(),
+                    _ => None,
+                };
+                crate::explorer::activity(&pool, chat, period, stats_now_ms()).await.map(Some).map_err(|e| e.to_string())
+            })
+        })
+        .await;
+    match value {
+        Some(Some(value)) => Ok(Json(value)),
+        _ => Err(explorer_unavailable("activity unavailable, try again shortly")),
     }
-    let url = format!(
-        "{}/buckets",
-        std::env::var("CHAT_STATS_URL").unwrap_or_else(|_| "http://127.0.0.1:8600/stats".to_string())
-    );
-    let chat = match app_state.http.get(&url).timeout(Duration::from_secs(5)).send().await {
-        Ok(resp) if resp.status().is_success() => resp.json::<crate::explorer::ChatBuckets>().await.ok(),
-        _ => None,
-    };
-    let value = crate::explorer::activity(&app_state.scheduled_pool, chat, period, stats_now_ms()).await;
-    explorer_store("activity", period, &value);
-    Ok(Json(value))
 }
 
 /// GET /network/fees?period=day|week|month|all — every Kaspa transaction's fees, per bucket, and
@@ -1442,18 +1473,18 @@ async fn handle_network_fees(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     check_rate_limit(&app_state, addr).await?;
     let period = explorer_period(params.period.as_deref())?;
-    if let Some(value) = explorer_cached("fees", period) {
-        return Ok(Json(value));
-    }
-    match crate::explorer::network_fees(&app_state.scheduled_pool, period, stats_now_ms()).await {
-        Some(value) => {
-            explorer_store("fees", period, &value);
-            Ok(Json(value))
-        }
-        None => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiError { error: "no fees counted yet".to_string(), code: "NOT_READY".to_string() }),
-        )),
+    let pool = app_state.scheduled_pool.clone();
+    let value = explorer_cache("fees", period)
+        .get(STATS_TTL, "explorer fees", move |_| {
+            Box::pin(async move {
+                crate::explorer::network_fees(&pool, period, stats_now_ms()).await.map_err(|e| e.to_string())
+            })
+        })
+        .await;
+    match value {
+        Some(Some(value)) => Ok(Json(value)),
+        Some(None) => Err(explorer_unavailable("no fees counted yet")),
+        None => Err(explorer_unavailable("fees unavailable, try again shortly")),
     }
 }
 
@@ -2435,7 +2466,7 @@ async fn handle_chess_leaderboard(
     Query(params): Query<ChessLeaderboardQuery>,
 ) -> Result<Json<ChessLeaderboardResponse>, (StatusCode, Json<ApiError>)> {
     check_rate_limit(&app_state, addr).await?;
-    let (players, since, period) = chess_snapshot(&app_state).await.board(params.period.as_deref());
+    let (players, since, period) = chess_snapshot(&app_state).await.ok_or_else(board_unavailable)?.board(params.period.as_deref());
     let limit = params.limit.unwrap_or(100).clamp(1, 1000) as usize;
     Ok(Json(ChessLeaderboardResponse {
         players: players.into_iter().take(limit).collect(),
@@ -2452,7 +2483,7 @@ async fn handle_chess_bots_leaderboard(
     Query(params): Query<ChessLeaderboardQuery>,
 ) -> Result<Json<ChessBotLeaderboardResponse>, (StatusCode, Json<ApiError>)> {
     check_rate_limit(&app_state, addr).await?;
-    let (mut bots, since, period) = chess_bots_snapshot(&app_state).await.board(params.period.as_deref());
+    let (mut bots, since, period) = chess_bots_snapshot(&app_state).await.ok_or_else(board_unavailable)?.board(params.period.as_deref());
     let limit = params.limit.unwrap_or(100).clamp(1, 1000) as usize;
     for bot in &mut bots {
         bot.players.truncate(limit);
@@ -2480,7 +2511,7 @@ async fn handle_arcade_leaderboard(
     Query(params): Query<ArcadeLeaderboardQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     check_rate_limit(&app_state, addr).await?;
-    let snapshot = arcade_snapshot(&app_state).await;
+    let snapshot = arcade_snapshot(&app_state).await.ok_or_else(board_unavailable)?;
     let Some((board, game, period)) = snapshot.board(params.game.as_deref().unwrap_or(""), params.period.as_deref())
     else {
         return Err((
@@ -2522,7 +2553,7 @@ async fn handle_chess_player(
             ));
         }
     };
-    let (players, _, _) = chess_snapshot(&app_state).await.board(params.period.as_deref());
+    let (players, _, _) = chess_snapshot(&app_state).await.ok_or_else(board_unavailable)?.board(params.period.as_deref());
     let row = players
         .into_iter()
         .find(|r| r.address == address)
@@ -2549,7 +2580,7 @@ async fn handle_chess_tournaments(
     Query(params): Query<ChessTournamentsQuery>,
 ) -> Result<Json<ChessTournamentsResponse>, (StatusCode, Json<ApiError>)> {
     check_rate_limit(&app_state, addr).await?;
-    let mut tournaments = chess_snapshot(&app_state).await.tournaments;
+    let mut tournaments = chess_snapshot(&app_state).await.ok_or_else(board_unavailable)?.tournaments;
     if let Some(status) = params.status.as_deref() {
         let status = status.trim().to_lowercase();
         if !status.is_empty() {

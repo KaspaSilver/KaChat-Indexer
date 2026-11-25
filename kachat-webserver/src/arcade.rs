@@ -330,18 +330,44 @@ impl ArcadeSnapshot {
     }
 }
 
+/// One row's verdict: a stamp whose replay reaches its score. A stamp never changes, so the
+/// webserver keeps this per tx id and replays each row once.
+#[derive(Debug, Clone)]
+pub struct CheckedStamp {
+    game: &'static str,
+    g: String,
+    score: u64,
+    sender: String,
+    at: i64,
+}
+
+/// The expensive half: replay the row's stamp. `None` if it is not a checked stamp.
+pub fn check_row(row: &ArenaRow) -> Option<CheckedStamp> {
+    let (game, g, score) = check_stamp(&row.content)?;
+    Some(CheckedStamp { game, g, score, sender: row.sender.clone(), at: row.block_time })
+}
+
 /// Replay the room once. Only the first stamp per (sender, game id) counts, in chain order
 /// (block time, then txid), as for the chess bot games.
-pub fn compute(mut rows: Vec<ArenaRow>, now_ms: i64) -> ArcadeSnapshot {
-    rows.sort_by(|a, b| a.block_time.cmp(&b.block_time).then_with(|| a.tx_id.cmp(&b.tx_id)));
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+#[cfg(test)]
+pub fn compute(rows: Vec<ArenaRow>, now_ms: i64) -> ArcadeSnapshot {
+    let checked: Vec<(String, CheckedStamp)> =
+        rows.iter().filter_map(|row| check_row(row).map(|s| (row.tx_id.clone(), s))).collect();
+    snapshot(checked.iter().map(|(tx, s)| (tx.as_str(), s)), now_ms)
+}
+
+/// The cheap half: both games' boards for both periods from the checked stamps, as
+/// (tx id, stamp), in any order.
+pub fn snapshot<'a>(checked: impl Iterator<Item = (&'a str, &'a CheckedStamp)>, now_ms: i64) -> ArcadeSnapshot {
+    let mut checked: Vec<(&str, &CheckedStamp)> = checked.collect();
+    checked.sort_by(|a, b| a.1.at.cmp(&b.1.at).then_with(|| a.0.cmp(b.0)));
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
     let mut games: Vec<CheckedGame> = Vec::new();
-    for row in rows {
-        let Some((game, g, score)) = check_stamp(&row.content) else { continue };
-        if !seen.insert((row.sender.clone(), g)) {
+    for (tx, s) in checked {
+        if !seen.insert((s.sender.as_str(), s.g.as_str())) {
             continue;
         }
-        games.push(CheckedGame { game, address: row.sender, score, at: row.block_time, tx: row.tx_id });
+        games.push(CheckedGame { game: s.game, address: s.sender.clone(), score: s.score, at: s.at, tx: tx.to_string() });
     }
     let mut boards = HashMap::new();
     for (period, since) in [("all", period_since_ms(false, now_ms)), ("month", period_since_ms(true, now_ms))] {
@@ -496,5 +522,38 @@ mod tests {
         assert_eq!(snap.board("2048", Some("month")).unwrap().0.games, 0);
         let all = snap.board("2048", Some("all")).unwrap().0;
         assert_eq!(all.games, u64::from(period_since_ms(false, now) <= period_since_ms(true, now) - 1));
+    }
+
+    #[test]
+    fn rows_judged_in_batches_give_the_full_replays_boards() {
+        let g = |n: u8| format!("{:08x}-0000-4000-8000-{:012x}", n, n);
+        let now = 1_900_000_000_000;
+        let at = now - 1_000;
+        let good = stamp("2048", &g(1), "0000000000000001", 48, "LURDLURDLURD");
+        let rows = || {
+            vec![
+                // Alice's later copy arrives first; the earlier one (by block time) arrives late.
+                (2, ArenaRow { tx_id: "t2".into(), sender: "kaspa:alice".into(), block_time: at + 5, content: good.clone() }),
+                (3, ArenaRow { tx_id: "t3".into(), sender: "kaspa:bob".into(), block_time: at + 1, content: good.clone() }),
+                (4, ArenaRow { tx_id: "t4".into(), sender: "kaspa:carol".into(), block_time: at, content: "spam".into() }),
+                (5, ArenaRow { tx_id: "t1".into(), sender: "kaspa:alice".into(), block_time: at, content: good.clone() }),
+            ]
+        };
+        let full = compute(rows().into_iter().map(|(_, r)| r).collect(), now);
+        let mut memo = crate::snapshot::RowMemo::default();
+        let mut batches = rows();
+        let late = batches.split_off(3);
+        let fresh = memo.unseen(batches);
+        memo.judge(fresh, check_row);
+        // The second read overlaps the first.
+        let fresh = memo.unseen(rows().into_iter().skip(2).chain(late).collect());
+        memo.judge(fresh, check_row);
+        let incremental = snapshot(memo.counted(), now);
+        let players = |s: &ArcadeSnapshot| {
+            let b = s.board("2048", None).unwrap().0;
+            (b.games, b.players.iter().map(|p| (p.address.clone(), p.tx.clone())).collect::<Vec<_>>())
+        };
+        assert_eq!(players(&incremental), players(&full));
+        assert_eq!(players(&full).1, vec![("kaspa:alice".to_string(), "t1".to_string()), ("kaspa:bob".to_string(), "t3".to_string())]);
     }
 }

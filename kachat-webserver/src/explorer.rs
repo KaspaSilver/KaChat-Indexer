@@ -178,15 +178,20 @@ impl Counts {
     }
 }
 
-/// GET /stats/activity body for one period.
-pub async fn activity(pool: &sqlx::PgPool, chat: Option<ChatBuckets>, period: Period, now: i64) -> serde_json::Value {
+/// GET /stats/activity body for one period. A database error is an error, never a body with
+/// counts missing (the webserver serves its last good answer instead).
+pub async fn activity(
+    pool: &sqlx::PgPool,
+    chat: Option<ChatBuckets>,
+    period: Period,
+    now: i64,
+) -> Result<serde_json::Value, sqlx::Error> {
     let chat = chat.unwrap_or_default();
     // `all` starts at the oldest month anything was counted in.
     let earliest = if period == Period::All {
         let k_min: Option<i64> = sqlx::query_scalar(&format!("SELECT min(bt) FROM ({K_EVENTS}) e"))
             .fetch_one(pool)
-            .await
-            .unwrap_or(None);
+            .await?;
         let chat_min = chat.months.values().filter_map(|m| m.keys().next().copied()).min();
         k_min.into_iter().chain(chat_min).min()
     } else {
@@ -201,13 +206,8 @@ pub async fn activity(pool: &sqlx::PgPool, chat: Option<ChatBuckets>, period: Pe
         "SELECT c, (bt / {HOUR_MS}) * {HOUR_MS} AS h, count(*)::BIGINT n FROM ({K_EVENTS}) e \
          WHERE bt >= $1 AND bt < $2 GROUP BY 1, 2"
     );
-    match sqlx::query(&sql).bind(range_from).bind(layout.to).fetch_all(pool).await {
-        Ok(rows) => {
-            for r in rows {
-                counts.add(&layout, r.get::<String, _>("c").as_str(), r.get("h"), r.get("n"));
-            }
-        }
-        Err(e) => tracing::error!("activity query failed: {e}"),
+    for r in sqlx::query(&sql).bind(range_from).bind(layout.to).fetch_all(pool).await? {
+        counts.add(&layout, r.get::<String, _>("c").as_str(), r.get("h"), r.get("n"));
     }
     // Chats: hourly counts reach 60 days back, enough for a month and the month before it.
     let chat_counts = if period == Period::All { &chat.months } else { &chat.hours };
@@ -218,13 +218,12 @@ pub async fn activity(pool: &sqlx::PgPool, chat: Option<ChatBuckets>, period: Pe
     }
 
     let hour_from = layout.from.div_euclid(HOUR_MS) * HOUR_MS;
-    let active: Option<i64> =
+    let active: i64 =
         sqlx::query_scalar("SELECT count(DISTINCT sender)::BIGINT FROM kachat_k_senders WHERE hour >= $1 AND hour < $2")
             .bind(hour_from)
             .bind(layout.to)
             .fetch_one(pool)
-            .await
-            .ok();
+            .await?;
     let k_fees = sqlx::query(
         "SELECT COALESCE(sum(fees_sompi), 0)::BIGINT f, (SELECT min(hour) FROM kachat_k_hours) s \
          FROM kachat_k_hours WHERE hour >= $1 AND hour < $2",
@@ -232,8 +231,7 @@ pub async fn activity(pool: &sqlx::PgPool, chat: Option<ChatBuckets>, period: Pe
     .bind(hour_from)
     .bind(layout.to)
     .fetch_one(pool)
-    .await
-    .ok();
+    .await?;
 
     let mut out = serde_json::json!({
         "period": period.name(),
@@ -246,28 +244,25 @@ pub async fn activity(pool: &sqlx::PgPool, chat: Option<ChatBuckets>, period: Pe
         out["previous"] = serde_json::json!(counts.previous);
     }
     // Senders and fees exist from the first hour the trigger saw input amounts (`feesSince`).
-    if let Some(row) = k_fees
-        && let Ok(Some(since)) = row.try_get::<Option<i64>, _>("s")
-    {
-        out["feesSompi"] = serde_json::json!(row.get::<i64, _>("f"));
+    if let Ok(Some(since)) = k_fees.try_get::<Option<i64>, _>("s") {
+        out["feesSompi"] = serde_json::json!(k_fees.get::<i64, _>("f"));
         out["feesSince"] = serde_json::json!(since);
-        if let Some(active) = active {
-            out["activeAddresses"] = serde_json::json!(active);
-        }
+        out["activeAddresses"] = serde_json::json!(active);
     }
-    out
+    Ok(out)
 }
 
-/// GET /network/fees body for one period. None until the trigger has counted any fee.
-pub async fn network_fees(pool: &sqlx::PgPool, period: Period, now: i64) -> Option<serde_json::Value> {
+/// GET /network/fees body for one period. None until the trigger has counted any fee; a
+/// database error is an error.
+pub async fn network_fees(pool: &sqlx::PgPool, period: Period, now: i64) -> Result<Option<serde_json::Value>, sqlx::Error> {
     let rows = sqlx::query("SELECT hour, fees_sompi, transactions FROM kachat_fee_hours ORDER BY hour")
         .fetch_all(pool)
-        .await
-        .map_err(|e| tracing::error!("network fees query failed: {e}"))
-        .ok()?;
+        .await?;
     let hours: Vec<(i64, i64, i64)> =
         rows.iter().map(|r| (r.get("hour"), r.get("fees_sompi"), r.get("transactions"))).collect();
-    let since = hours.first()?.0;
+    let Some(since) = hours.first().map(|h| h.0) else {
+        return Ok(None);
+    };
     let layout = Layout::new(period, now, Some(since));
     let mut buckets: BTreeMap<i64, (i64, i64)> = layout.starts.iter().map(|&t| (t, (0, 0))).collect();
     for &(hour, fees, txs) in &hours {
@@ -290,7 +285,7 @@ pub async fn network_fees(pool: &sqlx::PgPool, period: Period, now: i64) -> Opti
     if txs_24h > 0 {
         out["averageFeeSompi24h"] = serde_json::json!(fees_24h / txs_24h);
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 #[cfg(test)]

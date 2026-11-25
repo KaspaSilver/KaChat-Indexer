@@ -9,6 +9,7 @@ mod models;
 mod names;
 mod names_api;
 mod scheduled;
+mod snapshot;
 mod translate;
 mod web_server;
 

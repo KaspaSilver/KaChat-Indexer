@@ -218,10 +218,24 @@ pub trait DatabaseInterface: Send + Sync {
     // (tx_id_hex, sender_address, block_time, content). The engine sorts internally.
     async fn get_chess_arena_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>>;
 
-    // Chess bot leaderboards: every chess-bots row (kept for good), in the same shape.
-    async fn get_chess_bots_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>>;
-    // KaPlay Arcade boards: every kplay-arcade row (kept for good), in the same shape.
-    async fn get_arcade_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>>;
+    // Chess bot and KaPlay Arcade boards, read incrementally (snapshot::RowMemo): up to `limit`
+    // rows of `channel` with an insertion id above `after_id`, as (id, row), by id.
+    async fn get_channel_rows_after(
+        &self,
+        channel: &str,
+        after_id: i64,
+        limit: i64,
+    ) -> DatabaseResult<Vec<(i64, crate::chess::ArenaRow)>>;
+    // How many rows `channel` holds with an id up to `up_to_id`, and every tx id (hex) it holds:
+    // to notice deleted or missed rows.
+    async fn count_channel_rows(&self, channel: &str, up_to_id: i64) -> DatabaseResult<i64>;
+    async fn get_channel_tx_ids(&self, channel: &str) -> DatabaseResult<Vec<String>>;
+    // The rows of `channel` with these tx ids (hex), as (id, row).
+    async fn get_channel_rows_by_tx(
+        &self,
+        channel: &str,
+        tx_ids: &[String],
+    ) -> DatabaseResult<Vec<(i64, crate::chess::ArenaRow)>>;
 
     // NEW: k_contents table - Get content by ID using unified content table
     async fn get_content_by_id(
