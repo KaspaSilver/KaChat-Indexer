@@ -3,7 +3,7 @@
 Current state and next steps, so a fresh session (any device, from a clone) can continue
 without the chat history. Last updated 2026-10-02 after `a2438df` on `KaspaSilver/KaChat-Indexer`.
 
-> **Open from the K iOS app (2026-11-25):** `ROOM_MESSAGE_DELETES.md` (a room message's sender
+> **From the K iOS app (2026-11-25), all done:** `ROOM_MESSAGE_DELETES.md` (done, 0816402: a room message's sender
 > deletes it for everyone: `{"type":"delete","targetTxId":...}` from the same sender removes the
 > message, its reactions and edits; no push for the delete). `RECEIVED_PUSH_COINBASE.md` (a miner gets one
 > `address_activity` push per merging block's coinbase for one block found: push coinbase on
@@ -14,7 +14,7 @@ without the chat history. Last updated 2026-10-02 after `a2438df` on `KaspaSilve
 > Also `REPORT_BUGS_ROOM.md` (track the new default room
 > `report-bugs`, which replaces `kachat-bugs` in K; add it to `broadcast_channels` in the panel now).
 
-> **Open from the K iOS app (2026-11-24):** `KPLAY_ARCADE_LEADERBOARD.md` (the arcade boards),
+> **From the K iOS app (2026-11-24), done:** `KPLAY_ARCADE_LEADERBOARD.md` (the arcade boards),
 > `ROOM_MENTION_PUSHES.md` (push for @mentions in rooms) and `K_NOTIFICATION_SWITCHES.md`
 > (`notify_sound`, `kaposts_notify_mentions`, `mutable-content` on `address_activity`). Each says
 > what to build; add a Status note with the commit when done.

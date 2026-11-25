@@ -1,5 +1,9 @@
 # Public chat rooms: a sender deletes their own message for everyone (2026-11-25)
 
+**Status:** done, commit 0816402 (transaction processor). Deletes are recorded in
+`kachat_room_deletes` and applied in either arrival order; the delete row stays in the room
+history; no push. The webserver needed no change. Live after the next kachat image rebuild.
+
 **For:** the indexer session: the transaction processor that writes room (broadcast) messages, the
 webserver's room history read, and room pushes (`notify_broadcast`).
 **From:** the K iOS session (`KaspaSilver/K-iPhone`; `MessageDeleteCodec` in Models.swift,
