@@ -1522,23 +1522,15 @@ impl KProtocolProcessor {
         }
 
         let block_time = transaction.block_time.unwrap_or(0);
-        let result = sqlx::query(
-            r#"
-            INSERT INTO kachat_broadcasts (
-                transaction_id, block_time, channel, sender_address, content
-            ) VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (transaction_id) DO NOTHING
-            "#,
-        )
-        .bind(&transaction_id_bytes)
-        .bind(block_time)
-        .bind(&channel)
-        .bind(&sender_address)
-        .bind(content)
-        .execute(&self.db_pool)
-        .await?;
+        let envelope = crate::push_notify::room_envelope_target(content);
+        let inserted = self
+            .store_room_message(&transaction_id_bytes, &channel, &sender_address, content, block_time, &envelope)
+            .await?;
+        let Some(inserted) = inserted else {
+            return Ok(BcastOutcome::Done);
+        };
 
-        if result.rows_affected() == 0 {
+        if !inserted {
             info!("Broadcast {} already exists, skipping", transaction_id);
         } else {
             info!(
@@ -1560,12 +1552,154 @@ impl KProtocolProcessor {
             if !stale
                 && !crate::push_notify::is_reaction_content(content)
                 && !crate::push_notify::is_edit_content(content)
+                && !matches!(&envelope, Some((kind, _)) if kind == "delete")
                 && crate::push_notify::rings_as_media_part(&channel, &sender_address, content)
             {
                 crate::push_notify::notify_broadcast(&channel, &sender_address, content, transaction_id);
             }
         }
         Ok(BcastOutcome::Done)
+    }
+
+    /// Store a room message whose sender is verified. Sender deletes (ROOM_MESSAGE_DELETES.md):
+    /// a message its sender already deleted is not stored (the delete came first), nor is a
+    /// reaction or edit on a deleted message; a delete is stored like any room message (other
+    /// clients drop their cached copy), then recorded and applied, again on a repeat. None = not
+    /// stored; Some(false) = already stored.
+    async fn store_room_message(
+        &self,
+        tx: &[u8],
+        channel: &str,
+        sender: &str,
+        content: &str,
+        block_time: i64,
+        envelope: &Option<(String, String)>,
+    ) -> Result<Option<bool>> {
+        if self.room_delete_waiting(tx, channel, sender).await? {
+            info!("Broadcast {} on #{} not stored: its sender deleted it", hex::encode(tx), channel);
+            return Ok(None);
+        }
+        if let Some((kind, target)) = envelope {
+            if kind != "delete" && self.room_message_deleted(target, channel).await? {
+                debug!("Broadcast {} not stored: a {} on deleted message {}", hex::encode(tx), kind, target);
+                return Ok(None);
+            }
+        }
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO kachat_broadcasts (
+                transaction_id, block_time, channel, sender_address, content
+            ) VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (transaction_id) DO NOTHING
+            "#,
+        )
+        .bind(tx)
+        .bind(block_time)
+        .bind(channel)
+        .bind(sender)
+        .bind(content)
+        .execute(&self.db_pool)
+        .await?
+        .rows_affected()
+            > 0;
+        if let Some((kind, target)) = envelope {
+            if kind == "delete" {
+                self.apply_room_delete(tx, target, channel, sender, block_time).await?;
+            }
+        }
+        Ok(Some(inserted))
+    }
+
+    /// Record a sender delete and apply it: remove the target if it is stored in this room from
+    /// the same sender, with the reactions and edits on it. A target not stored yet is removed
+    /// when it arrives (`room_delete_waiting`); one from another sender or room is left alone.
+    async fn apply_room_delete(
+        &self,
+        delete_tx: &[u8],
+        target_hex: &str,
+        channel: &str,
+        sender: &str,
+        block_time: i64,
+    ) -> Result<()> {
+        let Ok(target) = hex::decode(target_hex) else { return Ok(()) };
+        sqlx::query(
+            "INSERT INTO kachat_room_deletes (transaction_id, target_tx, channel, sender_address, block_time) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (transaction_id) DO NOTHING",
+        )
+        .bind(delete_tx)
+        .bind(&target)
+        .bind(channel)
+        .bind(sender)
+        .bind(block_time)
+        .execute(&self.db_pool)
+        .await?;
+        let removed = sqlx::query(
+            "DELETE FROM kachat_broadcasts WHERE transaction_id = $1 AND channel = $2 AND sender_address = $3",
+        )
+        .bind(&target)
+        .bind(channel)
+        .bind(sender)
+        .execute(&self.db_pool)
+        .await?
+        .rows_affected();
+        if removed > 0 {
+            self.finish_room_delete(&target, target_hex, channel).await?;
+            info!("Room message {} on #{} deleted by its sender", target_hex, channel);
+        }
+        Ok(())
+    }
+
+    /// Whether this room message's sender already deleted it (the delete arrived first). If so,
+    /// the delete is applied now.
+    async fn room_delete_waiting(&self, tx: &[u8], channel: &str, sender: &str) -> Result<bool> {
+        let waiting = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM kachat_room_deletes WHERE target_tx = $1 AND channel = $2 AND sender_address = $3",
+        )
+        .bind(tx)
+        .bind(channel)
+        .bind(sender)
+        .fetch_one(&self.db_pool)
+        .await?
+            > 0;
+        if waiting {
+            self.finish_room_delete(tx, &hex::encode(tx), channel).await?;
+        }
+        Ok(waiting)
+    }
+
+    /// Whether a room message was deleted by its sender.
+    async fn room_message_deleted(&self, target_hex: &str, channel: &str) -> Result<bool> {
+        let Ok(target) = hex::decode(target_hex) else { return Ok(false) };
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM kachat_room_deletes WHERE target_tx = $1 AND channel = $2 AND applied",
+        )
+        .bind(&target)
+        .bind(channel)
+        .fetch_one(&self.db_pool)
+        .await?
+            > 0)
+    }
+
+    /// Mark a deleted message's delete applied and remove the reactions and edits on it.
+    async fn finish_room_delete(&self, target: &[u8], target_hex: &str, channel: &str) -> Result<()> {
+        sqlx::query("UPDATE kachat_room_deletes SET applied = true WHERE target_tx = $1 AND channel = $2")
+            .bind(target)
+            .bind(channel)
+            .execute(&self.db_pool)
+            .await?;
+        // The LIKE narrows to rows naming the target; the JSON check confirms. pg_input_is_valid
+        // keeps a plain-text row from failing the cast.
+        sqlx::query(
+            "DELETE FROM kachat_broadcasts WHERE channel = $1 AND content ILIKE '%' || $2 || '%' \
+             AND CASE WHEN pg_input_is_valid(content, 'jsonb') \
+                 THEN content::jsonb->>'type' IN ('reaction', 'edit') AND lower(content::jsonb->>'targetTxId') = $2 \
+                 ELSE false END",
+        )
+        .bind(channel)
+        .bind(target_hex)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(())
     }
 
     /// KaPosts push helper: resolve the author (compressed pubkey hex) of an indexed content id.
@@ -4457,5 +4591,98 @@ mod key_form_tests {
         for kind in ["post", "reply", "vote", "quote", "follow", "block", "broadcast", "tip", "poll", "pollvote"] {
             assert!(!OTHER_SERVICES_ACTIONS.contains(&kind), "{kind}");
         }
+    }
+}
+
+/// ROOM_MESSAGE_DELETES.md against a real Postgres: `KACHAT_TEST_DB=postgres://… cargo test
+/// room_deletes -- --ignored`. Uses its own tables in a fresh schema.
+#[cfg(test)]
+mod room_delete_tests {
+    use super::*;
+
+    const ROOM: &str = "kaspa";
+
+    fn id(n: u8) -> Vec<u8> {
+        vec![n; 32]
+    }
+
+    fn hexid(n: u8) -> String {
+        hex::encode(id(n))
+    }
+
+    async fn store(p: &KProtocolProcessor, n: u8, room: &str, sender: &str, content: &str) -> Option<bool> {
+        let envelope = crate::push_notify::room_envelope_target(content);
+        p.store_room_message(&id(n), room, sender, content, n as i64, &envelope).await.unwrap()
+    }
+
+    async fn stored(p: &KProtocolProcessor) -> Vec<u8> {
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar("SELECT transaction_id FROM kachat_broadcasts ORDER BY id")
+            .fetch_all(&p.db_pool)
+            .await
+            .unwrap();
+        rows.into_iter().map(|t| t[0]).collect()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn room_deletes() {
+        let url = std::env::var("KACHAT_TEST_DB").expect("KACHAT_TEST_DB");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO room_delete_test").execute(conn).await.map(|_| ())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        for sql in [
+            "DROP SCHEMA IF EXISTS room_delete_test CASCADE",
+            "CREATE SCHEMA room_delete_test",
+            "CREATE TABLE kachat_broadcasts (id BIGSERIAL PRIMARY KEY, transaction_id BYTEA UNIQUE NOT NULL, \
+             block_time BIGINT NOT NULL, channel VARCHAR(36) NOT NULL, sender_address TEXT NOT NULL, content TEXT NOT NULL)",
+            "CREATE TABLE kachat_room_deletes (transaction_id BYTEA PRIMARY KEY, target_tx BYTEA NOT NULL, \
+             channel VARCHAR(36) NOT NULL, sender_address TEXT NOT NULL, block_time BIGINT NOT NULL, \
+             applied BOOLEAN NOT NULL DEFAULT false)",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let p = KProtocolProcessor::new(pool);
+        let del = |n: u8| format!(r#"{{"type":"delete","targetTxId":"{}"}}"#, hexid(n));
+        let react = |n: u8| format!(r#"{{"emoji":"👍","type":"reaction","targetTxId":"{}","action":"add"}}"#, hexid(n));
+        let edit = |n: u8| format!(r#"{{"targetTxId":"{}","text":"fixed","type":"edit"}}"#, hexid(n));
+
+        // Target first: the delete removes it, its reactions (in any case) and edits; the delete
+        // row stays; a later reaction on it is not stored. A plain message naming the id stays.
+        assert_eq!(store(&p, 1, ROOM, "alice", "hello").await, Some(true));
+        store(&p, 2, ROOM, "bob", &react(1).replace(&hexid(1), &hexid(1).to_uppercase())).await;
+        store(&p, 3, ROOM, "alice", &edit(1)).await;
+        store(&p, 4, ROOM, "carol", &format!("see {}", hexid(1))).await;
+        assert_eq!(stored(&p).await, [1, 2, 3, 4]);
+        assert_eq!(store(&p, 5, ROOM, "alice", &del(1)).await, Some(true));
+        assert_eq!(stored(&p).await, [4, 5]);
+        assert_eq!(store(&p, 6, ROOM, "bob", &react(1)).await, None);
+        // A repeat of the delete changes nothing.
+        assert_eq!(store(&p, 5, ROOM, "alice", &del(1)).await, Some(false));
+
+        // Delete first: kept, then the target is not stored and a reaction that came between
+        // them is removed.
+        store(&p, 7, ROOM, "alice", &del(8)).await;
+        store(&p, 9, ROOM, "bob", &react(8)).await;
+        assert_eq!(stored(&p).await, [4, 5, 7, 9]);
+        assert_eq!(store(&p, 8, ROOM, "alice", "secret").await, None);
+        assert_eq!(stored(&p).await, [4, 5, 7]);
+
+        // Another sender's delete, or one sent in another room, removes nothing: before the
+        // target or after it.
+        store(&p, 10, ROOM, "alice", "mine").await;
+        store(&p, 11, ROOM, "mallory", &del(10)).await;
+        store(&p, 12, "other-room", "alice", &del(10)).await;
+        store(&p, 13, ROOM, "mallory", &del(14)).await;
+        assert_eq!(store(&p, 14, ROOM, "alice", "also mine").await, Some(true));
+        assert_eq!(stored(&p).await, [4, 5, 7, 10, 11, 12, 13, 14]);
+        // ...and a reaction on that message is still stored.
+        assert_eq!(store(&p, 15, ROOM, "bob", &react(10)).await, Some(true));
     }
 }

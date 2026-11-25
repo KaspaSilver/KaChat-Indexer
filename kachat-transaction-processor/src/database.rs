@@ -438,6 +438,26 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        // ROOM_MESSAGE_DELETES.md: every sender delete seen (`{"type":"delete","targetTxId":…}`),
+        // so one that arrives before its target still removes it. `applied` = the target, from
+        // the same sender in the same room, was found and removed.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_room_deletes (
+                transaction_id BYTEA PRIMARY KEY,
+                target_tx BYTEA NOT NULL,
+                channel VARCHAR(36) NOT NULL,
+                sender_address TEXT NOT NULL,
+                block_time BIGINT NOT NULL,
+                applied BOOLEAN NOT NULL DEFAULT false
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_room_deletes_target ON kachat_room_deletes(target_tx)")
+            .execute(&self.pool)
+            .await?;
         // kachat-audits IDX-020: broadcasts whose sender could not be resolved yet (node down,
         // tx not accepted yet), retried by bcast_pending.rs. Carries the payload and block hash
         // so a retry does not depend on the 1 h `transactions` retention. Times in ms.

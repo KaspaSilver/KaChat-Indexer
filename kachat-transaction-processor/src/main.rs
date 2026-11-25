@@ -362,6 +362,11 @@ async fn main() -> Result<()> {
             // Recovered transactions (reindex.rs): a week after a worker consumed them. One never
             // consumed (it keeps failing) goes after 30 days, so the table can't grow for ever;
             // until then every start queues it again (IDX-038).
+            // Sender deletes: kept as long as the room messages they could remove.
+            let _ = sqlx::query("DELETE FROM kachat_room_deletes WHERE block_time < $1")
+                .bind(cutoff)
+                .execute(&prune_pool)
+                .await;
             let _ = sqlx::query(
                 "DELETE FROM kachat_recovered_transactions \
                  WHERE (consumed_at IS NOT NULL AND inserted_at < $1) OR inserted_at < $2",

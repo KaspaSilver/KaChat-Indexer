@@ -379,6 +379,20 @@ pub fn is_edit_content(content: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A room envelope that points at an earlier message (ROOM_MESSAGE_DELETES.md): its `type`
+/// (`delete`, `reaction` or `edit`) and its `targetTxId`, lowercase. None for anything else,
+/// or a target that is not a 64-hex tx id.
+pub fn room_envelope_target(content: &str) -> Option<(String, String)> {
+    let v = serde_json::from_str::<serde_json::Value>(content.trim()).ok()?;
+    let kind = v.get("type")?.as_str()?;
+    if !matches!(kind, "delete" | "reaction" | "edit") {
+        return None;
+    }
+    let target = v.get("targetTxId")?.as_str()?;
+    (target.len() == 64 && target.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| (kind.to_string(), target.to_ascii_lowercase()))
+}
+
 /// The note or photo a Public Chats media part belongs to: its kind (`voice` or `photo`), its
 /// lowercased id and its `count`, or None for anything that isn't a well-formed part (a plain
 /// voice message or photo pushes as before). KaChat's long voice notes and large photos go out as
@@ -957,5 +971,19 @@ mod tests {
         assert!(!is_edit_content(reaction));
         assert!(!is_reaction_content(edit));
         assert!(!is_reaction_content("gm") && !is_edit_content("gm"));
+    }
+
+    #[test]
+    fn room_envelopes_name_their_target() {
+        let id = "AB".repeat(32);
+        let lower = id.to_ascii_lowercase();
+        let delete = format!(r#"{{"type":"delete","targetTxId":"{id}"}}"#);
+        assert_eq!(room_envelope_target(&delete), Some(("delete".into(), lower.clone())));
+        let reaction = format!(r#"{{"emoji":"👍","type":"reaction","targetTxId":"{lower}","action":"add"}}"#);
+        assert_eq!(room_envelope_target(&reaction), Some(("reaction".into(), lower.clone())));
+        // Not a tx id, another type, or not JSON: no target.
+        assert_eq!(room_envelope_target(r#"{"type":"delete","targetTxId":"abc"}"#), None);
+        assert_eq!(room_envelope_target(&format!(r#"{{"type":"reply","replyToId":"{lower}"}}"#)), None);
+        assert_eq!(room_envelope_target(&format!("delete {lower}")), None);
     }
 }
