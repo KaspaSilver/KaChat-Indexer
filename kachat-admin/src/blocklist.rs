@@ -23,7 +23,7 @@ const MAX_NOTE_CHARS: usize = 200;
 const GAME_CHANNELS: [&str; 3] = ["chess-arena", "chess-bots", "kplay-arcade"];
 
 /// The canonical form of `input` when it is an address of this indexer's network.
-fn parse_address(input: &str, testnet: bool) -> Result<kaspa_addresses::Address, ApiError> {
+pub(crate) fn parse_address(input: &str, testnet: bool) -> Result<kaspa_addresses::Address, ApiError> {
     let addr = kaspa_addresses::Address::try_from(input.trim().to_ascii_lowercase())
         .map_err(|_| ApiError::bad_request("Not a valid Kaspa address"))?;
     let want = if testnet { kaspa_addresses::Prefix::Testnet } else { kaspa_addresses::Prefix::Mainnet };
@@ -181,14 +181,12 @@ pub async fn post_blocklist_add(
     Ok(Json(AddResult { address, purged, total, warning }))
 }
 
-/// Everything in Postgres sent from the address, in one statement (all or nothing): KaPosts by
-/// its key, room messages and game stamps by address, its profile.
-async fn purge_postgres(pool: &PgPool, address: &str, xonly: Option<Vec<u8>>) -> Result<Purged, sqlx::Error> {
+/// The purge statement: $1 = x-only key, $2 = address, $3 = the game channels.
+fn purge_sql() -> String {
     // `kx(col)`: the key in any of its three valid forms (`02x`, `03x`, bare `x`), as an `IN`
     // list so each table's sender index can be used.
     let kx = |col: &str| format!("{col} IN ('\\x02'::bytea || $1, '\\x03'::bytea || $1, $1)");
     let kaposts_tables = [
-        ("k_contents", "sender_pubkey"),
         ("k_mentions", "sender_pubkey"),
         ("k_votes", "sender_pubkey"),
         ("k_blocks", "sender_pubkey"),
@@ -207,9 +205,14 @@ async fn purge_postgres(pool: &PgPool, address: &str, xonly: Option<Vec<u8>>) ->
         .enumerate()
         .map(|(i, (table, col))| format!("d{i} AS (DELETE FROM {table} WHERE {} RETURNING 1)", kx(col)))
         .collect();
-    let counts: Vec<String> = (0..kaposts_tables.len()).map(|i| format!("(SELECT COUNT(*) FROM d{i})")).collect();
-    let sql = format!(
-        "WITH {}, \
+    let mut counts: Vec<String> = (0..kaposts_tables.len()).map(|i| format!("(SELECT COUNT(*) FROM d{i})")).collect();
+    counts.extend(["contents", "polls", "translations"].map(|cte| format!("(SELECT COUNT(*) FROM {cte})")));
+    // The posts' polls and cached translations are keyed by the posts' transaction ids, so
+    // they go with them.
+    format!(
+        "WITH contents AS (DELETE FROM k_contents WHERE {} RETURNING transaction_id), {}, \
+         polls AS (DELETE FROM k_polls WHERE post_id IN (SELECT transaction_id FROM contents) RETURNING 1), \
+         translations AS (DELETE FROM post_translations WHERE post_id IN (SELECT transaction_id FROM contents) RETURNING 1), \
          rooms AS (DELETE FROM kachat_broadcasts WHERE sender_address = $2 RETURNING channel), \
          saves AS (DELETE FROM profile_saves WHERE address = $2 RETURNING 1), \
          profiles AS (DELETE FROM names_profiles WHERE address = $2 RETURNING 1) \
@@ -217,11 +220,18 @@ async fn purge_postgres(pool: &PgPool, address: &str, xonly: Option<Vec<u8>>) ->
                 (SELECT COUNT(*) FROM rooms WHERE channel <> ALL($3)) AS public_chats, \
                 (SELECT COUNT(*) FROM rooms WHERE channel = ANY($3)) AS games, \
                 (SELECT COUNT(*) FROM saves) + (SELECT COUNT(*) FROM profiles) AS profiles",
+        kx("sender_pubkey"),
         deletes.join(", "),
         counts.join(" + "),
-    );
+    )
+}
+
+/// Everything in Postgres sent from the address, in one statement (all or nothing): KaPosts by
+/// its key (with its posts' polls and translations), room messages and game stamps by address,
+/// its profile.
+async fn purge_postgres(pool: &PgPool, address: &str, xonly: Option<Vec<u8>>) -> Result<Purged, sqlx::Error> {
     // An address with no x-only key (a script address) has no KaPosts: match nothing.
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(&purge_sql())
         .bind(xonly.unwrap_or_default())
         .bind(address)
         .bind(GAME_CHANNELS.iter().map(|c| c.to_string()).collect::<Vec<_>>())
@@ -305,5 +315,24 @@ mod tests {
         assert!(parse_address("kaspa:nope", false).is_err());
         // A Schnorr address carries its x-only key.
         assert_eq!(xonly_key(&addr).map(|k| k.len()), Some(32));
+    }
+
+    #[test]
+    fn the_purge_takes_the_posts_polls_and_translations() {
+        let sql = purge_sql();
+        assert!(sql.starts_with("WITH contents AS (DELETE FROM k_contents WHERE "));
+        assert!(sql.contains("RETURNING transaction_id)"));
+        assert!(sql.contains("DELETE FROM k_polls WHERE post_id IN (SELECT transaction_id FROM contents)"));
+        assert!(sql.contains("DELETE FROM post_translations WHERE post_id IN (SELECT transaction_id FROM contents)"));
+        // Both count as KaPosts, with every other KaPosts table.
+        let kaposts = &sql[sql.find("SELECT (SELECT COUNT(*)").unwrap()..sql.find(" AS kaposts").unwrap()];
+        for cte in ["contents", "polls", "translations", "d0", "d10"] {
+            assert!(kaposts.contains(&format!("FROM {cte})")), "{cte} is counted");
+        }
+        // Parameterised: only $1..$3, and k_contents is no longer one of the d-tables.
+        assert!(!sql.contains("$4"));
+        assert!(sql.contains("d10 AS (DELETE FROM k_scheduled_posts"));
+        assert!(!sql.contains("d11 AS"));
+        assert_eq!(sql.matches("DELETE FROM k_contents").count(), 1);
     }
 }

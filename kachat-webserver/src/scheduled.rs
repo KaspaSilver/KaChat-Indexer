@@ -270,7 +270,7 @@ fn node() -> Option<&'static KaspaRpcClient> {
 
 /// Address prefix from `NETWORK` (`mainnet` | `testnet-10` | …), as the processor and names
 /// follower read it; unset means mainnet.
-fn network_prefix() -> Prefix {
+pub(crate) fn network_prefix() -> Prefix {
     prefix_for(&std::env::var("NETWORK").unwrap_or_default())
 }
 

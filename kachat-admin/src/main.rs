@@ -27,6 +27,11 @@ use tracing::{error, info};
 
 mod blocklist;
 
+/// Moderation tombstones, shared with the processor: a transaction id here is never stored
+/// again. Written by the admin deletes below, in the same statement as each delete.
+const CREATE_REMOVED_TXS: &str = "CREATE TABLE IF NOT EXISTS kachat_removed_txs (\
+     transaction_id BYTEA PRIMARY KEY, removed_at BIGINT NOT NULL DEFAULT 0)";
+
 #[derive(Parser, Debug)]
 #[command(name = "kachat-admin", about = "Ops/admin dashboard for the KaChat indexer")]
 struct Args {
@@ -189,6 +194,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .execute(&pool)
     .await;
+
+    // Moderation tombstones: every post and room message deleted here, by transaction id, so
+    // the processor never stores it again (a reindex, a late copy of the tx).
+    let _ = sqlx::query(CREATE_REMOVED_TXS).execute(&pool).await;
 
     // The address blocklist (the processor creates it too), and the chat indexer's copy of it.
     let _ = sqlx::query(blocklist::CREATE_TABLE).execute(&pool).await;
@@ -872,14 +881,20 @@ async fn post_remove(
         )
     } else {
         // Execute: atomic delete of every row authored by this pubkey (k_hashtags cascade
-        // from k_contents via FK). Mirrors kachat-content-remover's execute_removal.
+        // from k_contents via FK). Mirrors kachat-content-remover's execute_removal. The
+        // deleted posts are tombstoned ($2 = removed_at) so the processor never re-stores them.
         let row = sqlx::query(
             r#"
             WITH deleted_mentions AS (
                 DELETE FROM k_mentions WHERE sender_pubkey = $1 RETURNING id
             ),
             deleted_contents AS (
-                DELETE FROM k_contents WHERE sender_pubkey = $1 RETURNING id
+                DELETE FROM k_contents WHERE sender_pubkey = $1 RETURNING id, transaction_id
+            ),
+            tombstones AS (
+                INSERT INTO kachat_removed_txs (transaction_id, removed_at)
+                SELECT transaction_id, $2 FROM deleted_contents
+                ON CONFLICT (transaction_id) DO NOTHING
             ),
             deleted_votes AS (
                 DELETE FROM k_votes WHERE sender_pubkey = $1 RETURNING id
@@ -903,6 +918,7 @@ async fn post_remove(
             "#,
         )
         .bind(&pubkey_bytes)
+        .bind(now_ms())
         .fetch_one(&state.pool)
         .await
         .map_err(ApiError::db)?;
@@ -986,7 +1002,6 @@ async fn post_chat_import(
 ) -> Json<ChatImportResponse> {
     // "ciph_msg:" as hex — the on-chain prefix for all Kasia messaging payloads.
     const CIPH_PREFIX: &str = "636970685f6d73673a";
-    let address = req.address.trim().to_string();
     let mut resp = ChatImportResponse {
         scanned: 0,
         forwarded: 0,
@@ -995,11 +1010,15 @@ async fn post_chat_import(
         pages: 0,
         error: None,
     };
-    let prefix = if is_testnet() { "kaspatest:" } else { "kaspa:" };
-    if !address.starts_with(prefix) {
-        resp.error = Some(format!("address must start with {prefix} on this network"));
-        return Json(resp);
-    }
+    // A checked address of this network, in its canonical form: it goes into the explorer's
+    // URL path.
+    let address = match blocklist::parse_address(&req.address, is_testnet()) {
+        Ok(addr) => addr.to_string(),
+        Err(e) => {
+            resp.error = Some(e.message);
+            return Json(resp);
+        }
+    };
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -1413,26 +1432,32 @@ fn supervisorctl(action: &str, program: &str) -> Result<String, String> {
         .map_err(|e| format!("supervisorctl spawn failed: {e}"))?;
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
-    // `status` exits 3 for a stopped program, which is an answer, not a failure; so is starting
-    // what already runs or stopping what is already stopped.
-    let already = (action == "start" && s.contains("already started"))
-        || (action == "stop" && s.contains("not running"));
-    if out.status.success() || already || (action == "status" && out.status.code() == Some(3)) {
+    if out.status.success() || supervisor_answered(action, out.status.code(), &s) {
         Ok(s)
     } else {
         Err(format!("supervisorctl {action} {program} failed: {}", s.trim()))
     }
 }
 
-/// Runs a supervisorctl action off the async runtime, as an API error when it fails.
-async fn supervise(action: &'static str, program: &'static str) -> Result<(), ApiError> {
+/// A non-zero supervisorctl exit that is an answer, not a failure: `status` exits 3 for a
+/// stopped program; starting what already runs, stopping what is already stopped, and
+/// restarting a stopped program (`ERROR (not running)`, then it starts it) all did the job.
+fn supervisor_answered(action: &str, code: Option<i32>, output: &str) -> bool {
+    match action {
+        "status" => code == Some(3),
+        "start" => output.contains("already started"),
+        "stop" => output.contains("not running"),
+        "restart" => output.contains("not running") && output.contains("started"),
+        _ => false,
+    }
+}
+
+/// Runs a supervisorctl action off the async runtime; the error is the message to show.
+async fn supervise(action: &'static str, program: &'static str) -> Result<(), String> {
     let result = tokio::task::spawn_blocking(move || supervisorctl(action, program))
         .await
-        .map_err(|e| ApiError::server(&format!("supervisorctl task: {e}")))?;
-    result.map(|_| ()).map_err(|e| {
-        error!("kachat-admin: {e}");
-        ApiError::server(&format!("settings saved, but {e}"))
-    })
+        .map_err(|e| format!("supervisorctl task: {e}"))?;
+    result.map(|_| ()).inspect_err(|e| error!("kachat-admin: {e}"))
 }
 
 /// Is the chat indexer process currently running under supervisord?
@@ -1495,6 +1520,9 @@ struct SettingsResponse {
     broadcast_channels: String,
     // The defaults, offered as suggestions in the UI.
     available_broadcast_channels: Vec<String>,
+    /// After a save: what could not be applied (the chat indexer's supervisorctl action).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 /// Read the personal-mode allowlist file (one address per line) into a newline-joined string.
@@ -1537,6 +1565,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         kaposts_operator_address: kaposts_op,
         broadcast_channels,
         available_broadcast_channels: DEFAULT_BROADCAST_CHANNELS.iter().map(|s| s.to_string()).collect(),
+        warning: None,
     })
 }
 
@@ -1617,10 +1646,6 @@ async fn post_settings(
         restart_chat = true;
         info!("kachat-admin set {} personal group id(s)", normalized.len());
     }
-    if restart_chat {
-        supervise("restart", "chat").await?;
-        info!("kachat-admin restarted chat indexer to reload personal-mode allowlist(s)");
-    }
     if let Some(raw) = &req.kaposts_operator_address {
         // Store your kaspa address(es); the processor decodes each to an x-only pubkey and
         // watches the chain for your `k:1:block`/`unblock` actions. Empty = personal mode off.
@@ -1650,13 +1675,33 @@ async fn post_settings(
             .map_err(ApiError::db)?;
         info!("kachat-admin set {} tracked broadcast channel(s)", channels.len());
     }
-    if let Some(b) = req.chat_indexer {
-        // Start/stop the whole vendored chat indexer (1:1 + group + payments + handshakes).
-        let action = if b { "start" } else { "stop" };
-        supervise(action, "chat").await?;
-        info!("kachat-admin {} chat indexer via supervisorctl", action);
+    // Every field is written; now the chat process. A failure here is a warning in the answer,
+    // not an error: the settings above are saved either way.
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(action) = chat_action(req.chat_indexer, restart_chat) {
+        match supervise(action, "chat").await {
+            Ok(()) => info!("kachat-admin ran supervisorctl {action} chat"),
+            Err(e) => warnings.push(e),
+        }
     }
-    Ok(get_settings(State(state)).await)
+    let Json(mut settings) = get_settings(State(state)).await;
+    if !warnings.is_empty() {
+        settings.warning = Some(format!("settings saved, but {}", warnings.join("; ")));
+    }
+    Ok(Json(settings))
+}
+
+/// The one supervisorctl action a settings save needs for the chat indexer: start/stop the
+/// whole vendored indexer (1:1 + group + payments + handshakes) when asked, and a restart when
+/// a personal-mode allowlist changed so it reloads it (once, even if both were saved). A stop
+/// wins over the reload; a start that also needs a reload is a restart.
+fn chat_action(chat_indexer: Option<bool>, reload: bool) -> Option<&'static str> {
+    match (chat_indexer, reload) {
+        (Some(false), _) => Some("stop"),
+        (_, true) => Some("restart"),
+        (Some(true), false) => Some("start"),
+        (None, false) => None,
+    }
 }
 
 /// POST /api/chat/purge — proxy the chat indexer's personal-mode store wipe.
@@ -1762,27 +1807,47 @@ async fn post_broadcast_delete(
     State(state): State<AppState>,
     Json(req): Json<BroadcastDelete>,
 ) -> Result<Json<DeleteResult>, ApiError> {
+    // Every deleted row is tombstoned, a whole channel or everything included.
     let res = if req.all {
-        sqlx::query("DELETE FROM kachat_broadcasts")
-            .execute(&state.pool)
+        sqlx::query_scalar::<_, i64>(&tombstoned_delete("DELETE FROM kachat_broadcasts RETURNING transaction_id"))
+            .bind(now_ms())
+            .fetch_one(&state.pool)
             .await
     } else if let Some(ch) = req.channel.as_ref().map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty()) {
-        sqlx::query("DELETE FROM kachat_broadcasts WHERE channel = $1")
-            .bind(ch)
-            .execute(&state.pool)
-            .await
+        sqlx::query_scalar::<_, i64>(&tombstoned_delete(
+            "DELETE FROM kachat_broadcasts WHERE channel = $2 RETURNING transaction_id",
+        ))
+        .bind(now_ms())
+        .bind(ch)
+        .fetch_one(&state.pool)
+        .await
     } else if let Some(tx) = req.tx_id.as_ref().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()) {
         let bytes = hex::decode(&tx).map_err(|_| ApiError::bad_request("Invalid tx id hex"))?;
-        sqlx::query("DELETE FROM kachat_broadcasts WHERE transaction_id = $1")
-            .bind(bytes)
-            .execute(&state.pool)
-            .await
+        sqlx::query_scalar::<_, i64>(&tombstoned_delete(
+            "DELETE FROM kachat_broadcasts WHERE transaction_id = $2 RETURNING transaction_id",
+        ))
+        .bind(now_ms())
+        .bind(bytes)
+        .fetch_one(&state.pool)
+        .await
     } else {
         return Err(ApiError::bad_request("Specify tx_id, channel, or all=true"));
     };
-    let deleted = res.map_err(ApiError::db)?.rows_affected();
+    let deleted = res.map_err(ApiError::db)?.max(0) as u64;
     info!("kachat-admin deleted {} broadcast row(s)", deleted);
     Ok(Json(DeleteResult { deleted }))
+}
+
+/// One statement that runs `delete` (a DELETE … RETURNING transaction_id whose own parameters
+/// start at $2), tombstones every transaction id it removed in `kachat_removed_txs` with
+/// `removed_at` = $1, and answers the number of rows deleted.
+fn tombstoned_delete(delete: &str) -> String {
+    format!(
+        "WITH gone AS ({delete}), \
+         tombstones AS (INSERT INTO kachat_removed_txs (transaction_id, removed_at) \
+           SELECT transaction_id, $1 FROM gone ON CONFLICT (transaction_id) DO NOTHING) \
+         SELECT COUNT(*) FROM gone"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,13 +1866,17 @@ async fn post_content_delete(
     let tx = req.tx_id.trim().to_lowercase();
     let bytes = hex::decode(&tx).map_err(|_| ApiError::bad_request("Invalid tx id hex"))?;
     // k_hashtags cascade from k_contents via FK; votes/replies referencing this post remain
-    // (their live counts simply no longer resolve to a stored parent).
-    let deleted = sqlx::query("DELETE FROM k_contents WHERE transaction_id = $1")
-        .bind(bytes)
-        .execute(&state.pool)
-        .await
-        .map_err(ApiError::db)?
-        .rows_affected();
+    // (their live counts simply no longer resolve to a stored parent). Tombstoned, so the
+    // processor never stores it again.
+    let deleted = sqlx::query_scalar::<_, i64>(&tombstoned_delete(
+        "DELETE FROM k_contents WHERE transaction_id = $2 RETURNING transaction_id",
+    ))
+    .bind(now_ms())
+    .bind(bytes)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::db)?
+    .max(0) as u64;
     info!("kachat-admin deleted {} content row(s) for tx {}", deleted, tx);
     Ok(Json(DeleteResult { deleted }))
 }
@@ -1906,5 +1975,41 @@ impl ApiError {
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::{chat_action, supervisor_answered, tombstoned_delete};
+
+    #[test]
+    fn a_save_runs_one_chat_action() {
+        assert_eq!(chat_action(None, false), None);
+        assert_eq!(chat_action(None, true), Some("restart"));
+        assert_eq!(chat_action(Some(true), false), Some("start"));
+        assert_eq!(chat_action(Some(true), true), Some("restart"));
+        assert_eq!(chat_action(Some(false), true), Some("stop"));
+        assert_eq!(chat_action(Some(false), false), Some("stop"));
+    }
+
+    #[test]
+    fn supervisor_answers_are_not_failures() {
+        assert!(supervisor_answered("status", Some(3), "chat STOPPED"));
+        assert!(!supervisor_answered("status", Some(4), "chat: ERROR (no such process)"));
+        assert!(supervisor_answered("start", Some(1), "chat: ERROR (already started)"));
+        assert!(supervisor_answered("stop", Some(1), "chat: ERROR (not running)"));
+        // Restarting a stopped program: the stop half fails, then it starts.
+        assert!(supervisor_answered("restart", Some(1), "chat: ERROR (not running)\nchat: started"));
+        assert!(!supervisor_answered("restart", Some(1), "chat: ERROR (not running)\nchat: ERROR (spawn error)"));
+        assert!(!supervisor_answered("restart", Some(2), "unix:///run/supervisor.sock refused connection"));
+    }
+
+    #[test]
+    fn deletes_tombstone_in_the_same_statement() {
+        let sql = tombstoned_delete("DELETE FROM kachat_broadcasts WHERE channel = $2 RETURNING transaction_id");
+        assert!(sql.starts_with("WITH gone AS (DELETE FROM kachat_broadcasts WHERE channel = $2 RETURNING transaction_id)"));
+        assert!(sql.contains("INSERT INTO kachat_removed_txs (transaction_id, removed_at)"));
+        assert!(sql.contains("SELECT transaction_id, $1 FROM gone ON CONFLICT (transaction_id) DO NOTHING"));
+        assert!(sql.ends_with("SELECT COUNT(*) FROM gone"));
     }
 }

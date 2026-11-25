@@ -1637,7 +1637,7 @@ struct BotGame {
     win_moves: Option<i64>,
 }
 
-fn bot_game(row: ArenaRow, message: BotResultMessage) -> Option<BotGame> {
+fn bot_game(row: &ArenaRow, message: &BotResultMessage) -> Option<BotGame> {
     let player = match message.c.as_str() {
         "w" => Color::White,
         "b" => Color::Black,
@@ -1657,10 +1657,10 @@ fn bot_game(row: ArenaRow, message: BotResultMessage) -> Option<BotGame> {
     });
     Some(BotGame {
         level: message.bot,
-        sender: row.sender,
-        tx_id: row.tx_id,
+        sender: row.sender.clone(),
+        tx_id: row.tx_id.clone(),
         block_time: row.block_time,
-        game_id: message.g,
+        game_id: message.g.clone(),
         win_moves,
     })
 }
@@ -1692,7 +1692,7 @@ pub struct BotSnapshot {
 
 /// Boards for games at or after `since_ms` (by block time), lowest level first, bots with no
 /// games left out. `games` is in chain order, so on equal moves the earlier win stays.
-fn bot_boards(games: &[BotGame], since_ms: i64) -> Vec<BotBoard> {
+fn bot_boards(games: &[&BotGame], since_ms: i64) -> Vec<BotBoard> {
     let mut boards: Vec<BotBoard> = Vec::new();
     for level in BOT_LEVELS {
         let mut played = 0u64;
@@ -1724,18 +1724,51 @@ fn bot_boards(games: &[BotGame], since_ms: i64) -> Vec<BotBoard> {
     boards
 }
 
-/// Replay the chess-bots rows once and return both periods' boards. Only the first row per
-/// (sender, game id) counts, in chain order (block time, then txid).
-pub fn compute_bots(mut rows: Vec<ArenaRow>, now_ms: i64) -> BotSnapshot {
-    rows.sort_by(|a, b| a.block_time.cmp(&b.block_time).then_with(|| a.tx_id.cmp(&b.tx_id)));
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    let mut games: Vec<BotGame> = Vec::new();
-    for row in rows {
-        let Some(message) = decode_bot_result(&row.content) else { continue };
-        if !is_game_id(&message.g) || !seen.insert((row.sender.clone(), message.g.clone())) {
+/// One chess-bots row's verdict: a v2 result with a game id claims its (sender, game id) slot,
+/// and `game` is set when it is also a counted game (the replay, the expensive part). A row
+/// never changes, so the webserver keeps this per tx id and replays each row once.
+pub struct BotClaim {
+    sender: String,
+    block_time: i64,
+    game_id: String,
+    game: Option<BotGame>,
+}
+
+/// `None` when the row claims nothing (not a v2 result, or no valid game id).
+pub fn bot_claim(row: &ArenaRow) -> Option<BotClaim> {
+    let message = decode_bot_result(&row.content)?;
+    if !is_game_id(&message.g) {
+        return None;
+    }
+    Some(BotClaim {
+        sender: row.sender.clone(),
+        block_time: row.block_time,
+        game_id: message.g.clone(),
+        game: bot_game(row, &message),
+    })
+}
+
+/// Replay the chess-bots rows once and return both periods' boards.
+#[cfg(test)]
+pub fn compute_bots(rows: Vec<ArenaRow>, now_ms: i64) -> BotSnapshot {
+    let claims: Vec<(String, BotClaim)> =
+        rows.iter().filter_map(|row| bot_claim(row).map(|c| (row.tx_id.clone(), c))).collect();
+    bots_snapshot(claims.iter().map(|(tx, c)| (tx.as_str(), c)), now_ms)
+}
+
+/// Both periods' boards from the claims, as (tx id, claim), in any order. Only the first claim
+/// per (sender, game id) counts, in chain order (block time, then txid), even when that one
+/// is not a counted game.
+pub fn bots_snapshot<'a>(claims: impl Iterator<Item = (&'a str, &'a BotClaim)>, now_ms: i64) -> BotSnapshot {
+    let mut claims: Vec<(&str, &BotClaim)> = claims.collect();
+    claims.sort_by(|a, b| a.1.block_time.cmp(&b.1.block_time).then_with(|| a.0.cmp(b.0)));
+    let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    let mut games: Vec<&BotGame> = Vec::new();
+    for (_, claim) in claims {
+        if !seen.insert((claim.sender.as_str(), claim.game_id.as_str())) {
             continue;
         }
-        if let Some(game) = bot_game(row, message) {
+        if let Some(game) = &claim.game {
             games.push(game);
         }
     }
