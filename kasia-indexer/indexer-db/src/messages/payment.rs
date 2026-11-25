@@ -103,6 +103,10 @@ impl PaymentByReceiverPartition {
         Ok(())
     }
 
+    pub fn remove_wtx(&self, wtx: &mut WriteTransaction, key: &PaymentKeyByReceiver) {
+        wtx.remove(&self.0, key.as_bytes())
+    }
+
     pub fn get_by_receiver_from_block_time(
         &self,
         rtx: &ReadTransaction,

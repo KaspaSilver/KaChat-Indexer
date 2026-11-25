@@ -2,7 +2,7 @@ mod message;
 
 use crate::BlockGap;
 use crate::block_gap_filler::BlockGapFiller;
-use crate::data_source::Command;
+use crate::data_source::{Command, Request};
 use crate::metrics::SharedMetrics;
 use crate::push::{FundsPushEvent, PushEvent, PushEventKind, parse_self_stash_alias};
 use crate::util::{ToHex, ToHex64};
@@ -35,7 +35,11 @@ use indexer_db::messages::self_stash::{
     SelfStashByOwnerPartition, SelfStashKeyByOwner, SelfStashScope, TxIdToSelfStashPartition,
 };
 use indexer_db::metadata::MetadataPartition;
+use indexer_db::processing::alt_receiver::{AltReceiver, TxAltReceiverPartition};
 use indexer_db::processing::output0_owner::TxOutput0OwnerPartition;
+use indexer_db::processing::pending_senders::{
+    PendingResolutionKey, PendingSenderResolutionPartition,
+};
 use indexer_db::processing::tx_id_to_acceptance::{
     AcceptanceKey, Action, InsertionEntry, TxIDToAcceptancePartition,
 };
@@ -91,6 +95,9 @@ pub struct BlockProcessor {
     tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
     // Who owns output 0 of a tx when that isn't its receiver, so sender resolution is exact.
     tx_output0_owner_partition: TxOutput0OwnerPartition,
+    // Where a tx indexed with an unknown sender is moved if output 0 turns out to be the sender's.
+    tx_alt_receiver_partition: TxAltReceiverPartition,
+    pending_sender_resolution_partition: PendingSenderResolutionPartition,
     shared_metrics: SharedMetrics,
     push_tx: Option<flume::Sender<PushEvent>>,
     // Address Activity: accepted txs crediting a watched (owned) address are forwarded here.
@@ -100,6 +107,11 @@ pub struct BlockProcessor {
     watched_outpoint_partition: WatchedOutpointPartition,
     watched_outpoint_spend_partition: WatchedOutpointSpendPartition,
     last_watched_prune: Option<Instant>,
+    /// Where the sweep of watched outpoints whose address nobody watches any more resumes.
+    watched_gc_cursor: Option<WatchedOutpointKey>,
+    /// Sender lookups for the block being written, sent once it commits: (accepting daa, tx id).
+    #[builder(default)]
+    sender_requests: Vec<(u64, [u8; 32])>,
     #[builder(default)]
     gaps_filling_in_progress: usize,
 }
@@ -218,6 +230,7 @@ impl BlockProcessor {
                             warn!("conflict detected, retry handling block")
                         }
                     }
+                    self.send_sender_requests();
 
                     if !is_shutdown {
                         _ = self
@@ -265,6 +278,7 @@ impl BlockProcessor {
                                 warn!("conflict detected, retry handling block")
                             }
                         }
+                        self.send_sender_requests();
 
                         if !is_shutdown {
                             _ = self
@@ -301,6 +315,7 @@ impl BlockProcessor {
                                         warn!("conflict detected, retry handling block")
                                     }
                                 }
+                                self.send_sender_requests();
                                 if !is_shutdown {
                                     _ = self
                                         .processed_block_tx
@@ -323,6 +338,7 @@ impl BlockProcessor {
                                         warn!("conflict detected, retry handling block")
                                     }
                                 }
+                                self.send_sender_requests();
                                 if !is_shutdown {
                                     _ = self
                                         .processed_block_tx
@@ -355,6 +371,8 @@ impl BlockProcessor {
         wtx: &mut WriteTransaction,
         block: &RpcBlock,
     ) -> anyhow::Result<()> {
+        // A retry after a conflict starts over.
+        self.sender_requests.clear();
         let already_processed = self.block_compact_header_partition.insert_compact_header_wtx(
             wtx,
             block.header.hash.as_ref(),
@@ -378,6 +396,21 @@ impl BlockProcessor {
         self.shared_metrics.increment_blocks_processed();
         trace!(hash = %block.header.hash.as_bytes().to_hex_64(), "Block handled successfully");
         Ok(())
+    }
+
+    /// Ask for the senders that the block just committed is waiting on. Never blocks: the data
+    /// source also waits on this thread. A request that doesn't fit keeps its pending key, so the
+    /// next start asks again.
+    fn send_sender_requests(&mut self) {
+        for (daa_score, tx_id) in self.sender_requests.drain(..) {
+            if self
+                .command_tx
+                .try_send(Command::Request(Request::RequestSender { daa_score, tx_id }))
+                .is_err()
+            {
+                warn!(tx_id = %tx_id.to_hex_64(), "Command queue full; sender lookup left for the next start");
+            }
+        }
     }
 
     fn emit_push(&self, event: PushEvent) {
@@ -408,6 +441,27 @@ impl BlockProcessor {
         }
         if !expired.is_empty() {
             debug!(count = expired.len(), "Pruned spent watched outpoints");
+        }
+
+        // Outputs paying an address no device watches any more are never needed: a spend from it
+        // is no self-send for anyone. Swept a batch per pass, resuming where the last one stopped.
+        let batch = self
+            .watched_outpoint_partition
+            .scan_after(self.watched_gc_cursor.as_ref(), WATCHED_PRUNE_BATCH)?;
+        self.watched_gc_cursor = if batch.len() < WATCHED_PRUNE_BATCH {
+            None
+        } else {
+            batch.last().map(|(key, _)| *key)
+        };
+        let mut unwatched = 0usize;
+        for (key, address) in &batch {
+            if !crate::watch_only_contains(address) && !crate::self_send_contains(address) {
+                self.watched_outpoint_partition.remove_wtx(wtx, key);
+                unwatched += 1;
+            }
+        }
+        if unwatched > 0 {
+            debug!(count = unwatched, "Removed watched outpoints of addresses no longer watched");
         }
         Ok(())
     }
@@ -455,45 +509,61 @@ impl BlockProcessor {
             }
         }
         let tx_id_bytes = tx_id.as_bytes();
+        let coinbase = tx.subnetwork_id == kaspa_consensus_core::subnets::SUBNETWORK_ID_COINBASE;
         let mut credited: Vec<(AddressPayload, u64)> = Vec::new();
+        let mut coinbase_outpoints: Vec<(u32, AddressPayload)> = Vec::new();
         for (index, output) in tx.outputs.iter().enumerate() {
             let Ok(addr) = AddressPayload::try_from(&output.script_public_key) else {
                 continue;
             };
             let credits = crate::watch_only_contains(&addr);
             // A chatting address of a watching device is recorded, not announced: spending it
-            // later is a self-send (K_ALL_IN_ONE_PUSH.md §2).
+            // later is a self-send (K_ALL_IN_ONE_PUSH.md §2). A coinbase's outputs are recorded
+            // on acceptance: every merging block has one paying the miner, and only the accepted
+            // one is ever spent, so the others' rows would never be pruned.
             if credits || crate::self_send_contains(&addr) {
-                self.watched_outpoint_partition.insert_wtx(
-                    wtx,
-                    &WatchedOutpointKey {
-                        tx_id: tx_id_bytes,
-                        index: (index as u32).into(),
-                    },
-                    &addr,
-                );
+                if coinbase {
+                    coinbase_outpoints.push((index as u32, addr));
+                } else {
+                    self.watched_outpoint_partition.insert_wtx(
+                        wtx,
+                        &WatchedOutpointKey {
+                            tx_id: tx_id_bytes,
+                            index: (index as u32).into(),
+                        },
+                        &addr,
+                    );
+                }
             }
             if credits {
                 credited.push((addr, output.value));
             }
         }
-        if credited.is_empty() {
-            return Ok(());
-        }
-        let event = FundsPushEvent {
+        let event = (!credited.is_empty()).then(|| FundsPushEvent {
             credited,
             senders,
             tx_id: tx_id_bytes,
             timestamp: block_header.timestamp,
             daa_score: block_header.daa_score,
             chat_tx: parse_sealed_operation(&tx.payload).is_some(),
-        };
-        // A coinbase is pushed when accepted, not on sighting (RECEIVED_PUSH_COINBASE.md):
-        // virtual_chain_processor `handle_vcc_addition` sends it.
-        if tx.subnetwork_id == kaspa_consensus_core::subnets::SUBNETWORK_ID_COINBASE {
-            crate::hold_coinbase_credit(event);
+        });
+        // A coinbase is pushed and recorded when accepted, not on sighting
+        // (RECEIVED_PUSH_COINBASE.md): virtual_chain_processor `handle_vcc_addition` does both.
+        if coinbase {
+            if event.is_some() || !coinbase_outpoints.is_empty() {
+                crate::hold_coinbase_credit(
+                    tx_id_bytes,
+                    crate::HeldCoinbase {
+                        event,
+                        outpoints: coinbase_outpoints,
+                    },
+                );
+            }
             return Ok(());
         }
+        let Some(event) = event else {
+            return Ok(());
+        };
         if funds_tx.try_send(event).is_err() {
             warn!("Dropping funds push event; queue is full");
         }
@@ -501,7 +571,7 @@ impl BlockProcessor {
     }
 
     fn handle_transaction(
-        &self,
+        &mut self,
         wtx: &mut WriteTransaction,
         block_header: &RpcHeader,
         tx: &RpcTransaction,
@@ -540,6 +610,25 @@ impl BlockProcessor {
             None
         };
         let (amount, receiver) = resolve_primary_receiver(&tx.outputs, sender)?;
+        // A tx indexed again (another block holding it, or gap filling after a restart) keeps the
+        // acceptance record of its first copy. The receiver is part of the acceptance key, and it
+        // can differ the second time (the parent was indexed in between): two records for one tx
+        // break every lookup by tx id. With the sender unknown now, the rows are filed under that
+        // record's receiver too. With the sender known, the receiver computed now is the right
+        // one; a first copy filed under the sender's change moves there when its sender resolves
+        // (virtual_chain_processor `handle_sender_address`).
+        let existing_receiver = self
+            .tx_id_to_acceptance_partition
+            .key_by_tx_id_wtx(wtx, &tx_id.as_bytes())?
+            .map(|existing| existing.receiver);
+        let (amount, receiver) = match existing_receiver {
+            Some(existing) if sender.is_none() && existing != receiver => (
+                output_amount(&tx.outputs, existing).unwrap_or(amount),
+                existing,
+            ),
+            _ => (amount, receiver),
+        };
+        let acceptance_receiver = existing_receiver.unwrap_or(receiver);
         // The next tx spending our output 0 takes its owner as sender: note it when it isn't the
         // receiver (or isn't a standard address at all).
         let output0 = tx
@@ -593,7 +682,9 @@ impl BlockProcessor {
         // its sender's key, so it is caught even before the sender's address is known; any other
         // record with an unknown sender is caught when the sender resolves
         // (virtual_chain_processor `handle_sender_address`).
+        // A tx already dropped for its blocked sender (it came in another block) is caught too.
         let blocked = sender.as_ref().is_some_and(crate::is_blocked_address)
+            || crate::is_blocked_tx(&tx_id.as_bytes())
             || matches!(&op, SealedOperation::GroupMessageV1(gm)
                 if decode_fixed_hex::<32>(gm.sender_pub).is_ok_and(|pk| crate::is_blocked_xonly(&pk)));
         let store_content = store_content && !blocked;
@@ -653,14 +744,42 @@ impl BlockProcessor {
             }
         })?;
         }
-        self.tx_id_to_acceptance_partition.insert_wtx(
+        let previous = self.tx_id_to_acceptance_partition.insert_wtx(
             wtx,
             &AcceptanceKey {
                 tx_id: tx_id.as_bytes(),
-                receiver,
+                receiver: acceptance_receiver,
             },
             &entries,
         )?;
+        // With the sender unknown, the receiver may be the sender's own change at output 0. Note
+        // where the records go if so (virtual_chain_processor `handle_sender_address`). Not when
+        // an earlier copy of the tx is already resolved: its rows stay where they are, and these
+        // must join them.
+        if sender.is_none()
+            && !entries.is_empty()
+            && previous.is_none_or(|previous| previous.has_entries)
+            && let Some(alt) = alt_receiver(&tx.outputs, receiver)
+        {
+            self.tx_alt_receiver_partition
+                .insert_wtx(wtx, &tx_id.as_bytes(), &alt);
+        }
+        // The virtual chain processor asks for the sender when the tx is accepted. Entries
+        // appended after that (the tx came again in another block) would wait forever: ask now.
+        if !entries.is_empty()
+            && let Some(previous) = previous
+            && previous.is_accepted()
+        {
+            let daa_score = previous.header.accepting_daa.get();
+            self.pending_sender_resolution_partition.insert_wtx(
+                wtx,
+                &PendingResolutionKey {
+                    accepting_daa_score: daa_score.into(),
+                    tx_id: tx_id.as_bytes(),
+                },
+            );
+            self.sender_requests.push((daa_score, tx_id.as_bytes()));
+        }
         Ok(())
     }
 
@@ -1249,6 +1368,30 @@ fn output0_owner(
     }
 }
 
+/// What the first output paying `address` pays.
+fn output_amount(outputs: &[RpcTransactionOutput], address: AddressPayload) -> Option<u64> {
+    outputs.iter().find_map(|output| {
+        AddressPayload::try_from(&output.script_public_key)
+            .ok()
+            .filter(|addr| *addr == address)
+            .map(|_| output.value)
+    })
+}
+
+/// The receiver if `receiver` turns out to be the sender: the first standard output paying
+/// someone else, as `resolve_primary_receiver` would pick with the sender known.
+fn alt_receiver(outputs: &[RpcTransactionOutput], receiver: AddressPayload) -> Option<AltReceiver> {
+    outputs.iter().find_map(|output| {
+        AddressPayload::try_from(&output.script_public_key)
+            .ok()
+            .filter(|addr| *addr != receiver)
+            .map(|addr| AltReceiver {
+                receiver: addr,
+                amount: output.value.into(),
+            })
+    })
+}
+
 fn resolve_primary_receiver(
     outputs: &[RpcTransactionOutput],
     sender: Option<AddressPayload>,
@@ -1319,5 +1462,364 @@ mod sender_tests {
         assert_eq!(output0_owner(victim, None), Some(victim));
         // Output 0 pays no standard address: unknown, left to the node.
         assert_eq!(output0_owner(victim, Some(AddressPayload::default())), None);
+    }
+}
+
+#[cfg(test)]
+mod reindex_tests {
+    use super::*;
+    use indexer_db::processing::watched_outpoints::WatchedOutpointPartition;
+    use kaspa_consensus_core::BlueWorkType;
+    use kaspa_consensus_core::subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE};
+    use kaspa_consensus_core::tx::ScriptPublicKey;
+    use kaspa_rpc_core::{
+        RpcHash, RpcTransactionInput, RpcTransactionOutpoint, RpcTransactionVerboseData,
+    };
+
+    fn addr(byte: u8) -> AddressPayload {
+        AddressPayload::from_xonly_pubkey([byte; 32])
+    }
+
+    /// Pay-to-pubkey script of `addr(byte)`.
+    fn p2pk(byte: u8) -> ScriptPublicKey {
+        let mut script = vec![0x20];
+        script.extend_from_slice(&[byte; 32]);
+        script.push(0xac);
+        ScriptPublicKey::from_vec(0, script)
+    }
+
+    fn tx(id: u8, parent: (u8, u32), outputs: &[(u8, u64)], payload: &[u8]) -> RpcTransaction {
+        RpcTransaction {
+            version: 0,
+            inputs: vec![RpcTransactionInput {
+                previous_outpoint: RpcTransactionOutpoint {
+                    transaction_id: RpcHash::from_bytes([parent.0; 32]),
+                    index: parent.1,
+                },
+                signature_script: Vec::new(),
+                sequence: 0,
+                sig_op_count: 1,
+                verbose_data: None,
+            }],
+            outputs: outputs
+                .iter()
+                .map(|(byte, value)| RpcTransactionOutput {
+                    value: *value,
+                    script_public_key: p2pk(*byte),
+                    verbose_data: None,
+                })
+                .collect(),
+            lock_time: 0,
+            subnetwork_id: SUBNETWORK_ID_NATIVE,
+            gas: 0,
+            payload: payload.to_vec(),
+            mass: 0,
+            verbose_data: Some(RpcTransactionVerboseData {
+                transaction_id: RpcHash::from_bytes([id; 32]),
+                hash: RpcHash::from_bytes([id; 32]),
+                compute_mass: 0,
+                block_hash: RpcHash::from_bytes([0; 32]),
+                block_time: 0,
+            }),
+        }
+    }
+
+    fn block(hash: u8, transactions: Vec<RpcTransaction>) -> RpcBlock {
+        RpcBlock {
+            header: RpcHeader {
+                hash: RpcHash::from_bytes([hash; 32]),
+                version: 1,
+                parents_by_level: Vec::new(),
+                hash_merkle_root: RpcHash::from_bytes([0; 32]),
+                accepted_id_merkle_root: RpcHash::from_bytes([0; 32]),
+                utxo_commitment: RpcHash::from_bytes([0; 32]),
+                timestamp: 1_000 + hash as u64,
+                bits: 0,
+                nonce: 0,
+                daa_score: 100 + hash as u64,
+                blue_work: BlueWorkType::from_u64(hash as u64),
+                blue_score: 0,
+                pruning_point: RpcHash::from_bytes([0; 32]),
+            },
+            transactions,
+            verbose_data: None,
+        }
+    }
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        _runtime: tokio::runtime::Runtime,
+        ks: TxKeyspace,
+        processor: BlockProcessor,
+        commands: workflow_core::channel::Receiver<Command>,
+        _funds_rx: flume::Receiver<FundsPushEvent>,
+        _channels: (
+            flume::Sender<BlockNotification>,
+            flume::Receiver<CompactHeader>,
+        ),
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("temporary database directory");
+            let ks = fjall::Config::new(dir.path())
+                .open_transactional()
+                .expect("keyspace");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            let (notification_tx, notification_rx) = flume::bounded(1);
+            let (gap_result_tx, gap_result_rx) = flume::bounded(1);
+            let (processed_block_tx, processed_block_rx) = flume::bounded(64);
+            let (command_tx, commands) = workflow_core::channel::bounded(64);
+            let (funds_tx, funds_rx) = flume::bounded(64);
+            let processor = BlockProcessor::builder()
+                .notification_rx(notification_rx)
+                .gap_result_rx(gap_result_rx)
+                .gap_result_tx(gap_result_tx)
+                .processed_block_tx(processed_block_tx)
+                .command_tx(command_tx)
+                .tx_keyspace(ks.clone())
+                .blocks_gap_partition(BlockGapsPartition::new(&ks).unwrap())
+                .runtime_handle(runtime.handle().clone())
+                .metadata_partition(MetadataPartition::new(&ks).unwrap())
+                .block_compact_header_partition(BlockCompactHeaderPartition::new(&ks).unwrap())
+                .daa_index_partition(DaaIndexPartition::new(&ks).unwrap())
+                .handshake_by_receiver_partition(HandshakeByReceiverPartition::new(&ks).unwrap())
+                .handshake_by_sender_partition(HandshakeBySenderPartition::new(&ks).unwrap())
+                .tx_id_to_handshake_partition(TxIdToHandshakePartition::new(&ks).unwrap())
+                .contextual_message_by_sender_partition(
+                    ContextualMessageBySenderPartition::new(&ks).unwrap(),
+                )
+                .contextual_message_by_inbox_partition(
+                    ContextualMessageByInboxPartition::new(&ks).unwrap(),
+                )
+                .tx_id_to_contextual_message_partition(
+                    TxIdToContextualMessagePartition::new(&ks).unwrap(),
+                )
+                .tx_id_to_self_stash_partition(TxIdToSelfStashPartition::new(&ks).unwrap())
+                .self_stash_by_owner_partition(SelfStashByOwnerPartition::new(&ks).unwrap())
+                .payment_by_receiver_partition(PaymentByReceiverPartition::new(&ks).unwrap())
+                .payment_by_sender_partition(PaymentBySenderPartition::new(&ks).unwrap())
+                .tx_id_to_payment_partition(TxIdToPaymentPartition::new(&ks).unwrap())
+                .group_message_by_blinded_group_id_partition(
+                    GroupMessageByBlindedGroupIdPartition::new(&ks).unwrap(),
+                )
+                .tx_id_to_group_message_partition(TxIdToGroupMessagePartition::new(&ks).unwrap())
+                .group_sender_binding_partition(GroupSenderBindingPartition::new(&ks).unwrap())
+                .group_control_by_sender_partition(GroupControlBySenderPartition::new(&ks).unwrap())
+                .group_control_by_recipient_partition(
+                    GroupControlByRecipientPartition::new(&ks).unwrap(),
+                )
+                .tx_id_to_group_control_partition(TxIdToGroupControlPartition::new(&ks).unwrap())
+                .tx_id_to_acceptance_partition(TxIDToAcceptancePartition::new(&ks).unwrap())
+                .tx_output0_owner_partition(TxOutput0OwnerPartition::new(&ks).unwrap())
+                .tx_alt_receiver_partition(TxAltReceiverPartition::new(&ks).unwrap())
+                .pending_sender_resolution_partition(
+                    PendingSenderResolutionPartition::new(&ks).unwrap(),
+                )
+                .shared_metrics(crate::metrics::create_shared_metrics())
+                .push_funds_tx(funds_tx)
+                .watched_outpoint_partition(WatchedOutpointPartition::new(&ks).unwrap())
+                .watched_outpoint_spend_partition(WatchedOutpointSpendPartition::new(&ks).unwrap())
+                .build();
+            Self {
+                _dir: dir,
+                _runtime: runtime,
+                ks,
+                processor,
+                commands,
+                _funds_rx: funds_rx,
+                _channels: (notification_tx, processed_block_rx),
+            }
+        }
+
+        /// Write a block the way `process` does: one transaction, then the sender lookups.
+        fn index(&mut self, block: &RpcBlock) {
+            let mut wtx = self.ks.write_tx().unwrap();
+            self.processor.handle_block(&mut wtx, block).unwrap();
+            wtx.commit().unwrap().unwrap();
+            self.processor.send_sender_requests();
+        }
+
+        fn acceptance_receivers(&self, tx_id: [u8; 32]) -> Vec<AddressPayload> {
+            let part = self
+                .ks
+                .open_partition("tx_id_to_acceptance", Default::default())
+                .unwrap();
+            self.ks
+                .read_tx()
+                .prefix(&part, tx_id)
+                .map(|kv| {
+                    let (k, _) = kv.unwrap();
+                    AddressPayload::read_from_bytes(&k[32..]).unwrap()
+                })
+                .collect()
+        }
+
+        fn payment_receivers(&self) -> Vec<AddressPayload> {
+            let part = self
+                .ks
+                .open_partition("payment_by_receiver", Default::default())
+                .unwrap();
+            self.ks
+                .read_tx()
+                .keys(&part)
+                .map(|k| AddressPayload::read_from_bytes(&k.unwrap()[..34]).unwrap())
+                .collect()
+        }
+    }
+
+    use indexer_db::FromBytes;
+
+    const PAYMENT: &[u8] = b"ciph_msg:1:pay:abcd";
+
+    #[test]
+    fn a_tx_indexed_again_keeps_one_acceptance_record() {
+        let mut h = Harness::new();
+        let (change, recipient) = (1, 2);
+        // Spends output 0 of a parent not indexed yet: the sender is unknown, so the receiver is
+        // output 0, the sender's change.
+        let t = tx(0x70, (0x50, 0), &[(change, 100), (recipient, 5_000)], PAYMENT);
+        h.index(&block(1, vec![t.clone()]));
+        assert_eq!(h.acceptance_receivers([0x70; 32]), vec![addr(change)]);
+        let alt = TxAltReceiverPartition::new(&h.ks).unwrap();
+        let mut wtx = h.ks.write_tx().unwrap();
+        let noted = alt.get_wtx(&mut wtx, &[0x70; 32]).unwrap().expect("alt receiver");
+        assert_eq!((noted.receiver, noted.amount.get()), (addr(recipient), 5_000));
+        drop(wtx);
+
+        // The parent is indexed in between (its receiver owns output 0): the second copy knows
+        // its sender and files its rows under the recipient, on the same acceptance record.
+        let mut wtx = h.ks.write_tx().unwrap();
+        h.processor
+            .tx_id_to_acceptance_partition
+            .insert_wtx(
+                &mut wtx,
+                &AcceptanceKey {
+                    tx_id: [0x50; 32],
+                    receiver: addr(change),
+                },
+                &[],
+            )
+            .unwrap();
+        wtx.commit().unwrap().unwrap();
+        h.index(&block(2, vec![t.clone()]));
+        assert_eq!(h.acceptance_receivers([0x70; 32]), vec![addr(change)]);
+        let mut receivers = h.payment_receivers();
+        receivers.sort_by_key(|a| a.payload);
+        assert_eq!(receivers, vec![addr(change), addr(recipient)]);
+
+        // A third copy with the sender unknown again (the parent's record is gone) joins the
+        // first record's receiver.
+        let mut wtx = h.ks.write_tx().unwrap();
+        h.processor.tx_id_to_acceptance_partition.remove_wtx(
+            &mut wtx,
+            &AcceptanceKey {
+                tx_id: [0x50; 32],
+                receiver: addr(change),
+            },
+        );
+        wtx.commit().unwrap().unwrap();
+        h.index(&block(3, vec![t]));
+        assert_eq!(h.acceptance_receivers([0x70; 32]), vec![addr(change)]);
+        assert!(h.commands.try_recv().is_err(), "not accepted: nothing to ask yet");
+    }
+
+    #[test]
+    fn entries_appended_after_acceptance_ask_for_the_sender() {
+        let mut h = Harness::new();
+        let t = tx(0x71, (0x51, 1), &[(3, 100), (4, 5_000)], PAYMENT);
+        h.index(&block(1, vec![t.clone()]));
+        let key = AcceptanceKey {
+            tx_id: [0x71; 32],
+            receiver: addr(3),
+        };
+        // Accepted and resolved, as the virtual chain processor does.
+        let mut wtx = h.ks.write_tx().unwrap();
+        let acceptance = &h.processor.tx_id_to_acceptance_partition;
+        acceptance.update_acceptance_wtx(&mut wtx, &key, [9; 32], 77).unwrap();
+        acceptance.take_entries_wtx(&mut wtx, &key).unwrap();
+        h.processor
+            .tx_alt_receiver_partition
+            .remove_wtx(&mut wtx, &[0x71; 32]);
+        wtx.commit().unwrap().unwrap();
+        assert!(h.commands.try_recv().is_err());
+
+        // Another block with the same tx: its new entries ask for the sender at once.
+        h.index(&block(2, vec![t]));
+        match h.commands.try_recv() {
+            Ok(Command::Request(Request::RequestSender { daa_score, tx_id })) => {
+                assert_eq!((daa_score, tx_id), (77, [0x71; 32]));
+            }
+            other => panic!("expected a sender request, got {other:?}"),
+        }
+        let pending = PendingSenderResolutionPartition::new(&h.ks).unwrap();
+        let keys: Vec<_> = pending
+            .get_all_pending()
+            .map(|k| (k.as_ref().unwrap().accepting_daa_score.get(), k.unwrap().tx_id))
+            .collect();
+        assert_eq!(keys, vec![(77, [0x71; 32])]);
+        assert!(acceptance_has_entries(&h, [0x71; 32]));
+        // The first copy is resolved, so its rows stay where they are: no move is noted.
+        let mut wtx = h.ks.write_tx().unwrap();
+        assert!(
+            h.processor
+                .tx_alt_receiver_partition
+                .get_wtx(&mut wtx, &[0x71; 32])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn acceptance_has_entries(h: &Harness, tx_id: [u8; 32]) -> bool {
+        h.processor
+            .tx_id_to_acceptance_partition
+            .keys_with_entries()
+            .any(|k| k.unwrap().tx_id == tx_id)
+    }
+
+    #[test]
+    fn a_tx_whose_sender_was_blocked_is_not_stored_again() {
+        let mut h = Harness::new();
+        crate::remember_blocked_tx([0x72; 32]);
+        h.index(&block(1, vec![tx(0x72, (0x52, 1), &[(5, 100), (6, 5_000)], PAYMENT)]));
+        assert!(h.payment_receivers().is_empty());
+        assert!(!acceptance_has_entries(&h, [0x72; 32]));
+    }
+
+    #[test]
+    fn coinbase_outputs_are_held_until_accepted_and_unwatched_outpoints_are_swept() {
+        let mut h = Harness::new();
+        let miner = 0x31;
+        crate::set_watch_only_addresses(std::collections::HashSet::from([addr(miner)]));
+        // A row left for an address nobody watches any more.
+        let outpoints = WatchedOutpointPartition::new(&h.ks).unwrap();
+        let stale = WatchedOutpointKey {
+            tx_id: [0x40; 32],
+            index: 0.into(),
+        };
+        let mut wtx = h.ks.write_tx().unwrap();
+        outpoints.insert_wtx(&mut wtx, &stale, &addr(0x32));
+        wtx.commit().unwrap().unwrap();
+
+        let mut coinbase = tx(0x73, (0, 0), &[(miner, 50_000)], b"");
+        coinbase.subnetwork_id = SUBNETWORK_ID_COINBASE;
+        coinbase.inputs.clear();
+        // An ordinary payment to the same address is recorded at once.
+        let transfer = tx(0x74, (0x54, 0), &[(miner, 7)], b"");
+        h.index(&block(1, vec![coinbase, transfer]));
+        crate::set_watch_only_addresses(std::collections::HashSet::new());
+
+        let rows: Vec<_> = outpoints
+            .scan_after(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key.tx_id[0])
+            .collect();
+        assert_eq!(rows, vec![0x74], "no coinbase row, and the stale one swept");
+        let held = crate::take_coinbase_credit(&[0x73; 32]).expect("held coinbase");
+        assert_eq!(held.outpoints, vec![(0, addr(miner))]);
+        assert!(held.event.is_some());
     }
 }

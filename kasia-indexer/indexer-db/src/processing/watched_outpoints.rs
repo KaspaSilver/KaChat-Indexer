@@ -98,6 +98,35 @@ impl WatchedOutpointPartition {
     pub fn remove_wtx(&self, wtx: &mut WriteTransaction, key: &WatchedOutpointKey) {
         wtx.remove(&self.0, key.as_bytes())
     }
+
+    /// Up to `limit` rows after `after` (from the start when None), in key order. Reads the
+    /// committed state, so a sweep adds no read-conflict tracking.
+    pub fn scan_after(
+        &self,
+        after: Option<&WatchedOutpointKey>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(WatchedOutpointKey, AddressPayload)>> {
+        let read = |item: fjall::Result<(fjall::Slice, fjall::Slice)>| {
+            let (key, value) = item?;
+            let key = WatchedOutpointKey::read_from_bytes(key.as_ref())
+                .map_err(|_| anyhow::anyhow!("db corrupted, failed to read watched outpoint"))?;
+            let address = AddressPayload::read_from_bytes(value.as_ref())
+                .map_err(|_| anyhow::anyhow!("db corrupted, failed to read watched outpoint"))?;
+            Ok((key, address))
+        };
+        let inner = self.0.inner();
+        match after {
+            None => inner.iter().take(limit).map(read).collect(),
+            Some(after) => {
+                let start = after.as_bytes().to_vec();
+                inner
+                    .range((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+                    .take(limit)
+                    .map(read)
+                    .collect()
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -205,5 +234,35 @@ mod tests {
         wtx.commit().expect("commit").expect("no conflict");
         assert_eq!(spends.spent_before(u64::MAX, 10).expect("range").len(), 1);
         assert!(outpoints.is_empty().expect("empty"));
+    }
+
+    #[test]
+    fn a_sweep_walks_every_outpoint_in_batches() {
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let keyspace = fjall::Config::new(dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let outpoints = WatchedOutpointPartition::new(&keyspace).expect("outpoints");
+        let addr = AddressPayload::from_xonly_pubkey([7; 32]);
+        let mut wtx = keyspace.write_tx().expect("wtx");
+        for (b, index) in [(1, 0), (1, 3), (2, 0), (3, 1), (3, 2)] {
+            outpoints.insert_wtx(&mut wtx, &outpoint(b, index), &addr);
+        }
+        wtx.commit().expect("commit").expect("no conflict");
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let batch = outpoints.scan_after(cursor.as_ref(), 2).expect("scan");
+            seen.extend(batch.iter().map(|(key, address)| {
+                assert_eq!(*address, addr);
+                (key.tx_id[0], key.index.get())
+            }));
+            if batch.len() < 2 {
+                break;
+            }
+            cursor = batch.last().map(|(key, _)| *key);
+        }
+        assert_eq!(seen, vec![(1, 0), (1, 3), (2, 0), (3, 1), (3, 2)]);
     }
 }

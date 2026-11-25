@@ -107,6 +107,10 @@ impl HandshakeByReceiverPartition {
         Ok(())
     }
 
+    pub fn remove_wtx(&self, wtx: &mut WriteTransaction, key: &HandshakeKeyByReceiver) {
+        wtx.remove(&self.0, key.as_bytes())
+    }
+
     pub fn iter_by_receiver_from_block_time_rtx(
         &self,
         rtx: &ReadTransaction,

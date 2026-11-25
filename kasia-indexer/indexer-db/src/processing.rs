@@ -7,3 +7,5 @@ pub mod pending_senders;
 pub mod watched_outpoints;
 
 pub mod output0_owner;
+
+pub mod alt_receiver;

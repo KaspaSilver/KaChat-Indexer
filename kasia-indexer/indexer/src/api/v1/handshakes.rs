@@ -133,8 +133,10 @@ async fn get_handshakes_by_sender(
             .iter_by_sender_from_block_time_rtx(&rtx, sender, cursor)
             .process_results(|iter| {
                 iter.filter(|hs| seen_tx_ids.insert(hs.tx_id))
-                    .take(limit)
-                    .map(|handshake| {
+                    // A row whose payload is gone (a purge removed it, or another block's copy of
+                    // the tx was left behind) is skipped, not a 500 for the whole page. Skipped
+                    // before take(limit), so the page still fills.
+                    .map(|handshake| -> anyhow::Result<Option<HandshakeResponse>> {
                         let block_time = handshake.block_time.into();
 
                         let sender_str =
@@ -171,15 +173,18 @@ async fn get_handshakes_by_sender(
                                 (None, None)
                             };
 
-                        let payload_bytes = state
+                        let Some(payload_bytes) = state
                             .tx_id_to_handshake_partition
                             .get_rtx(&rtx, &handshake.tx_id)
                             .with_context(|| "Database error")?
-                            .context("Missing handshake payload")?;
+                        else {
+                            tracing::debug!(tx_id = %faster_hex::hex_string(&handshake.tx_id), "handshakes by-sender: skipping a row whose payload is missing");
+                            return Ok(None);
+                        };
 
                         let message_payload = faster_hex::hex_string(payload_bytes.as_ref());
 
-                        Ok(HandshakeResponse {
+                        Ok(Some(HandshakeResponse {
                             tx_id: faster_hex::hex_string(&handshake.tx_id),
                             sender: sender_str,
                             receiver: receiver_str,
@@ -187,8 +192,10 @@ async fn get_handshakes_by_sender(
                             accepting_block,
                             accepting_daa_score,
                             message_payload,
-                        })
+                        }))
                     })
+                    .filter_map(Result::transpose)
+                    .take(limit)
                     .collect::<Result<Vec<_>, _>>()
             })
             .flatten()
@@ -271,8 +278,10 @@ async fn get_handshakes_by_receiver(
             .iter_by_receiver_from_block_time_rtx(&rtx, &receiver, cursor)
             .process_results(|iter| {
                 iter.filter(|hs_key_payload_tuple| seen_tx_ids.insert(hs_key_payload_tuple.0.tx_id))
-                    .take(limit)
-                    .map(|handshake_key_payload_tuple| {
+                    // A row whose payload is gone (a purge removed it, or another block's copy of
+                    // the tx was left behind) is skipped, not a 500 for the whole page. Skipped
+                    // before take(limit), so the page still fills.
+                    .map(|handshake_key_payload_tuple| -> anyhow::Result<Option<HandshakeResponse>> {
                         let (handshake, sender_payload) = handshake_key_payload_tuple;
 
                         let block_time = handshake.block_time.into();
@@ -304,7 +313,10 @@ async fn get_handshakes_by_receiver(
                             .get_rtx(&rtx, &handshake.tx_id)
                         {
                             Ok(Some(bts)) => bts,
-                            Ok(None) => bail!("Missing handshake payload"),
+                            Ok(None) => {
+                                tracing::debug!(tx_id = %faster_hex::hex_string(&handshake.tx_id), "handshakes by-receiver: skipping a row whose payload is missing");
+                                return Ok(None);
+                            }
                             Err(e) => bail!("Database error: {}", e),
                         };
                         let message_payload = faster_hex::hex_string(payload_bytes.as_ref());
@@ -320,7 +332,7 @@ async fn get_handshakes_by_receiver(
                                 (None, None)
                             };
 
-                        Ok(HandshakeResponse {
+                        Ok(Some(HandshakeResponse {
                             tx_id: faster_hex::hex_string(&handshake.tx_id),
                             sender: sender_str,
                             receiver: receiver_str,
@@ -328,8 +340,10 @@ async fn get_handshakes_by_receiver(
                             accepting_block,
                             accepting_daa_score,
                             message_payload,
-                        })
+                        }))
                     })
+                    .filter_map(Result::transpose)
+                    .take(limit)
                     .collect::<Result<Vec<_>, _>>()
             })
             .flatten()
