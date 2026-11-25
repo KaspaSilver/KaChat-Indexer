@@ -219,21 +219,33 @@ pub async fn activity(
         }
     }
 
+    // Fees and senders: only once the profiles follower has created its tables. Before that,
+    // the period's counts are served without them.
     let hour_from = layout.from.div_euclid(HOUR_MS) * HOUR_MS;
-    let active: i64 =
-        sqlx::query_scalar("SELECT count(DISTINCT sender)::BIGINT FROM kachat_k_senders WHERE hour >= $1 AND hour < $2")
-            .bind(hour_from)
-            .bind(layout.to)
-            .fetch_one(pool)
-            .await?;
-    let k_fees = sqlx::query(
-        "SELECT COALESCE(sum(fees_sompi), 0)::BIGINT f, (SELECT min(hour) FROM kachat_k_hours) s \
-         FROM kachat_k_hours WHERE hour >= $1 AND hour < $2",
+    let fee_tables: bool = sqlx::query_scalar(
+        "SELECT to_regclass('kachat_k_hours') IS NOT NULL AND to_regclass('kachat_k_senders') IS NOT NULL",
     )
-    .bind(hour_from)
-    .bind(layout.to)
     .fetch_one(pool)
     .await?;
+    let mut fees = None;
+    if fee_tables {
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT sender)::BIGINT FROM kachat_k_senders WHERE hour >= $1 AND hour < $2",
+        )
+        .bind(hour_from)
+        .bind(layout.to)
+        .fetch_one(pool)
+        .await?;
+        let k_fees = sqlx::query(
+            "SELECT COALESCE(sum(fees_sompi), 0)::BIGINT f, (SELECT min(hour) FROM kachat_k_hours) s \
+             FROM kachat_k_hours WHERE hour >= $1 AND hour < $2",
+        )
+        .bind(hour_from)
+        .bind(layout.to)
+        .fetch_one(pool)
+        .await?;
+        fees = Some((active, k_fees));
+    }
 
     let mut out = serde_json::json!({
         "period": period.name(),
@@ -246,7 +258,9 @@ pub async fn activity(
         out["previous"] = serde_json::json!(counts.previous);
     }
     // Senders and fees exist from the first hour the profiles follower counted (`feesSince`).
-    if let Ok(Some(since)) = k_fees.try_get::<Option<i64>, _>("s") {
+    if let Some((active, k_fees)) = fees
+        && let Ok(Some(since)) = k_fees.try_get::<Option<i64>, _>("s")
+    {
         out["feesSompi"] = serde_json::json!(k_fees.get::<i64, _>("f"));
         out["feesSince"] = serde_json::json!(since);
         out["activeAddresses"] = serde_json::json!(active);
@@ -257,6 +271,12 @@ pub async fn activity(
 /// GET /network/fees body for one period. None until any fee has been counted; a database
 /// error is an error.
 pub async fn network_fees(pool: &sqlx::PgPool, period: Period, now: i64) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('kachat_fee_hours') IS NOT NULL")
+        .fetch_one(pool)
+        .await?;
+    if !exists {
+        return Ok(None);
+    }
     let rows = sqlx::query("SELECT hour, fees_sompi, transactions FROM kachat_fee_hours ORDER BY hour")
         .fetch_all(pool)
         .await?;
