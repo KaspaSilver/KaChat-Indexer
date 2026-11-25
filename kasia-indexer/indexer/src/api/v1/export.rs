@@ -64,7 +64,7 @@ impl ExportApi {
 /// one-entry-per-tx `tx-id-to-*` partitions via approximate_len (O(1)-ish; exact enough for a
 /// dashboard). The KaPosts/chess/public-chat categories are served by the content indexer, which
 /// aggregates this endpoint. All-time totals only; the app shows a dash for the rolling windows.
-/// GET /stats/buckets — per chat category, distinct transactions per hour (the last 60 days) and
+/// GET /stats/buckets — per chat category, distinct transactions per hour (the last 14 days) and
 /// per calendar month (all time), keyed by the bucket's start (ms UTC). 503 until the first scan.
 pub async fn get_stats_buckets() -> impl IntoResponse {
     match crate::stats_windows::buckets() {
@@ -81,20 +81,18 @@ pub async fn get_stats(State(state): State<ExportApi>) -> impl IntoResponse {
             .map(|p| p.approximate_len() as u64)
             .unwrap_or(0)
     };
-    // total from approximate_len (unchanged); 24h/7d/30d from the cached window scan (omitted while
-    // the cache is still warming). Clamp the windows to total so last24h <= last7d <= last30d <= total holds
+    // total from approximate_len (unchanged); 24h/7d from the cached window scan (omitted while
+    // the cache is still warming). Clamp the windows to total so last24h <= last7d <= total holds
     // even though total is an approximate count and the windows are exact.
     let category = |cat: &'static str, tx_id_partition: &str| -> serde_json::Value {
         let total = count(tx_id_partition);
         let mut obj = serde_json::Map::new();
         obj.insert("total".to_string(), serde_json::json!(total));
-        if let Some((d1, d7, d30)) = crate::stats_windows::windows_for(cat) {
-            let d30 = d30.min(total);
-            let d7 = d7.min(d30);
+        if let Some((d1, d7)) = crate::stats_windows::windows_for(cat) {
+            let d7 = d7.min(total);
             let d1 = d1.min(d7);
             obj.insert("last24h".to_string(), serde_json::json!(d1));
             obj.insert("last7d".to_string(), serde_json::json!(d7));
-            obj.insert("last30d".to_string(), serde_json::json!(d30));
         }
         serde_json::Value::Object(obj)
     };

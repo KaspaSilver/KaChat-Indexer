@@ -1,4 +1,4 @@
-//! KaChat Stats: rolling 24h / 7d / 30d windows for the six chat-family categories.
+//! KaChat Stats: rolling 24h / 7d windows for the six chat-family categories.
 //!
 //! The `/stats` totals come from `approximate_len()` of the one-row-per-tx `tx-id-to-*` partitions,
 //! which carry no time, so they can only give all-time totals. This module adds the windows: a
@@ -25,8 +25,8 @@ use indexer_db::messages::handshake::HandshakeKeyBySender;
 use indexer_db::messages::payment::PaymentKeyBySender;
 use indexer_db::messages::self_stash::SelfStashKeyByOwner;
 
-/// category key -> (last24h, last7d, last30d)
-type Windows = HashMap<&'static str, (u64, u64, u64)>;
+/// category key -> (last24h, last7d)
+type Windows = HashMap<&'static str, (u64, u64)>;
 
 /// Per category, distinct transactions per hour (the last `HOURS_KEPT_MS`) and per calendar month
 /// (all time), keyed by the bucket's start (ms UTC). Served at `/stats/buckets` for the webserver's
@@ -37,8 +37,8 @@ pub struct Buckets {
     pub months: HashMap<&'static str, BTreeMap<u64, u64>>,
 }
 
-/// 60 days of hours: a month's window and the month before it.
-const HOURS_KEPT_MS: u64 = 60 * 24 * 3600 * 1000;
+/// 14 days of hours: a week's window and the week before it.
+const HOURS_KEPT_MS: u64 = 14 * 24 * 3600 * 1000;
 const HOUR_MS: u64 = 3600 * 1000;
 
 static CACHE: OnceLock<RwLock<Option<(Windows, Buckets)>>> = OnceLock::new();
@@ -46,9 +46,9 @@ fn cache() -> &'static RwLock<Option<(Windows, Buckets)>> {
     CACHE.get_or_init(|| RwLock::new(None))
 }
 
-/// (last24h, last7d, last30d) for a category, or None until the first scan completes (keep it
-/// omitted, not 0).
-pub fn windows_for(category: &str) -> Option<(u64, u64, u64)> {
+/// (last24h, last7d) for a category, or None until the first scan completes (keep it omitted,
+/// not 0).
+pub fn windows_for(category: &str) -> Option<(u64, u64)> {
     cache().read().ok()?.as_ref()?.0.get(category).copied()
 }
 
@@ -82,7 +82,7 @@ fn now_ms() -> u64 {
 
 /// One category's counts from one scan.
 struct Scanned {
-    windows: (u64, u64, u64),
+    windows: (u64, u64),
     hours: BTreeMap<u64, u64>,
     months: BTreeMap<u64, u64>,
 }
@@ -96,7 +96,7 @@ fn scan(
     now: u64,
     decode: fn(&[u8]) -> Option<(u64, [u8; 32])>,
 ) -> anyhow::Result<Scanned> {
-    let [d1, d7, d30] = [1, 7, 30].map(|days| now.saturating_sub(days * 24 * HOUR_MS));
+    let [d1, d7] = [1, 7].map(|days| now.saturating_sub(days * 24 * HOUR_MS));
     let hours_from = now.saturating_sub(HOURS_KEPT_MS);
     let part = tx_keyspace.open_partition(partition, PartitionCreateOptions::default())?;
     let rtx = tx_keyspace.read_tx();
@@ -104,7 +104,7 @@ fn scan(
     // set would hold every tx id ever stored. Older months count each key once; the main source
     // of repeats, a message's zero-sender key, is skipped by its decoder.
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
-    let mut out = Scanned { windows: (0, 0, 0), hours: BTreeMap::new(), months: BTreeMap::new() };
+    let mut out = Scanned { windows: (0, 0), hours: BTreeMap::new(), months: BTreeMap::new() };
     for kv in rtx.iter(&part) {
         let (k, _v) = kv?;
         let Some((bt, tx)) = decode(k.as_ref()) else { continue };
@@ -113,7 +113,6 @@ fn scan(
         }
         out.windows.0 += u64::from(bt > d1);
         out.windows.1 += u64::from(bt > d7);
-        out.windows.2 += u64::from(bt > d30);
         if bt >= hours_from {
             *out.hours.entry(bt / HOUR_MS * HOUR_MS).or_default() += 1;
         }
