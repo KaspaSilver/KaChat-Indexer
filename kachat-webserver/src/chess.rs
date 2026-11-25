@@ -5,7 +5,8 @@
 //!   - KaChat/Models/ChessTournamentModels.swift (wire message, tournament/game state)
 //!   - KaChat/Services/ChessTournamentEngine.swift (the reducer + leaderboard)
 //!
-//! Input: the `#chess-arena` broadcast rows (kchat:1:bcast:chess-arena:<json>) in chain order.
+//! Input: the `chess_t` broadcast rows of `#chess-arena` and `#kplay-arcade` (ARENA_ROOMS), merged
+//! in chain order.
 //! Output: every tournament's bracket/results, and the aggregated leaderboard. See
 //! CHESS_TOURNAMENTS.md §2-4, §6.
 
@@ -627,6 +628,9 @@ fn revoke_castling_right_if_corner_touched(sq: Square, board: &mut Board) {
 // ---------------------------------------------------------------------------
 
 pub const ARENA_CHANNEL: &str = "chess-arena";
+/// The rooms duels and tournaments are read from: `#chess-arena`, and `#kplay-arcade`, KaPlay's one
+/// room (KPLAY_ONE_ROOM.md). An event is keyed by its id `t`, not its room.
+pub const ARENA_ROOMS: [&str; 2] = [ARENA_CHANNEL, crate::arcade::ARCADE_CHANNEL];
 const PLAYER_COUNT: usize = 8;
 const CLOCK_MS: i64 = 5 * 60 * 1000;
 /// Chain time is charged only past an allowance per move, so the seconds a move spends
@@ -1458,7 +1462,8 @@ fn leaderboard(tournaments: &HashMap<String, Tournament>, since_ms: i64) -> Vec<
 // Public entry points for the HTTP layer
 // ---------------------------------------------------------------------------
 
-/// A raw chess-arena or chess-bots broadcast row (as read from kachat_broadcasts).
+/// A raw KaPlay room row (as read from kachat_broadcasts): `#chess-arena`, `#chess-bots` or
+/// `#kplay-arcade`.
 pub struct ArenaRow {
     pub tx_id: String,
     pub sender: String,
@@ -1546,6 +1551,8 @@ pub fn compute_all(rows: Vec<ArenaRow>, now_ms: i64) -> ArenaSnapshot {
 
 /// One transaction per finished bot game: kchat:1:bcast:chess-bots:<json>, signed by the player.
 pub const BOTS_CHANNEL: &str = "chess-bots";
+/// The rooms bot results are read from: `#chess-bots`, and `#kplay-arcade` (KPLAY_ONE_ROOM.md).
+pub const BOT_ROOMS: [&str; 2] = [BOTS_CHANNEL, crate::arcade::ARCADE_CHANNEL];
 const BOT_LEVELS: std::ops::RangeInclusive<i64> = 1..=5;
 const BOT_END_REASONS: [&str; 6] = [
     "checkmate",
@@ -2138,5 +2145,31 @@ mod tests {
         };
         assert_eq!(summary(&snap.all_time), [(3, 1, 1), (5, 1, 0)]);
         assert_eq!(summary(&snap.monthly), [(5, 1, 0)]);
+    }
+
+    #[test]
+    fn one_room_holds_every_kaplay_kind() {
+        // KPLAY_ONE_ROOM.md: #kplay-arcade holds duel events, bot results and arcade stamps, and
+        // each engine reads only its own kind. The duel opens in #chess-arena and is joined from
+        // #kplay-arcade: the rows merge into one duel by `t`, in chain order.
+        let t = LEADERBOARD_FRESH_FROM_MS + 1_000;
+        let join = |tx: &str, who: &str, bt: i64| ev(tx, who, bt, r#"{"type":"chess_t","v":1,"t":"duel-1","a":"join"}"#);
+        let stamp = r#"{"g":"00000001-0000-4000-8000-000000000001","game":"2048","m":"LURD","score":4,"seed":"0000000000000001","type":"arcade","v":1}"#;
+        let room = || {
+            vec![
+                join("d1", "alice", t),
+                ev("s", "carol", t + 1, stamp),
+                bot_win("b", "bob", t + 2, 1, SCHOLARS_MATE),
+                join("d2", "bob", t + 3),
+            ]
+        };
+        let ts = events(room());
+        assert_eq!(ts.len(), 1);
+        let g = ts["duel-1"].game(1, 0).unwrap();
+        assert_eq!((g.white.as_str(), g.black.as_str()), ("alice", "bob"));
+        assert_eq!(bot3(room()), (1, vec![("bob".into(), 4)]));
+        let rows = room();
+        assert_eq!(rows.iter().filter(|r| bot_claim(r).is_some()).count(), 1);
+        assert!(crate::arcade::check_row(&rows[0]).is_none() && crate::arcade::check_row(&rows[2]).is_none());
     }
 }

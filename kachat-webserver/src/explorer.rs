@@ -31,7 +31,7 @@ const K_EVENTS: &str = "\
     UNION ALL SELECT 'kapostActions', block_time FROM k_deletes \
     UNION ALL SELECT 'kapostActions', block_time FROM k_poll_votes \
     UNION ALL SELECT 'publicChats', block_time FROM kachat_broadcasts WHERE channel NOT IN ('chess-arena', 'chess-bots', 'kplay-arcade') \
-    UNION ALL SELECT 'chessMoves', block_time FROM kachat_broadcasts WHERE channel = 'chess-arena' AND content LIKE '%\"a\":\"move\"%' \
+    UNION ALL SELECT 'chessMoves', block_time FROM kachat_broadcasts WHERE (channel = 'chess-arena' OR (channel = 'kplay-arcade' AND content LIKE '%\"type\":\"chess_t\"%')) AND content LIKE '%\"a\":\"move\"%' \
     UNION ALL SELECT 'arcadeScores', block_time FROM kachat_broadcasts WHERE channel = 'kplay-arcade' AND content LIKE '%\"type\":\"arcade\"%'";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

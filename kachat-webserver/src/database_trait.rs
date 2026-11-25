@@ -214,26 +214,27 @@ pub trait DatabaseInterface: Send + Sync {
         before: Option<i64>,
     ) -> DatabaseResult<(Vec<BroadcastMessage>, bool)>;
 
-    // Chess Tournaments (5.1): every retained chess-arena row for the leaderboard replay, as
-    // (tx_id_hex, sender_address, block_time, content). The engine sorts internally.
+    // Chess Tournaments (5.1): every retained `chess_t` row of chess::ARENA_ROOMS for the
+    // leaderboard replay, as (tx_id_hex, sender_address, block_time, content). The engine sorts
+    // internally.
     async fn get_chess_arena_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>>;
 
     // Chess bot and KaPlay Arcade boards, read incrementally (snapshot::RowMemo): up to `limit`
-    // rows of `channel` with an insertion id above `after_id`, as (id, row), by id.
+    // rows of the `channels` with an insertion id above `after_id`, as (id, row), by id.
     async fn get_channel_rows_after(
         &self,
-        channel: &str,
+        channels: &[&str],
         after_id: i64,
         limit: i64,
     ) -> DatabaseResult<Vec<(i64, crate::chess::ArenaRow)>>;
-    // How many rows `channel` holds with an id up to `up_to_id`, and every tx id (hex) it holds:
-    // to notice deleted or missed rows.
-    async fn count_channel_rows(&self, channel: &str, up_to_id: i64) -> DatabaseResult<i64>;
-    async fn get_channel_tx_ids(&self, channel: &str) -> DatabaseResult<Vec<String>>;
-    // The rows of `channel` with these tx ids (hex), as (id, row).
+    // How many rows the `channels` hold with an id up to `up_to_id`, and every tx id (hex) they
+    // hold: to notice deleted or missed rows.
+    async fn count_channel_rows(&self, channels: &[&str], up_to_id: i64) -> DatabaseResult<i64>;
+    async fn get_channel_tx_ids(&self, channels: &[&str]) -> DatabaseResult<Vec<String>>;
+    // The rows of the `channels` with these tx ids (hex), as (id, row).
     async fn get_channel_rows_by_tx(
         &self,
-        channel: &str,
+        channels: &[&str],
         tx_ids: &[String],
     ) -> DatabaseResult<Vec<(i64, crate::chess::ArenaRow)>>;
 

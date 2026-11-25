@@ -55,7 +55,8 @@ pub struct AppState {
     /// Chess leaderboard: replaying the whole arena is expensive, so cache the derived views
     /// (one refresh at a time, never a failed one: crate::snapshot).
     pub chess_cache: Arc<SnapshotCache<ChessSnapshot>>,
-    /// Chess bot leaderboards: each chess-bots row replayed once (RowMemo), cached the same way.
+    /// Chess bot leaderboards: each chess-bots and kplay-arcade row judged once (RowMemo), cached the
+    /// same way.
     pub chess_bots_cache: Arc<SnapshotCache<ChessBotsSnapshot, RowMemo<crate::chess::BotClaim>>>,
     /// KaPlay Arcade boards: each kplay-arcade row replayed once, cached the same way.
     pub arcade_cache: Arc<SnapshotCache<crate::arcade::ArcadeSnapshot, RowMemo<crate::arcade::CheckedStamp>>>,
@@ -71,7 +72,7 @@ const CHESS_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Rows read per query while bringing a room's RowMemo up to date.
 const ROOM_PAGE_ROWS: i64 = 20_000;
 
-/// Both periods of the bot boards, from one chess-bots snapshot.
+/// Both periods of the bot boards, from one bot-rooms snapshot.
 #[derive(Clone, Default)]
 pub struct ChessBotsSnapshot {
     bots: Vec<ChessBotBoard>,
@@ -144,18 +145,18 @@ async fn on_memo<V: Send + 'static, R: Send + 'static>(
     Ok(out)
 }
 
-/// Bring a KaPlay room's memo up to date and build its boards: judge only the rows added since
+/// Bring a KaPlay board's memo (one or more rooms) up to date and build its boards: judge only the rows added since
 /// the last refresh (and any the count says were missed), forget deleted ones, then `build`.
 async fn refresh_room<V: Send + 'static, T: Send + 'static>(
     db: &Arc<dyn DatabaseInterface>,
-    channel: &'static str,
+    channels: &'static [&'static str],
     memo: &mut RowMemo<V>,
     judge: fn(&crate::chess::ArenaRow) -> Option<V>,
     build: fn(&RowMemo<V>, i64) -> T,
 ) -> Result<T, String> {
     let mut after = memo.fetch_after();
     loop {
-        let page = db.get_channel_rows_after(channel, after, ROOM_PAGE_ROWS).await.map_err(|e| format!("{e:?}"))?;
+        let page = db.get_channel_rows_after(channels, after, ROOM_PAGE_ROWS).await.map_err(|e| format!("{e:?}"))?;
         let full = page.len() as i64 >= ROOM_PAGE_ROWS;
         after = page.last().map_or(after, |(id, _)| *id);
         let fresh = memo.unseen(page);
@@ -169,13 +170,13 @@ async fn refresh_room<V: Send + 'static, T: Send + 'static>(
     // Up to the highest id read, the room holds exactly the memo's rows unless some were deleted
     // (an admin delete, a blocklist purge) or committed below the overlap window. A count that
     // differs lists the room's tx ids and reconciles.
-    let stored = db.count_channel_rows(channel, memo.last_id()).await.map_err(|e| format!("{e:?}"))?;
+    let stored = db.count_channel_rows(channels, memo.last_id()).await.map_err(|e| format!("{e:?}"))?;
     if stored != memo.len() as i64 {
-        let ids = db.get_channel_tx_ids(channel).await.map_err(|e| format!("{e:?}"))?;
+        let ids = db.get_channel_tx_ids(channels).await.map_err(|e| format!("{e:?}"))?;
         let missing: Vec<String> = memo.missing(&ids).into_iter().cloned().collect();
         let mut late = Vec::new();
         for chunk in missing.chunks(ROOM_PAGE_ROWS as usize) {
-            late.extend(db.get_channel_rows_by_tx(channel, chunk).await.map_err(|e| format!("{e:?}"))?);
+            late.extend(db.get_channel_rows_by_tx(channels, chunk).await.map_err(|e| format!("{e:?}"))?);
         }
         let late = memo.unseen(late);
         on_memo(memo, move |m| {
@@ -195,7 +196,7 @@ async fn arcade_snapshot(state: &AppState) -> Option<crate::arcade::ArcadeSnapsh
         .arcade_cache
         .get(CHESS_CACHE_TTL, "arcade boards", move |memo| {
             Box::pin(async move {
-                refresh_room(&db, crate::arcade::ARCADE_CHANNEL, memo, crate::arcade::check_row, |m, now| {
+                refresh_room(&db, &crate::arcade::ARCADE_ROOMS, memo, crate::arcade::check_row, |m, now| {
                     crate::arcade::snapshot(m.counted(), now)
                 })
                 .await
@@ -204,14 +205,15 @@ async fn arcade_snapshot(state: &AppState) -> Option<crate::arcade::ArcadeSnapsh
         .await
 }
 
-/// Serve the bot boards from cache, bringing the chess-bots memo up to date when stale.
+/// Serve the bot boards from cache, bringing the chess-bots and kplay-arcade memo up to date when
+/// stale.
 async fn chess_bots_snapshot(state: &AppState) -> Option<ChessBotsSnapshot> {
     let db = state.db.clone();
     state
         .chess_bots_cache
         .get(CHESS_CACHE_TTL, "chess bot boards", move |memo| {
             Box::pin(async move {
-                refresh_room(&db, crate::chess::BOTS_CHANNEL, memo, crate::chess::bot_claim, |m, now| {
+                refresh_room(&db, &crate::chess::BOT_ROOMS, memo, crate::chess::bot_claim, |m, now| {
                     ChessBotsSnapshot::from_boards(crate::chess::bots_snapshot(m.counted(), now))
                 })
                 .await
@@ -1329,7 +1331,8 @@ async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
 
     let chess_moves = stats_count(pool,
         "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7 \
-         FROM kachat_broadcasts WHERE channel = 'chess-arena' AND content LIKE '%\"a\":\"move\"%'", cutoffs).await;
+         FROM kachat_broadcasts WHERE (channel = 'chess-arena' OR (channel = 'kplay-arcade' AND content LIKE '%\"type\":\"chess_t\"%')) \
+           AND content LIKE '%\"a\":\"move\"%'", cutoffs).await;
     let (k, v) = cat("chessMoves", chess_moves); categories.insert(k, v);
 
     let arcade = stats_count(pool,

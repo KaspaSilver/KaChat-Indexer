@@ -8,6 +8,9 @@ use std::collections::{HashMap, HashSet};
 use crate::chess::{ArenaRow, period_since_ms};
 
 pub const ARCADE_CHANNEL: &str = "kplay-arcade";
+/// The rooms arcade stamps are read from. `#kplay-arcade` also holds chess rows, which
+/// `check_row` skips.
+pub const ARCADE_ROOMS: [&str; 1] = [ARCADE_CHANNEL];
 
 /// A stamp is a short JSON object; anything much larger isn't one.
 const MAX_STAMP_CHARS: usize = 24_000;
