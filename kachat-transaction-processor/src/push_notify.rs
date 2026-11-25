@@ -43,9 +43,153 @@ fn enabled() -> bool {
 }
 
 tokio::task_local! {
-    /// True while a worker processes a transaction older than a few minutes (a reindex, a
-    /// catch-up after downtime): its pushes would be stale news, so none are sent.
+    /// True while a worker processes a transaction whose pushes would be stale news (a reindex,
+    /// a startup catch-up, the ingester's backlog after an outage), so none are sent.
     pub static QUIET: bool;
+}
+
+/// A transaction this much older than now is the ingester's backlog after an outage, not news:
+/// it is stored, but it pushes nothing (worker.rs, and live room messages).
+pub const BACKLOG_PUSH_MAX_AGE_MS: i64 = 30 * 60 * 1000;
+
+/// A map whose entries expire `ttl` after they were put, holding at most `cap` of them (the
+/// oldest go first). Entries are put in time order, so the queue's front is always the oldest.
+struct TtlMap<K, V> {
+    ttl: std::time::Duration,
+    cap: usize,
+    at: std::collections::HashMap<K, (std::time::Instant, V)>,
+    order: std::collections::VecDeque<(K, std::time::Instant)>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> TtlMap<K, V> {
+    fn new(ttl: std::time::Duration, cap: usize) -> Self {
+        Self { ttl, cap, at: Default::default(), order: Default::default() }
+    }
+
+    /// Drops the expired entries, and the oldest while there are more than `keep`.
+    fn evict(&mut self, now: std::time::Instant, keep: usize) {
+        while let Some((key, put)) = self.order.front() {
+            if now.saturating_duration_since(*put) < self.ttl && self.order.len() <= keep {
+                break;
+            }
+            if self.at.get(key).is_some_and(|(t, _)| t == put) {
+                self.at.remove(key);
+            }
+            self.order.pop_front();
+        }
+    }
+
+    fn get(&mut self, key: &K, now: std::time::Instant) -> Option<V> {
+        self.evict(now, self.cap);
+        self.at.get(key).map(|(_, v)| v.clone())
+    }
+
+    fn put(&mut self, key: K, value: V, now: std::time::Instant) {
+        self.evict(now, self.cap.saturating_sub(1));
+        self.at.insert(key.clone(), (now, value));
+        self.order.push_back((key, now));
+    }
+}
+
+/// How long one sender's push of one kind to one recipient holds back the next: a follow, a
+/// like or a room @mention cycled (follow, unfollow, follow...) rings once per window.
+const PUSH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// (sender, recipient, kind) pairs tracked at most; the oldest go first.
+const PUSH_COOLDOWN_CAP: usize = 50_000;
+
+/// The pushes that rang in the last `PUSH_COOLDOWN`, by (sender, recipient, kind). In memory
+/// only: a restart rings each once more, which is fine.
+struct Cooldown(TtlMap<(String, String, &'static str), ()>);
+
+impl Cooldown {
+    fn new(ttl: std::time::Duration, cap: usize) -> Self {
+        Self(TtlMap::new(ttl, cap))
+    }
+
+    /// True when this (sender, recipient, kind) may ring now (and starts its window); false for
+    /// a repeat inside the window, which does not extend it.
+    fn allow(&mut self, sender: &str, recipient: &str, kind: &'static str, now: std::time::Instant) -> bool {
+        let key = (sender.to_string(), recipient.to_string(), kind);
+        if self.0.get(&key, now).is_some() {
+            return false;
+        }
+        self.0.put(key, (), now);
+        true
+    }
+}
+
+static PUSH_COOLDOWNS: Lazy<std::sync::Mutex<Cooldown>> =
+    Lazy::new(|| std::sync::Mutex::new(Cooldown::new(PUSH_COOLDOWN, PUSH_COOLDOWN_CAP)));
+
+fn cooldown_allows(sender: &str, recipient: &str, kind: &'static str) -> bool {
+    PUSH_COOLDOWNS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .allow(sender, recipient, kind, std::time::Instant::now())
+}
+
+/// At most this many room @mention pushes ring one recipient per minute, whoever sends them.
+const ROOM_MENTIONS_PER_MINUTE: u32 = 5;
+/// Recipients tracked at most for that cap; the oldest windows go first.
+const ROOM_MENTION_CAP_RECIPIENTS: usize = 20_000;
+
+/// Room @mention pushes per recipient in the current minute (a fixed window from its first).
+struct MentionCap {
+    max: u32,
+    windows: TtlMap<String, (std::time::Instant, u32)>,
+}
+
+impl MentionCap {
+    fn new(max: u32, cap: usize) -> Self {
+        Self { max, windows: TtlMap::new(std::time::Duration::from_secs(60), cap) }
+    }
+
+    /// True when `recipient` may get one more room @mention push this minute (and counts it).
+    fn allow(&mut self, recipient: &str, now: std::time::Instant) -> bool {
+        let key = recipient.to_string();
+        match self.windows.get(&key, now) {
+            None => {
+                self.windows.put(key, (now, 1), now);
+                true
+            }
+            Some((_, n)) if n >= self.max => false,
+            Some((start, n)) => {
+                // Same window: the count goes up, the window keeps its start.
+                if let Some(entry) = self.windows.at.get_mut(&key) {
+                    entry.1 = (start, n + 1);
+                }
+                true
+            }
+        }
+    }
+}
+
+static ROOM_MENTION_CAP: Lazy<std::sync::Mutex<MentionCap>> =
+    Lazy::new(|| std::sync::Mutex::new(MentionCap::new(ROOM_MENTIONS_PER_MINUTE, ROOM_MENTION_CAP_RECIPIENTS)));
+
+/// Whether a room @mention of `recipient` by `sender` rings: once per sender and recipient per
+/// `PUSH_COOLDOWN`, and at most `ROOM_MENTIONS_PER_MINUTE` a minute per recipient.
+fn room_mention_allowed(sender: &str, recipient: &str) -> bool {
+    if !cooldown_allows(sender, recipient, "room_mention") {
+        return false;
+    }
+    ROOM_MENTION_CAP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .allow(recipient, std::time::Instant::now())
+}
+
+/// KaPosts kinds an actor can cycle at will (follow / unfollow, like / unvote, repost /
+/// unquote): each rings once per `PUSH_COOLDOWN` per actor and recipient. Replies, quotes,
+/// mentions and tips are new content every time and are not held back.
+fn kaposts_kind_cycles(kind: &str) -> Option<&'static str> {
+    match kind {
+        "follow" => Some("follow"),
+        "vote_up" => Some("vote_up"),
+        "vote_down" => Some("vote_down"),
+        "repost" => Some("repost"),
+        _ => None,
+    }
 }
 
 fn quiet() -> bool {
@@ -86,6 +230,7 @@ fn post_inner(
                 if let Some(owner) = name_owner(name).await
                     && owner != sender
                     && !addresses.contains(&owner)
+                    && room_mention_allowed(&sender, &owner)
                 {
                     addresses.push(owner);
                 }
@@ -151,6 +296,16 @@ fn address_from_pubkey_hex(pubkey_hex: &str) -> Option<String> {
         )
         .to_string(),
     )
+}
+
+/// A pubkey hex's x-only part (its last 64 characters), lowercased: one person whichever form
+/// (`02x`, `03x`, `x`) an action carries.
+fn xonly_lower(pubkey_hex: &str) -> String {
+    let pk = pubkey_hex.trim().to_ascii_lowercase();
+    match pk.len().checked_sub(64) {
+        Some(start) if pk.is_char_boundary(start) => pk[start..].to_string(),
+        _ => pk,
+    }
 }
 
 fn truncate_chars(s: &str, n: usize) -> String {
@@ -372,20 +527,51 @@ pub fn room_mention_names(text: &str) -> Vec<String> {
     names
 }
 
+/// How long a name's owner (or that it has none) is remembered, and how many names at most.
+const NAME_OWNER_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const NAME_OWNER_CAP: usize = 10_000;
+
+/// `name_owner` answers by name: `Some(owner)` or `None` (no owner), both remembered.
+static NAME_OWNERS: Lazy<std::sync::Mutex<TtlMap<String, Option<String>>>> =
+    Lazy::new(|| std::sync::Mutex::new(TtlMap::new(NAME_OWNER_TTL, NAME_OWNER_CAP)));
+
 /// The address a `.kachat` name resolves to (its owner, while active or in grace), from the names
-/// webserver (`KACHAT_IDENTITY_URL`). Short (2 s); any failure is no address.
+/// webserver (`KACHAT_IDENTITY_URL`). Short (2 s); any failure is no address. A clear answer,
+/// owner or none, is cached for `NAME_OWNER_TTL`, so a burst of @mentions costs one lookup; a
+/// failed lookup (timeout, 5xx) is not cached.
 async fn name_owner(name: &str) -> Option<String> {
-    let base = identity_base_url()?;
+    let cached = NAME_OWNERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&name.to_string(), std::time::Instant::now());
+    if let Some(owner) = cached {
+        return owner;
+    }
+    let owner = name_owner_lookup(name).await.ok()?;
+    NAME_OWNERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .put(name.to_string(), owner.clone(), std::time::Instant::now());
+    owner
+}
+
+/// One `/names/{name}` lookup: `Ok` with the owner or none for an answer, `Err` when there was
+/// none to be had (no URL, unreachable, a server error).
+async fn name_owner_lookup(name: &str) -> Result<Option<String>, ()> {
+    let base = identity_base_url().ok_or(())?;
     let resp = CLIENT
         .get(format!("{base}/names/{name}"))
         .timeout(std::time::Duration::from_secs(2))
         .send()
         .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+        .map_err(|_| ())?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
     }
-    name_owner_from(&resp.json::<serde_json::Value>().await.ok()?)
+    if !resp.status().is_success() {
+        return Err(());
+    }
+    Ok(name_owner_from(&resp.json::<serde_json::Value>().await.map_err(|_| ())?))
 }
 
 /// The owner of a `/names/{name}` answer while the name still resolves (active or grace).
@@ -499,6 +685,16 @@ pub fn notify_kaposts(
     post_id: Option<String>,
     tx_id: &str,
 ) {
+    if !enabled() || quiet() {
+        return;
+    }
+    // Follow / unfollow / follow (or like, unvote, like) rings once per cooldown, by x-only key.
+    if let Some(kind) = kaposts_kind_cycles(kind)
+        && !cooldown_allows(&xonly_lower(actor_pubkey), &xonly_lower(target_pubkey), kind)
+    {
+        tracing::debug!("push notify kaposts {kind} held back (cooldown): tx {tx_id}");
+        return;
+    }
     let subtitle = actor_subtitle(actor_pubkey);
     post_with_actor(
         "kaposts",
@@ -608,6 +804,87 @@ mod tests {
         // Once the entry expires the key rings again.
         let later = start + super::MEDIA_NOTE_PUSHED_TTL;
         assert!(pushed.first(key("kaspa", "kaspa:alice", "voice"), later));
+    }
+
+    #[test]
+    fn a_cycled_push_rings_once_per_cooldown() {
+        let ttl = std::time::Duration::from_secs(600);
+        let mut cooldown = super::Cooldown::new(ttl, 100);
+        let start = std::time::Instant::now();
+        assert!(cooldown.allow("alice", "bob", "follow", start));
+        // Follow, unfollow, follow: the second follow inside the window does not ring.
+        assert!(!cooldown.allow("alice", "bob", "follow", start + std::time::Duration::from_secs(5)));
+        // Another kind, recipient or sender is its own window.
+        assert!(cooldown.allow("alice", "bob", "vote_up", start));
+        assert!(cooldown.allow("alice", "carol", "follow", start));
+        assert!(cooldown.allow("dave", "bob", "follow", start));
+        // A held-back repeat does not extend the window: it rings again once the first expires.
+        assert!(!cooldown.allow("alice", "bob", "follow", start + ttl - std::time::Duration::from_secs(1)));
+        assert!(cooldown.allow("alice", "bob", "follow", start + ttl));
+        assert!(!cooldown.allow("alice", "bob", "follow", start + ttl));
+    }
+
+    #[test]
+    fn the_cooldown_is_bounded_oldest_first() {
+        let mut cooldown = super::Cooldown::new(std::time::Duration::from_secs(600), 3);
+        let start = std::time::Instant::now();
+        let at = |s: u64| start + std::time::Duration::from_secs(s);
+        for (i, sender) in ["a", "b", "c", "d"].iter().enumerate() {
+            assert!(cooldown.allow(sender, "r", "follow", at(i as u64)));
+        }
+        assert!(cooldown.0.at.len() <= 3);
+        // "a" was the oldest and made room for "d"; the rest are still held back.
+        assert!(cooldown.allow("a", "r", "follow", at(10)));
+        assert!(!cooldown.allow("d", "r", "follow", at(10)));
+    }
+
+    #[test]
+    fn room_mentions_are_capped_per_recipient_per_minute() {
+        let mut cap = super::MentionCap::new(3, 100);
+        let start = std::time::Instant::now();
+        let at = |s: u64| start + std::time::Duration::from_secs(s);
+        assert!(cap.allow("kaspa:bob", at(0)));
+        assert!(cap.allow("kaspa:bob", at(10)));
+        assert!(cap.allow("kaspa:bob", at(20)));
+        assert!(!cap.allow("kaspa:bob", at(30)));
+        // Someone else has their own count; the next minute starts over.
+        assert!(cap.allow("kaspa:carol", at(30)));
+        assert!(cap.allow("kaspa:bob", at(60)));
+    }
+
+    #[test]
+    fn a_cached_name_answer_expires() {
+        let ttl = std::time::Duration::from_secs(300);
+        let mut cache: super::TtlMap<String, Option<String>> = super::TtlMap::new(ttl, 2);
+        let start = std::time::Instant::now();
+        cache.put("alice".into(), Some("kaspa:qa".into()), start);
+        cache.put("nobody".into(), None, start);
+        assert_eq!(cache.get(&"alice".into(), start), Some(Some("kaspa:qa".into())));
+        // A name without an owner is remembered too.
+        assert_eq!(cache.get(&"nobody".into(), start), Some(None));
+        assert_eq!(cache.get(&"bob".into(), start), None);
+        assert_eq!(cache.get(&"alice".into(), start + ttl), None);
+        // Bounded: a third name pushes out the oldest.
+        cache.put("a".into(), None, start + ttl);
+        cache.put("b".into(), None, start + ttl);
+        cache.put("c".into(), None, start + ttl);
+        assert_eq!(cache.get(&"a".into(), start + ttl), None);
+        assert_eq!(cache.get(&"c".into(), start + ttl), Some(None));
+    }
+
+    #[test]
+    fn only_cyclable_kaposts_kinds_cool_down_and_by_xonly_key() {
+        for kind in ["follow", "vote_up", "vote_down", "repost"] {
+            assert_eq!(super::kaposts_kind_cycles(kind), Some(kind));
+        }
+        for kind in ["reply", "quote", "mention", "tip"] {
+            assert_eq!(super::kaposts_kind_cycles(kind), None);
+        }
+        let x = "ab".repeat(32);
+        assert_eq!(super::xonly_lower(&format!("02{x}")), x);
+        assert_eq!(super::xonly_lower(&format!("03{}", x.to_uppercase())), x);
+        assert_eq!(super::xonly_lower(&x), x);
+        assert_eq!(super::xonly_lower("short"), "short");
     }
 
     #[test]

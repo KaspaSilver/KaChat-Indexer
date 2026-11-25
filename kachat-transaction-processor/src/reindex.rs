@@ -16,11 +16,13 @@
 //!   `kaposts_reindex_status`; a status left at "running" by a restart mid-walk is marked failed
 //!   at the next start (IDX-037).
 //!
-//! Order does not matter: profiles keep the newest by block time, and a follow or block is
-//! ignored when a newer opposing action is known (k_protocol.rs, IDX-035). Pushes stay quiet
-//! for both kinds of re-queued row (worker.rs): a reindexed like is history, and a catch-up row
-//! may already have been pushed before the restart (the push service's dedup is in memory).
-//! Live transactions always push, however late the processor is.
+//! Order does not matter: profiles keep the newest by block time, and a follow, block, vote or
+//! unvote is ignored when a newer opposing action is known (k_protocol.rs, IDX-035). Content the
+//! operator removed (`kachat_removed_txs`) counts as done and is never stored again. Pushes stay
+//! quiet for both kinds of re-queued row (worker.rs): a reindexed like is history, and a catch-up
+//! row may already have been pushed before the restart (the push service's dedup is in memory).
+//! Live transactions push unless they are more than 30 minutes old (the ingester's backlog
+//! after an outage).
 
 use crate::bcast_pending::now_ms;
 use crate::database::DbPool;
@@ -174,10 +176,11 @@ pub async fn run(pool: DbPool, queue: mpsc::UnboundedSender<String>) {
 
 /// Already in one of the processor's tables under this transaction id: indexed, nothing to do.
 /// A recovered row counts only once a worker consumed it - an unconsumed one is queued again
-/// (IDX-038). A delete counts once its tombstone exists (IDX-039).
+/// (IDX-038). A delete counts once its tombstone exists (IDX-039). A transaction whose content
+/// the operator removed (`kachat_removed_txs`) is done too: a reindex never brings it back.
 async fn already_indexed(pool: &DbPool, tx_id: &[u8]) -> Result<bool> {
     let hit: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM k_contents WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_votes WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_follows WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_blocks WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_recovered_transactions WHERE transaction_id = $1 AND consumed_at IS NOT NULL          UNION ALL SELECT 1 FROM kachat_delete_tombstones WHERE transaction_id = $1          LIMIT 1",
+        "SELECT 1 FROM k_contents WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_votes WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_follows WHERE transaction_id = $1          UNION ALL SELECT 1 FROM k_blocks WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_broadcasts WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_recovered_transactions WHERE transaction_id = $1 AND consumed_at IS NOT NULL          UNION ALL SELECT 1 FROM kachat_delete_tombstones WHERE transaction_id = $1          UNION ALL SELECT 1 FROM kachat_removed_txs WHERE transaction_id = $1          LIMIT 1",
     )
     .bind(tx_id)
     .fetch_optional(pool)

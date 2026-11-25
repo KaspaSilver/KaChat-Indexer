@@ -124,6 +124,83 @@ fn blocked_address_xonly(address: &str) -> Option<String> {
     }
 }
 
+/// One refresh of what the admin dashboard controls: the `feature_kaposts` /
+/// `feature_broadcasts` / `feature_kaplay` keys from k_vars (absent key = default ON), the KaPosts
+/// operator addresses and tracked rooms, the personal-mode denylist and the address blocklist.
+/// Flips the runtime switches and lists the processor consults per transaction. A failed read
+/// keeps what was there.
+async fn refresh_flags(flags_pool: &database::DbPool) {
+    use sqlx::Row;
+    if let Ok(rows) = sqlx::query(
+        "SELECT key, value FROM k_vars WHERE key IN ('feature_kaposts', 'feature_broadcasts', 'feature_kaplay', 'kaposts_operator_addresses', 'broadcast_channels')",
+    )
+    .fetch_all(flags_pool)
+    .await
+    {
+        for row in &rows {
+            let key: String = row.get("key");
+            let value: String = row.get("value");
+            match key.as_str() {
+                "feature_kaposts" => k_protocol::FEATURE_KAPOSTS.store(
+                    value.trim().to_lowercase() != "off",
+                    std::sync::atomic::Ordering::Relaxed,
+                ),
+                "feature_kaplay" => k_protocol::FEATURE_KAPLAY.store(
+                    value.trim().to_lowercase() != "off",
+                    std::sync::atomic::Ordering::Relaxed,
+                ),
+                "feature_broadcasts" => k_protocol::FEATURE_BROADCASTS.store(
+                    value.trim().to_lowercase() != "off",
+                    std::sync::atomic::Ordering::Relaxed,
+                ),
+                "kaposts_operator_addresses" => {
+                    // Decode each kaspa address to its x-only pubkey (hex) for matching.
+                    let ops: Vec<String> = value
+                        .split(['\n', '\r', ',', ' ', '\t'])
+                        .filter_map(operator_address_to_xonly)
+                        .collect();
+                    k_protocol::set_kaposts_operators(ops);
+                }
+                "broadcast_channels" => {
+                    // Runtime-configurable tracked-channel set (present, even empty). Absent
+                    // key never reaches here → the processor keeps the compile-time defaults.
+                    let channels: Vec<String> = value
+                        .split(['\n', '\r', ',', ' ', '\t'])
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    k_protocol::set_broadcast_channels(channels);
+                }
+                _ => {}
+            }
+        }
+    }
+    // KaPosts personal-mode block/mute denylist (author pubkeys to never store).
+    if let Ok(rows) =
+        sqlx::query("SELECT encode(pubkey, 'hex') AS pk FROM kachat_kaposts_denylist")
+            .fetch_all(flags_pool)
+            .await
+    {
+        let list: Vec<String> = rows
+            .iter()
+            .map(|r| r.get::<String, _>("pk").to_lowercase())
+            .collect();
+        k_protocol::set_kaposts_denylist(list);
+    }
+    // Address blocklist: addresses nothing is stored from.
+    if let Ok(rows) = sqlx::query("SELECT address FROM kachat_address_blocklist")
+        .fetch_all(flags_pool)
+        .await
+    {
+        let addresses: Vec<String> = rows
+            .iter()
+            .map(|r| r.get::<String, _>("address").trim().to_ascii_lowercase())
+            .collect();
+        let xonly = addresses.iter().filter_map(|a| blocked_address_xonly(a)).collect();
+        k_protocol::set_address_blocklist(addresses, xonly);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing with default INFO level
@@ -226,82 +303,17 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Feature-flag refresher: honor the admin dashboard's indexing toggles. Reads the
-    // `feature_kaposts` / `feature_broadcasts` / `feature_kaplay` keys from k_vars every 15s and
-    // flips the runtime switches the processor consults per transaction. Absent key = default ON.
+    // Feature-flag refresher: honor the admin dashboard's indexing toggles, denylist and
+    // address blocklist (`refresh_flags`), every 15 s. The first refresh runs to completion
+    // here, before the catch-up, the re-queue, the pending queue and the workers start: until it
+    // has, the switches are at their defaults (all on) and the lists empty, so the first catch-up
+    // would store what the operator switched off or blocked.
     let flags_pool = database.pool().clone();
+    refresh_flags(&flags_pool).await;
     let _flags_handle = tokio::spawn(async move {
-        use sqlx::Row;
         loop {
-            if let Ok(rows) = sqlx::query(
-                "SELECT key, value FROM k_vars WHERE key IN ('feature_kaposts', 'feature_broadcasts', 'feature_kaplay', 'kaposts_operator_addresses', 'broadcast_channels')",
-            )
-            .fetch_all(&flags_pool)
-            .await
-            {
-                for row in &rows {
-                    let key: String = row.get("key");
-                    let value: String = row.get("value");
-                    match key.as_str() {
-                        "feature_kaposts" => k_protocol::FEATURE_KAPOSTS.store(
-                            value.trim().to_lowercase() != "off",
-                            std::sync::atomic::Ordering::Relaxed,
-                        ),
-                        "feature_kaplay" => k_protocol::FEATURE_KAPLAY.store(
-                            value.trim().to_lowercase() != "off",
-                            std::sync::atomic::Ordering::Relaxed,
-                        ),
-                        "feature_broadcasts" => k_protocol::FEATURE_BROADCASTS.store(
-                            value.trim().to_lowercase() != "off",
-                            std::sync::atomic::Ordering::Relaxed,
-                        ),
-                        "kaposts_operator_addresses" => {
-                            // Decode each kaspa address to its x-only pubkey (hex) for matching.
-                            let ops: Vec<String> = value
-                                .split(['\n', '\r', ',', ' ', '\t'])
-                                .filter_map(operator_address_to_xonly)
-                                .collect();
-                            k_protocol::set_kaposts_operators(ops);
-                        }
-                        "broadcast_channels" => {
-                            // Runtime-configurable tracked-channel set (present, even empty). Absent
-                            // key never reaches here → the processor keeps the compile-time defaults.
-                            let channels: Vec<String> = value
-                                .split(['\n', '\r', ',', ' ', '\t'])
-                                .map(|s| s.trim().to_lowercase())
-                                .filter(|s| !s.is_empty())
-                                .collect();
-                            k_protocol::set_broadcast_channels(channels);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // KaPosts personal-mode block/mute denylist (author pubkeys to never store).
-            if let Ok(rows) =
-                sqlx::query("SELECT encode(pubkey, 'hex') AS pk FROM kachat_kaposts_denylist")
-                    .fetch_all(&flags_pool)
-                    .await
-            {
-                let list: Vec<String> = rows
-                    .iter()
-                    .map(|r| r.get::<String, _>("pk").to_lowercase())
-                    .collect();
-                k_protocol::set_kaposts_denylist(list);
-            }
-            // Address blocklist: addresses nothing is stored from.
-            if let Ok(rows) = sqlx::query("SELECT address FROM kachat_address_blocklist")
-                .fetch_all(&flags_pool)
-                .await
-            {
-                let addresses: Vec<String> = rows
-                    .iter()
-                    .map(|r| r.get::<String, _>("address").trim().to_ascii_lowercase())
-                    .collect();
-                let xonly = addresses.iter().filter_map(|a| blocked_address_xonly(a)).collect();
-                k_protocol::set_address_blocklist(addresses, xonly);
-            }
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            refresh_flags(&flags_pool).await;
         }
     });
 
