@@ -1,5 +1,5 @@
 use crate::api::to_rpc_address;
-use crate::config::ApnsEnvironment;
+use crate::config::{ApnsEnvironment, PushAuthMode};
 use crate::context::IndexerContext;
 use crate::fcm::{FcmClient, FcmError};
 use crate::webpush::{self, WebPushClient, WebPushConfig, WebPushSendResult, WebPushSubscription};
@@ -18,10 +18,11 @@ use kaspa_rpc_core::{RpcAddress, RpcNetworkType};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::mem::size_of;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, oneshot};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const MAX_WATCHED_ADDRESSES: usize = 256;
 const MAX_WATCHED_GROUP_IDS: usize = 256;
@@ -73,6 +74,10 @@ pub(crate) fn push_http_client() -> reqwest::Result<reqwest::Client> {
 }
 
 const WATCH_ONLY_RATE_WINDOW: Duration = Duration::from_secs(3600);
+/// An invalid-token count not bumped for this long is forgotten (the next failure starts at 1).
+const INVALID_TOKEN_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
+/// How often the dispatcher's per-token maps are pruned.
+const TOKEN_MAPS_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone)]
 pub struct WalletBinding {
@@ -97,9 +102,14 @@ pub struct PushRegistry {
     alias_cache: HashMap<String, HashSet<String>>,
     primary_cache: HashMap<String, Option<AddressPayload>>,
     capability_cache: HashMap<String, HashSet<String>>,
+    /// Address Activity: who watches what, in memory. Built once at startup and kept up to date
+    /// by register/update/unregister, so neither a registration nor a funds event scans the store.
+    watch_only_index: WatchOnlyIndex,
 }
 
 impl PushRegistry {
+    /// Opens the registry. Startup work, once: clears the stored claims the current rules would
+    /// refuse (`clear_unbound_claims`), then builds the watch-only index.
     pub fn new(
         tx_keyspace: fjall::TxKeyspace,
         device_partition: DeviceRegistrationPartition,
@@ -108,7 +118,7 @@ impl PushRegistry {
         primary_address_partition: PrimaryAddressPartition,
         metrics: SharedMetrics,
     ) -> Self {
-        Self {
+        let mut registry = Self {
             tx_keyspace,
             device_partition,
             watched_partition,
@@ -118,7 +128,79 @@ impl PushRegistry {
             alias_cache: HashMap::new(),
             primary_cache: HashMap::new(),
             capability_cache: HashMap::new(),
+            watch_only_index: WatchOnlyIndex::default(),
+        };
+        // The same mode the API authenticates with (main.rs reads it from the same config).
+        let legacy = crate::config::get_indexer_config()
+            .map(|config| config.push_auth_mode == PushAuthMode::Legacy)
+            .unwrap_or(false);
+        if let Err(err) = registry.clear_unbound_claims(legacy) {
+            warn!("[PushRegistry] could not re-check stored claims: {err:#}");
         }
+        registry.load_watch_only_index();
+        registry
+    }
+
+    /// Startup migration. Before 10715be a device could store anyone's `primary_address`, and
+    /// `kaposts_pubkey` was never tied to the signer, so a device could get another wallet's
+    /// name offers, room mentions, group adds, inbox pushes, VoIP rings and KaPost activity.
+    /// Every stored claim is re-checked by the rule a new one must pass now (`claim_is_bound`)
+    /// and cleared when it fails, with its primary-address index entry. A device that
+    /// re-registers with a valid signature gets it back. `unsigned_may_claim` = legacy auth mode,
+    /// where an unsigned registration may still claim both. Returns (primaries, KaPost keys)
+    /// cleared.
+    pub fn clear_unbound_claims(&mut self, unsigned_may_claim: bool) -> anyhow::Result<(usize, usize)> {
+        let mut fixed = Vec::new();
+        let (mut primaries, mut kaposts_keys) = (0, 0);
+        {
+            let rtx = self.tx_keyspace.read_tx();
+            for entry in self.device_partition.iter_values_rtx(&rtx) {
+                let value = entry?;
+                let Ok(mut reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                    continue;
+                };
+                let old_primary = reg.primary_address.clone();
+                let mut changed = false;
+                if !primary_is_bound(&reg, unsigned_may_claim) {
+                    reg.primary_address = None;
+                    primaries += 1;
+                    changed = true;
+                }
+                if !kaposts_pubkey_is_bound(&reg, unsigned_may_claim) {
+                    reg.kaposts_pubkey = None;
+                    kaposts_keys += 1;
+                    changed = true;
+                }
+                if changed {
+                    fixed.push((reg, old_primary));
+                }
+            }
+        }
+        if !fixed.is_empty() {
+            let mut wtx = self.tx_keyspace.write_tx()?;
+            for (reg, old_primary) in &fixed {
+                let token_key = reg.device_token.as_bytes();
+                if reg.primary_address.is_none()
+                    && let Some(old) = old_primary.as_deref().and_then(|a| address_to_payload(a).ok())
+                {
+                    self.primary_address_partition.remove_wtx(&mut wtx, &old, token_key);
+                }
+                self.device_partition
+                    .insert_wtx(&mut wtx, token_key, &serde_json::to_vec(reg)?);
+            }
+            match wtx.commit() {
+                Ok(result) if result.is_ok() => {}
+                Ok(_) => anyhow::bail!("Commit conflict"),
+                Err(err) => return Err(err.into()),
+            }
+            for (reg, _) in &fixed {
+                self.clear_primary_address(&reg.device_token);
+            }
+        }
+        info!(
+            "[PushRegistry] stored claims re-checked: cleared {primaries} primary address(es) and {kaposts_keys} KaPost key(s) not bound to the device's wallet"
+        );
+        Ok((primaries, kaposts_keys))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -291,13 +373,6 @@ impl PushRegistry {
                     && reg.app == normalized_app
             })
             .unwrap_or(false);
-        let watch_only_changed = existing
-            .as_ref()
-            .map(|reg| {
-                reg.watch_only_addresses != normalized_watch_only
-                    || (!normalized_watch_only.is_empty() && reg.watched_addresses != addresses)
-            })
-            .unwrap_or(!normalized_watch_only.is_empty());
         if addresses_unchanged
             && group_ids_unchanged
             && capabilities_unchanged
@@ -457,11 +532,9 @@ impl PushRegistry {
                 if !had_existing {
                     self.metrics.increment_push_registered_devices(1);
                 }
-                // Address Activity: if this device's watch-only set changed, refresh the global
-                // set the block processor gates funds-detection on.
-                if watch_only_changed {
-                    self.rebuild_watch_only_global();
-                }
+                // Address Activity: keep the watch-only index (and the block processor's gate)
+                // in step with this device.
+                self.refresh_watch_only(&token, Some(&registration));
                 Ok(())
             }
             Ok(_) => {
@@ -644,13 +717,6 @@ impl PushRegistry {
                     && reg.app == normalized_app
             })
             .unwrap_or(false);
-        let watch_only_changed = existing
-            .as_ref()
-            .map(|reg| {
-                reg.watch_only_addresses != normalized_watch_only
-                    || (!normalized_watch_only.is_empty() && reg.watched_addresses != addresses)
-            })
-            .unwrap_or(!normalized_watch_only.is_empty());
         if addresses_unchanged
             && group_ids_unchanged
             && capabilities_unchanged
@@ -808,11 +874,9 @@ impl PushRegistry {
                 if !had_existing {
                     self.metrics.increment_push_registered_devices(1);
                 }
-                // Address Activity: if this device's watch-only set changed, refresh the global
-                // set the block processor gates funds-detection on.
-                if watch_only_changed {
-                    self.rebuild_watch_only_global();
-                }
+                // Address Activity: keep the watch-only index (and the block processor's gate)
+                // in step with this device.
+                self.refresh_watch_only(&token, Some(&registration));
                 Ok(())
             }
             Ok(_) => {
@@ -840,10 +904,6 @@ impl PushRegistry {
             validate_unregister_binding(existing.as_ref(), wallet_pubkey.as_deref())?;
         }
         let had_existing = existing.is_some();
-        let had_watch_only = existing
-            .as_ref()
-            .map(|reg| !reg.watch_only_addresses.is_empty())
-            .unwrap_or(false);
         let token_key = token.as_bytes();
 
         self.metrics.increment_db_write_ops_total(1);
@@ -884,9 +944,7 @@ impl PushRegistry {
                     self.metrics.decrement_push_registered_devices(1);
                 }
                 // Address Activity: dropping a device that watched addresses shrinks the global set.
-                if had_watch_only {
-                    self.rebuild_watch_only_global();
-                }
+                self.refresh_watch_only(&token, None);
                 Ok(())
             }
             Ok(_) => {
@@ -1143,72 +1201,49 @@ impl PushRegistry {
         Ok(tokens)
     }
 
-    /// Address Activity: recompute the union of every device's `watch_only_addresses` and hand it
-    /// to the block processor's global gate, with the `watched_addresses` (the chatting address)
-    /// of those same devices: a send from one of those is a self-send too (K_ALL_IN_ONE_PUSH.md
-    /// §2), so the block processor records what pays them without announcing it. Called after any
-    /// registration change that touched either, and once at startup. Scans all registrations
-    /// (registration changes are infrequent vs. blocks, so no incremental index is kept).
-    pub fn rebuild_watch_only_global(&self) {
+    /// Address Activity, at startup: builds the watch-only index from every stored registration
+    /// (the one full scan) and publishes it.
+    fn load_watch_only_index(&mut self) {
+        let mut index = WatchOnlyIndex::default();
         let rtx = self.tx_keyspace.read_tx();
-        let mut set: HashSet<AddressPayload> = HashSet::new();
-        let mut own: HashSet<AddressPayload> = HashSet::new();
         for entry in self.device_partition.iter_values_rtx(&rtx) {
             let Ok(value) = entry else { continue };
             let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
                 continue;
             };
-            for address in &reg.watch_only_addresses {
-                if let Ok(payload) = address_to_payload(address) {
-                    set.insert(payload);
-                }
-            }
-            if reg.watch_only_addresses.is_empty() {
-                continue;
-            }
-            own.extend(own_addresses(&reg));
+            index.set(&reg.device_token, Some(&reg));
         }
-        indexer_actors::set_watch_only_addresses(set);
-        indexer_actors::set_self_send_addresses(own);
+        index.publish();
+        self.watch_only_index = index;
+    }
+
+    /// Address Activity: hand the block processor's global gate the union of every device's
+    /// `watch_only_addresses`, with the own chatting address of those same devices: a send from
+    /// one of those is a self-send too (K_ALL_IN_ONE_PUSH.md §2), so the block processor records
+    /// what pays them without announcing it. Both come from the in-memory index; no scan.
+    pub fn rebuild_watch_only_global(&self) {
+        self.watch_only_index.publish();
+    }
+
+    /// Address Activity: after a registration was stored or removed, updates its index entry and
+    /// republishes the global sets only if an address entered or left them.
+    fn refresh_watch_only(&mut self, token: &str, registration: Option<&DeviceRegistration>) {
+        if self.watch_only_index.set(token, registration) {
+            self.watch_only_index.publish();
+        }
     }
 
     /// Address Activity: devices to notify that `address` was credited. Matches devices whose
     /// `watch_only_addresses` include `address`, and drops any device that also watches one of
     /// `senders` (a self-send: the owner funded their own address, so no ping;
     /// docs/KACHAT_WALLET_PUSH.md §1), counting its own chatting address as its own too
-    /// (`own_addresses`). Iterates all registrations (funds events are gated on the global
-    /// watch-only set, so this only runs for real hits).
+    /// (`own_addresses`). Reads the in-memory index only.
     pub fn watch_only_tokens(
         &self,
         address: &AddressPayload,
         senders: &[AddressPayload],
     ) -> anyhow::Result<Vec<String>> {
-        let rtx = self.tx_keyspace.read_tx();
-        let mut tokens = Vec::new();
-        for entry in self.device_partition.iter_values_rtx(&rtx) {
-            let value = entry?;
-            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
-                continue;
-            };
-            if reg.watch_only_addresses.is_empty() {
-                continue;
-            }
-            let payloads: Vec<AddressPayload> = reg
-                .watch_only_addresses
-                .iter()
-                .filter_map(|a| address_to_payload(a).ok())
-                .collect();
-            if !payloads.iter().any(|p| p == address) {
-                continue;
-            }
-            if payloads.iter().any(|p| senders.contains(p))
-                || own_addresses(&reg).iter().any(|p| senders.contains(p))
-            {
-                continue;
-            }
-            tokens.push(reg.device_token);
-        }
-        Ok(tokens)
+        Ok(self.watch_only_index.tokens(address, senders))
     }
 
     pub fn prune_address_watchers(&self, address: &AddressPayload) -> anyhow::Result<()> {
@@ -1659,6 +1694,96 @@ impl PushRegistry {
     }
 }
 
+/// Address Activity, in memory: each watch-only address to the devices watching it, and the own
+/// addresses (`own_addresses`) of those devices, which make a send from them a self-send. The
+/// block processor's two global sets are the keys of these maps.
+#[derive(Default)]
+struct WatchOnlyIndex {
+    devices: HashMap<String, WatchOnlyDevice>,
+    by_address: HashMap<AddressPayload, HashSet<String>>,
+    by_own_address: HashMap<AddressPayload, HashSet<String>>,
+}
+
+struct WatchOnlyDevice {
+    watch_only: Vec<AddressPayload>,
+    own: Vec<AddressPayload>,
+}
+
+impl WatchOnlyIndex {
+    /// Replaces one device's entry with what `registration` watches (`None` or no watch-only
+    /// address = drops it). Returns true when either global set gained or lost an address.
+    fn set(&mut self, token: &str, registration: Option<&DeviceRegistration>) -> bool {
+        let new = registration
+            .filter(|reg| !reg.watch_only_addresses.is_empty())
+            .map(|reg| WatchOnlyDevice {
+                watch_only: reg
+                    .watch_only_addresses
+                    .iter()
+                    .filter_map(|address| address_to_payload(address).ok())
+                    .collect(),
+                own: own_addresses(reg),
+            });
+        let old = self.devices.remove(token);
+        let mut changed = false;
+        for own in [false, true] {
+            let map = if own { &mut self.by_own_address } else { &mut self.by_address };
+            let side = |device: Option<&WatchOnlyDevice>| -> HashSet<AddressPayload> {
+                device
+                    .map(|d| if own { &d.own } else { &d.watch_only })
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect()
+            };
+            let (before, after) = (side(old.as_ref()), side(new.as_ref()));
+            for address in before.difference(&after) {
+                if let Some(tokens) = map.get_mut(address) {
+                    tokens.remove(token);
+                    if tokens.is_empty() {
+                        map.remove(address);
+                        changed = true;
+                    }
+                }
+            }
+            for address in after.difference(&before) {
+                let tokens = map.entry(*address).or_default();
+                changed |= tokens.is_empty();
+                tokens.insert(token.to_string());
+            }
+        }
+        if let Some(device) = new {
+            self.devices.insert(token.to_string(), device);
+        }
+        changed
+    }
+
+    /// The devices watching `address`, minus those for which one of `senders` is their own.
+    fn tokens(&self, address: &AddressPayload, senders: &[AddressPayload]) -> Vec<String> {
+        let Some(tokens) = self.by_address.get(address) else {
+            return Vec::new();
+        };
+        tokens
+            .iter()
+            .filter(|token| {
+                self.devices.get(token.as_str()).is_some_and(|device| {
+                    !device
+                        .watch_only
+                        .iter()
+                        .chain(device.own.iter())
+                        .any(|own| senders.contains(own))
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Hands both sets to the block processor.
+    fn publish(&self) {
+        indexer_actors::set_watch_only_addresses(self.by_address.keys().copied().collect());
+        indexer_actors::set_self_send_addresses(self.by_own_address.keys().copied().collect());
+    }
+}
+
 type RegistryResponse<T> = oneshot::Sender<anyhow::Result<T>>;
 
 enum PushRegistryCommand {
@@ -1822,6 +1947,11 @@ enum PushRegistryCommand {
     Stats {
         response: RegistryResponse<PushStats>,
     },
+    /// Tests: a command that panics on the registry thread.
+    #[cfg(test)]
+    Panic {
+        response: RegistryResponse<()>,
+    },
 }
 
 pub struct PushRegistryActor {
@@ -1845,8 +1975,51 @@ impl PushRegistryActor {
     pub fn process(mut self) {
         info!("[PushRegistry] actor started");
         while let Ok(command) = self.commands.recv() {
-            match command {
-                PushRegistryCommand::Register {
+            // A panic in one command must not stop every push: it is logged and the actor goes
+            // on. The command's response sender is dropped while unwinding, so its caller gets
+            // an error instead of waiting forever.
+            let registry = &mut self.registry;
+            let handled =
+                std::panic::catch_unwind(AssertUnwindSafe(|| Self::handle(registry, command)));
+            if let Err(panic) = handled {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|m| m.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                error!("[PushRegistry] a command panicked, continuing: {message}");
+            }
+        }
+        info!("[PushRegistry] actor stopped");
+    }
+
+    fn handle(registry: &mut PushRegistry, command: PushRegistryCommand) {
+        match command {
+            PushRegistryCommand::Register {
+                token,
+                platform,
+                watched_addresses,
+                watched_group_ids,
+                capabilities,
+                primary_address,
+                aliases,
+                watched_broadcast_channels,
+                hidden_broadcast_senders,
+                kaposts_pubkey,
+                kaposts_notify,
+                kaposts_watch_authors,
+                watch_only_addresses,
+                apns_environment,
+                voip_token,
+                web_push,
+                apns_topic,
+                android_channel_id,
+                device_prefs,
+                wallet_binding,
+                device_key_binding,
+                response,
+            } => {
+                let result = registry.register(
                     token,
                     platform,
                     watched_addresses,
@@ -1868,34 +2041,33 @@ impl PushRegistryActor {
                     device_prefs,
                     wallet_binding,
                     device_key_binding,
-                    response,
-                } => {
-                    let result = self.registry.register(
-                        token,
-                        platform,
-                        watched_addresses,
-                        watched_group_ids,
-                        capabilities,
-                        primary_address,
-                        aliases,
-                        watched_broadcast_channels,
-                        hidden_broadcast_senders,
-                        kaposts_pubkey,
-                        kaposts_notify,
-                        kaposts_watch_authors,
-                        watch_only_addresses,
-                        apns_environment,
-                        voip_token,
-                        web_push,
-                        apns_topic,
-                        android_channel_id,
-                        device_prefs,
-                        wallet_binding,
-                        device_key_binding,
-                    );
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::Update {
+                );
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::Update {
+                token,
+                watched_addresses,
+                watched_group_ids,
+                capabilities,
+                primary_address,
+                aliases,
+                watched_broadcast_channels,
+                hidden_broadcast_senders,
+                kaposts_pubkey,
+                kaposts_notify,
+                kaposts_watch_authors,
+                watch_only_addresses,
+                apns_environment,
+                voip_token,
+                web_push,
+                apns_topic,
+                android_channel_id,
+                device_prefs,
+                wallet_binding,
+                device_key_binding,
+                response,
+            } => {
+                let result = registry.update(
                     token,
                     watched_addresses,
                     watched_group_ids,
@@ -1916,185 +2088,164 @@ impl PushRegistryActor {
                     device_prefs,
                     wallet_binding,
                     device_key_binding,
-                    response,
-                } => {
-                    let result = self.registry.update(
-                        token,
-                        watched_addresses,
-                        watched_group_ids,
-                        capabilities,
-                        primary_address,
-                        aliases,
-                        watched_broadcast_channels,
-                        hidden_broadcast_senders,
-                        kaposts_pubkey,
-                        kaposts_notify,
-                        kaposts_watch_authors,
-                        watch_only_addresses,
-                        apns_environment,
-                        voip_token,
-                        web_push,
-                        apns_topic,
-                        android_channel_id,
-                        device_prefs,
-                        wallet_binding,
-                        device_key_binding,
-                    );
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::Unregister { token, response } => {
-                    let result = self.registry.unregister_inner(token, None, false);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::UnregisterAuthenticated {
+                );
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::Unregister { token, response } => {
+                let result = registry.unregister_inner(token, None, false);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::UnregisterAuthenticated {
+                token,
+                wallet_pubkey,
+                device_binding,
+                response,
+            } => {
+                let result = registry.unregister_authenticated(
                     token,
                     wallet_pubkey,
                     device_binding,
-                    response,
-                } => {
-                    let result = self.registry.unregister_authenticated(
-                        token,
-                        wallet_pubkey,
-                        device_binding,
-                    );
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::MatchTokens {
-                    watched_address,
-                    alias,
-                    receiver,
-                    response,
-                } => {
-                    let result = self.registry.matching_tokens(
-                        &watched_address,
-                        alias.as_deref(),
-                        receiver.as_ref(),
-                    );
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::MatchGroupTokens { group_id, response } => {
-                    let result = self.registry.matching_tokens_for_group(&group_id);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::MatchInboxTokens {
-                    inbox_tag,
-                    response,
-                } => {
-                    let result = self.registry.tokens_for_inbox(&inbox_tag);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::MatchGroupControlTokens {
-                    sender,
-                    recipient,
-                    response,
-                } => {
-                    let result = self
-                        .registry
-                        .matching_tokens_for_group_control(&sender, recipient.as_ref());
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::MatchBroadcastTokens {
-                    channel,
-                    sender_address,
-                    response,
-                } => {
-                    let result = self.registry.tokens_for_broadcast(&channel, &sender_address);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::MatchRoomMentionTokens {
-                    addresses,
-                    sender_address,
-                    response,
-                } => {
-                    let result = self.registry.tokens_for_room_mention(&addresses, &sender_address);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::MatchKaPostsTokens {
-                    target_pubkey,
-                    actor_pubkey,
-                    response,
-                } => {
-                    let result = self.registry.tokens_for_kaposts(&target_pubkey, &actor_pubkey);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::MatchKaPostsWatcherTokens {
-                    author_pubkey,
-                    response,
-                } => {
-                    let result = self.registry.tokens_for_kaposts_watchers(&author_pubkey);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::PlatformsForTokens { tokens, response } => {
-                    let result = self.registry.platforms_for_tokens(&tokens);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::PrimaryAddressesForTokens { tokens, response } => {
-                    let result = self.registry.primary_addresses_for_tokens(&tokens);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::KaPostsNotifyForTokens { tokens, response } => {
-                    let result = self.registry.kaposts_notify_for_tokens(&tokens);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::MatchWatchOnlyTokens {
-                    address,
-                    senders,
-                    response,
-                } => {
-                    let result = self.registry.watch_only_tokens(&address, &senders);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::ApnsEnvironmentForTokens { tokens, response } => {
-                    let result = self.registry.apns_environment_for_tokens(&tokens);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::ApnsTopicsForTokens { tokens, response } => {
-                    let result = self.registry.apns_topics_for_tokens(&tokens);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::SilentTokens { tokens, response } => {
-                    let result = self.registry.silent_tokens(&tokens);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::KTokens { tokens, response } => {
-                    let result = self.registry.k_tokens(&tokens);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::AndroidChannelsForTokens { tokens, response } => {
-                    let result = self.registry.android_channels_for_tokens(&tokens);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::WebPushForTokens { tokens, response } => {
-                    let result = self.registry.web_push_for_tokens(&tokens);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::SetApnsEnvironment {
-                    token,
-                    environment,
-                    response,
-                } => {
-                    let result = self.registry.set_apns_environment(&token, environment);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::VoipTokensForPrimaryAddress { address, response } => {
-                    let result = self.registry.voip_tokens_for_primary_address(&address);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::TokensForPrimaryAddressStr { address, response } => {
-                    let result = self.registry.tokens_for_primary_address_str(&address);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::RegistrationForToken { token, response } => {
-                    let result = self.registry.get_registration(&token);
-                    let _ = response.send(result);
-                }
-                PushRegistryCommand::Stats { response } => {
-                    let result = self.registry.stats();
-                    let _ = response.send(result);
-                }
+                );
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::MatchTokens {
+                watched_address,
+                alias,
+                receiver,
+                response,
+            } => {
+                let result = registry.matching_tokens(
+                    &watched_address,
+                    alias.as_deref(),
+                    receiver.as_ref(),
+                );
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::MatchGroupTokens { group_id, response } => {
+                let result = registry.matching_tokens_for_group(&group_id);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::MatchInboxTokens {
+                inbox_tag,
+                response,
+            } => {
+                let result = registry.tokens_for_inbox(&inbox_tag);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::MatchGroupControlTokens {
+                sender,
+                recipient,
+                response,
+            } => {
+                let result =
+                    registry.matching_tokens_for_group_control(&sender, recipient.as_ref());
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::MatchBroadcastTokens {
+                channel,
+                sender_address,
+                response,
+            } => {
+                let result = registry.tokens_for_broadcast(&channel, &sender_address);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::MatchRoomMentionTokens {
+                addresses,
+                sender_address,
+                response,
+            } => {
+                let result = registry.tokens_for_room_mention(&addresses, &sender_address);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::MatchKaPostsTokens {
+                target_pubkey,
+                actor_pubkey,
+                response,
+            } => {
+                let result = registry.tokens_for_kaposts(&target_pubkey, &actor_pubkey);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::MatchKaPostsWatcherTokens {
+                author_pubkey,
+                response,
+            } => {
+                let result = registry.tokens_for_kaposts_watchers(&author_pubkey);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::PlatformsForTokens { tokens, response } => {
+                let result = registry.platforms_for_tokens(&tokens);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::PrimaryAddressesForTokens { tokens, response } => {
+                let result = registry.primary_addresses_for_tokens(&tokens);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::KaPostsNotifyForTokens { tokens, response } => {
+                let result = registry.kaposts_notify_for_tokens(&tokens);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::MatchWatchOnlyTokens {
+                address,
+                senders,
+                response,
+            } => {
+                let result = registry.watch_only_tokens(&address, &senders);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::ApnsEnvironmentForTokens { tokens, response } => {
+                let result = registry.apns_environment_for_tokens(&tokens);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::ApnsTopicsForTokens { tokens, response } => {
+                let result = registry.apns_topics_for_tokens(&tokens);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::SilentTokens { tokens, response } => {
+                let result = registry.silent_tokens(&tokens);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::KTokens { tokens, response } => {
+                let result = registry.k_tokens(&tokens);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::AndroidChannelsForTokens { tokens, response } => {
+                let result = registry.android_channels_for_tokens(&tokens);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::WebPushForTokens { tokens, response } => {
+                let result = registry.web_push_for_tokens(&tokens);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::SetApnsEnvironment {
+                token,
+                environment,
+                response,
+            } => {
+                let result = registry.set_apns_environment(&token, environment);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::VoipTokensForPrimaryAddress { address, response } => {
+                let result = registry.voip_tokens_for_primary_address(&address);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::TokensForPrimaryAddressStr { address, response } => {
+                let result = registry.tokens_for_primary_address_str(&address);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::RegistrationForToken { token, response } => {
+                let result = registry.get_registration(&token);
+                let _ = response.send(result);
+            }
+            PushRegistryCommand::Stats { response } => {
+                let result = registry.stats();
+                let _ = response.send(result);
+            }
+            #[cfg(test)]
+            PushRegistryCommand::Panic { response } => {
+                let _response = response;
+                panic!("a test command panicked");
             }
         }
-        info!("[PushRegistry] actor stopped");
     }
 }
 
@@ -2471,6 +2622,12 @@ impl PushRegistryHandle {
             .await
     }
 
+    #[cfg(test)]
+    async fn panic_for_test(&self) -> anyhow::Result<()> {
+        self.request(|response| PushRegistryCommand::Panic { response })
+            .await
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
     }
@@ -2649,10 +2806,14 @@ pub struct PushDispatcher {
     web: Option<WebPushClient>,
     network_type: RpcNetworkType,
     sent_cache: SentTxCache,
-    invalid_token_counts: HashMap<String, u8>,
+    /// Consecutive invalid-token answers per token, with when the last one came. A count not
+    /// bumped within `INVALID_TOKEN_WINDOW` is forgotten (`prune_token_maps`).
+    invalid_token_counts: HashMap<String, (u8, Instant)>,
     /// Address Activity: per-device sliding-window timestamps used to cap funds pushes (a busy
     /// address must not spam a device). See `WATCH_ONLY_RATE_*`.
     watch_only_rate: HashMap<String, VecDeque<Instant>>,
+    /// When `prune_token_maps` last ran.
+    token_maps_pruned_at: Instant,
 }
 
 impl PushDispatcher {
@@ -2731,6 +2892,7 @@ impl PushDispatcher {
             sent_cache: SentTxCache::new(Duration::from_secs(3600)),
             invalid_token_counts: HashMap::new(),
             watch_only_rate: HashMap::new(),
+            token_maps_pruned_at: Instant::now(),
         }
     }
 
@@ -3213,6 +3375,7 @@ impl PushDispatcher {
     /// Address Activity: sliding-window per-device rate limit. Records and allows the send when the
     /// device is under `WATCH_ONLY_RATE_MAX` within `WATCH_ONLY_RATE_WINDOW`; otherwise drops it.
     fn allow_watch_only_push(&mut self, token: &str, now: Instant) -> bool {
+        self.prune_token_maps(now);
         let window = self.watch_only_rate.entry(token.to_string()).or_default();
         while let Some(front) = window.front() {
             if now.duration_since(*front) > WATCH_ONLY_RATE_WINDOW {
@@ -3226,6 +3389,23 @@ impl PushDispatcher {
         }
         window.push_back(now);
         true
+    }
+
+    /// Both per-token maps gain an entry for every token ever pushed to, so every
+    /// `TOKEN_MAPS_PRUNE_INTERVAL` the ones past their window are dropped: rate windows with no
+    /// send left in them, and invalid-token counts not bumped within `INVALID_TOKEN_WINDOW`.
+    fn prune_token_maps(&mut self, now: Instant) {
+        if now.duration_since(self.token_maps_pruned_at) < TOKEN_MAPS_PRUNE_INTERVAL {
+            return;
+        }
+        self.token_maps_pruned_at = now;
+        self.watch_only_rate.retain(|_, window| {
+            window
+                .back()
+                .is_some_and(|last| now.duration_since(*last) <= WATCH_ONLY_RATE_WINDOW)
+        });
+        self.invalid_token_counts
+            .retain(|_, (_, last)| now.duration_since(*last) <= INVALID_TOKEN_WINDOW);
     }
 
     fn push_enabled(&self) -> bool {
@@ -3464,6 +3644,8 @@ impl PushDispatcher {
 
     /// Apply metrics + dead-token pruning for a batch of delivery outcomes (transport-agnostic).
     async fn record_outcomes(&mut self, outcomes: Vec<(String, DeliveryOutcome)>) {
+        let now = Instant::now();
+        self.prune_token_maps(now);
         for (token, outcome) in outcomes {
             let token_short = token
                 .get(token.len().saturating_sub(8)..)
@@ -3484,13 +3666,21 @@ impl PushDispatcher {
                 DeliveryOutcome::InvalidToken => {
                     self.metrics.increment_push_send_failed_total();
                     self.metrics.increment_push_invalid_token_total();
-                    let count = self.invalid_token_counts.entry(token.clone()).or_insert(0);
+                    let (count, last) = self
+                        .invalid_token_counts
+                        .entry(token.clone())
+                        .or_insert((0, now));
+                    if now.duration_since(*last) > INVALID_TOKEN_WINDOW {
+                        *count = 0;
+                    }
                     *count = count.saturating_add(1);
+                    *last = now;
+                    let count = *count;
                     warn!(
                         "[Push] Invalid token ...{} ({} consecutive)",
                         token_short, count
                     );
-                    if *count >= 10 {
+                    if count >= 10 {
                         warn!(
                             "[Push] Invalid token threshold reached for ...{}, removing",
                             token_short
@@ -4758,7 +4948,6 @@ fn normalize_hidden_broadcast_senders(
         .collect()
 }
 
-/// x-only form of a KaPosts pubkey hex: drops the `02`/`03` parity byte of a compressed key.
 /// A device's own chatting address for self-send checks: its signer-bound `primary_address`
 /// and `wallet_address`. Not `watched_addresses`, which also holds the device's chat contacts:
 /// counting those made every payment from a contact look like a self-send.
@@ -4771,6 +4960,43 @@ fn own_addresses(reg: &DeviceRegistration) -> Vec<AddressPayload> {
         .collect()
 }
 
+/// The rule a stored `primary_address` must pass, the one a new claim passes in
+/// api/v1/push.rs (`check_primary_binding`, `unsigned_push_auth`): it is the address of the
+/// wallet bound to the device; with no wallet bound, only in legacy auth mode.
+fn primary_is_bound(reg: &DeviceRegistration, unsigned_may_claim: bool) -> bool {
+    let Some(primary) = reg.primary_address.as_deref() else {
+        return true;
+    };
+    match registration_wallet_binding(reg) {
+        Some(binding) => {
+            let primary = normalize_primary_address(Some(primary.to_string()));
+            primary.is_some() && primary == normalize_primary_address(Some(binding.wallet_address))
+        }
+        None => unsigned_may_claim,
+    }
+}
+
+/// The rule a stored `kaposts_pubkey` must pass, the one a new one passes in api/v1/push.rs
+/// (`kaposts_pubkey_for_signer`): the bound wallet's own key; with no wallet bound, only in
+/// legacy auth mode.
+fn kaposts_pubkey_is_bound(reg: &DeviceRegistration, unsigned_may_claim: bool) -> bool {
+    let Some(pubkey) = reg.kaposts_pubkey.as_deref() else {
+        return true;
+    };
+    match registration_wallet_binding(reg) {
+        Some(binding) => kaposts_key_matches_wallet(pubkey, &binding.wallet_pubkey),
+        None => unsigned_may_claim,
+    }
+}
+
+/// Whether a KaPosts key (66-hex compressed or 64-hex x-only) is the wallet's own key: the
+/// wallet signs with its x-only key, so the two are compared on the x-only key.
+pub(crate) fn kaposts_key_matches_wallet(kaposts_pubkey: &str, wallet_pubkey: &str) -> bool {
+    let wallet = wallet_pubkey.trim().to_ascii_lowercase();
+    !wallet.is_empty() && kaposts_xonly(kaposts_pubkey) == wallet
+}
+
+/// x-only form of a KaPosts pubkey hex: drops the `02`/`03` parity byte of a compressed key.
 fn kaposts_xonly(pubkey: &str) -> String {
     let pk = pubkey.trim().to_lowercase();
     // `get`, not `[2..]`: a 66-byte non-ASCII string would panic the registry thread.
@@ -6310,6 +6536,255 @@ mod kaposts_watch_tests {
                 .is_empty()
         );
 
+        drop(handle);
+        actor_thread.join().expect("actor exits cleanly");
+    }
+}
+
+#[cfg(test)]
+mod claims_and_index_tests {
+    use super::{
+        PushRegistry, PushRegistryActor, WalletBinding, WatchOnlyIndex, address_to_payload,
+        kaposts_key_matches_wallet,
+    };
+    use indexer_actors::metrics::create_shared_metrics;
+    use indexer_db::push::{
+        DeviceRegistrationPartition, PrimaryAddressPartition, WatchedAddressPartition,
+        WatchedGroupIdPartition,
+    };
+    use kaspa_addresses::{Address, Prefix, Version};
+
+    fn open(tx_keyspace: &fjall::TxKeyspace) -> PushRegistry {
+        PushRegistry::new(
+            tx_keyspace.clone(),
+            DeviceRegistrationPartition::new(tx_keyspace).expect("device partition"),
+            WatchedAddressPartition::new(tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(tx_keyspace).expect("primary partition"),
+            create_shared_metrics(),
+        )
+    }
+
+    fn addr(byte: u8) -> String {
+        Address::new(Prefix::Mainnet, Version::PubKey, &[byte; 32]).to_string()
+    }
+
+    /// The wallet whose x-only key is 32 bytes of `byte`, as the API binds it.
+    fn wallet(byte: u8) -> WalletBinding {
+        WalletBinding {
+            wallet_pubkey: faster_hex::hex_string(&[byte; 32]),
+            wallet_address: addr(byte),
+        }
+    }
+
+    fn register(
+        registry: &mut PushRegistry,
+        token: &str,
+        primary: Option<String>,
+        kaposts_pubkey: Option<String>,
+        watch_only: Vec<String>,
+        binding: Option<WalletBinding>,
+    ) {
+        registry
+            .register(
+                token.to_string(),
+                "ios".to_string(),
+                vec![addr(99)],
+                vec![],
+                vec![],
+                primary,
+                vec![],
+                vec![],
+                Default::default(),
+                kaposts_pubkey,
+                None,
+                vec![],
+                watch_only,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+                binding,
+                None,
+            )
+            .expect("registered");
+    }
+
+    fn sorted(mut tokens: Vec<String>) -> Vec<String> {
+        tokens.sort();
+        tokens
+    }
+
+    fn primary_tokens(registry: &PushRegistry, address: &str) -> Vec<String> {
+        sorted(
+            registry
+                .tokens_for_primary_address(&address_to_payload(address).unwrap())
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn stored_claims_not_bound_to_the_wallet_are_cleared() {
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let mut registry = open(&tx_keyspace);
+        let (own, bound_wrong, unbound) = ("a1".repeat(32), "b2".repeat(32), "c3".repeat(32));
+        let victim = addr(2);
+        let own_key = format!("03{}", wallet(1).wallet_pubkey);
+        let victim_key = format!("02{}", wallet(2).wallet_pubkey);
+        // What the registry could store before 10715be: the signer's own claims, a signed device
+        // claiming someone else's primary and KaPost key, and an unsigned one doing the same.
+        register(&mut registry, &own, Some(addr(1)), Some(own_key.clone()), vec![], Some(wallet(1)));
+        register(
+            &mut registry,
+            &bound_wrong,
+            Some(victim.clone()),
+            Some(victim_key.clone()),
+            vec![],
+            Some(wallet(1)),
+        );
+        register(&mut registry, &unbound, Some(victim.clone()), Some(victim_key.clone()), vec![], None);
+        assert_eq!(
+            primary_tokens(&registry, &victim),
+            sorted(vec![bound_wrong.clone(), unbound.clone()])
+        );
+
+        // Legacy mode lets an unsigned device claim both, so only the signed mismatch goes.
+        assert_eq!(registry.clear_unbound_claims(true).unwrap(), (1, 1));
+        assert_eq!(primary_tokens(&registry, &victim), vec![unbound.clone()]);
+
+        // Mixed or strict: the unsigned claims go too. The signer's own stay.
+        assert_eq!(registry.clear_unbound_claims(false).unwrap(), (1, 1));
+        assert!(primary_tokens(&registry, &victim).is_empty());
+        assert!(registry.tokens_for_primary_address_str(&victim).unwrap().is_empty());
+        assert!(registry.voip_tokens_for_primary_address(&victim).unwrap().is_empty());
+        assert!(
+            registry
+                .tokens_for_room_mention(std::slice::from_ref(&victim), &addr(50))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .tokens_for_inbox(&crate::compute_inbox_tag(&victim))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(registry.tokens_for_kaposts(&victim_key, &"ee".repeat(32)).unwrap().is_empty());
+        let stored = |token: &str| registry.get_registration(token).unwrap().unwrap();
+        assert_eq!(stored(&own).primary_address, Some(addr(1)));
+        assert_eq!(stored(&own).kaposts_pubkey, Some(own_key.clone()));
+        assert_eq!(stored(&bound_wrong).primary_address, None);
+        assert_eq!(stored(&bound_wrong).kaposts_pubkey, None);
+        assert_eq!(stored(&bound_wrong).wallet_address, Some(addr(1)));
+        assert_eq!(stored(&unbound).primary_address, None);
+        assert_eq!(stored(&unbound).kaposts_pubkey, None);
+        // Nothing left to clear: a restart finds the store clean.
+        assert_eq!(registry.clear_unbound_claims(false).unwrap(), (0, 0));
+
+        // Re-registering with the signer's own address gives the primary back.
+        register(&mut registry, &bound_wrong, Some(addr(1)), None, vec![], Some(wallet(1)));
+        assert_eq!(primary_tokens(&registry, &addr(1)), sorted(vec![own, bound_wrong]));
+        assert_eq!(registry.tokens_for_primary_address_str(&addr(1)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_kaposts_key_matches_its_wallet_on_the_x_only_key() {
+        let pk = "ab".repeat(32);
+        assert!(kaposts_key_matches_wallet(&format!("02{pk}"), &pk));
+        assert!(kaposts_key_matches_wallet(&format!("03{pk}"), &pk.to_uppercase()));
+        assert!(kaposts_key_matches_wallet(&pk, &pk));
+        assert!(!kaposts_key_matches_wallet(&format!("02{}", "cd".repeat(32)), &pk));
+        assert!(!kaposts_key_matches_wallet("", ""));
+    }
+
+    #[test]
+    fn the_watch_only_index_follows_registrations_and_survives_a_restart() {
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let mut registry = open(&tx_keyspace);
+        let (kapay, other) = ("d4".repeat(32), "e5".repeat(32));
+        let payload = |a: &str| address_to_payload(a).unwrap();
+        let (spending, cold, chatting, stranger) = (addr(11), addr(12), addr(1), addr(13));
+        register(
+            &mut registry,
+            &kapay,
+            Some(chatting.clone()),
+            None,
+            vec![spending.clone(), cold.clone()],
+            Some(wallet(1)),
+        );
+        register(&mut registry, &other, None, None, vec![cold.clone()], None);
+        let matched = |registry: &PushRegistry, address: &str, senders: &[&str]| {
+            let senders: Vec<_> = senders.iter().map(|a| payload(a)).collect();
+            sorted(registry.watch_only_tokens(&payload(address), &senders).unwrap())
+        };
+        assert_eq!(matched(&registry, &spending, &[]), vec![kapay.clone()]);
+        assert_eq!(
+            matched(&registry, &cold, &[&stranger]),
+            sorted(vec![kapay.clone(), other.clone()])
+        );
+        // A send from the device's own chatting address or one of its watch-only addresses is a
+        // self-send for that device only.
+        assert_eq!(matched(&registry, &cold, &[&chatting]), vec![other.clone()]);
+        assert_eq!(matched(&registry, &cold, &[&spending]), vec![other.clone()]);
+        assert!(matched(&registry, &stranger, &[]).is_empty());
+
+        // A restart builds the same index from the store.
+        let restarted = open(&tx_keyspace);
+        assert_eq!(matched(&restarted, &spending, &[]), vec![kapay.clone()]);
+        assert_eq!(matched(&restarted, &cold, &[&chatting]), vec![other.clone()]);
+
+        // An update that drops an address, then unregisters, take them out of the index.
+        register(&mut registry, &kapay, Some(chatting.clone()), None, vec![cold.clone()], Some(wallet(1)));
+        assert!(matched(&registry, &spending, &[]).is_empty());
+        registry.unregister_inner(other.clone(), None, false).unwrap();
+        assert_eq!(matched(&registry, &cold, &[]), vec![kapay.clone()]);
+        registry.unregister_inner(kapay.clone(), None, false).unwrap();
+        assert!(matched(&registry, &cold, &[]).is_empty());
+        assert!(registry.watch_only_index.by_address.is_empty());
+        assert!(registry.watch_only_index.by_own_address.is_empty());
+    }
+
+    #[test]
+    fn the_index_reports_only_changes_to_the_global_sets() {
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let mut registry = open(&tx_keyspace);
+        let (first, second) = ("f6".repeat(32), "a7".repeat(32));
+        register(&mut registry, &first, None, None, vec![addr(21)], None);
+        register(&mut registry, &second, None, None, vec![addr(21)], None);
+        let first_reg = registry.get_registration(&first).unwrap().unwrap();
+        let second_reg = registry.get_registration(&second).unwrap().unwrap();
+        let mut index = WatchOnlyIndex::default();
+        assert!(index.set(&first, Some(&first_reg)), "a new address");
+        assert!(!index.set(&first, Some(&first_reg)), "unchanged, its only watcher");
+        assert!(!index.set(&second, Some(&second_reg)), "already watched");
+        assert!(!index.set(&first, Some(&first_reg)), "unchanged");
+        assert!(!index.set(&first, None), "still watched by the second device");
+        assert!(index.set(&second, None), "no one watches it any more");
+        assert!(index.by_address.is_empty() && index.devices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_command_fails_its_caller_and_the_actor_keeps_serving() {
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let (actor, handle) = PushRegistryActor::new(open(&tx_keyspace), 8);
+        let actor_thread = std::thread::spawn(move || actor.process());
+        let err = handle.panic_for_test().await.expect_err("the panic reaches the caller");
+        assert!(err.to_string().contains("dropped its response"), "{err}");
+        assert_eq!(handle.stats().await.expect("still serving").total, 0);
         drop(handle);
         actor_thread.join().expect("actor exits cleanly");
     }

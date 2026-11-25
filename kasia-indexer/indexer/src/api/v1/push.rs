@@ -1,6 +1,7 @@
 use crate::config::PushAuthMode;
 use crate::push::{
     DeviceKeyBinding, DevicePrefs, GROUP_V1_CAPABILITY, KaPostsNotify, PushRegistryHandle, WalletBinding,
+    kaposts_key_matches_wallet,
 };
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -55,6 +56,8 @@ pub struct PushApi {
     /// can't push other notifications out of ext_push_tx.
     ring_push_tx: flume::Sender<ExtensionPushEvent>,
     ring_limiter: Arc<StdMutex<RingLimiter>>,
+    /// Registers and updates per device token (`RegistrationLimiter`).
+    registration_limiter: Arc<StdMutex<RegistrationLimiter>>,
     /// Optional shared secret guarding the internal endpoints (env INTERNAL_PUSH_SECRET).
     internal_secret: Option<String>,
     /// §5.10: the node client used to broadcast scheduled posts (the webserver's scheduler relays
@@ -89,6 +92,7 @@ impl PushApi {
             ext_push_tx,
             ring_push_tx,
             ring_limiter: Arc::new(StdMutex::new(RingLimiter::default())),
+            registration_limiter: Arc::new(StdMutex::new(RegistrationLimiter::default())),
             internal_secret,
             rpc_client,
         }
@@ -770,12 +774,7 @@ async fn internal_kaposts_new_post_push(
         return (StatusCode::BAD_REQUEST, "author_pubkey and post_id are required");
     }
     let subtitle = if payload.subtitle.trim().is_empty() {
-        let pk = payload.author_pubkey.trim();
-        if pk.len() > 12 {
-            format!("{}…{}", &pk[..6], &pk[pk.len() - 4..])
-        } else {
-            pk.to_string()
-        }
+        short_key(&payload.author_pubkey)
     } else {
         payload.subtitle
     };
@@ -954,6 +953,9 @@ async fn register_device(
         payload.primary_address.is_some(),
         payload.auth.is_some(),
     );
+    if let Err(err) = check_registration_rate(&state, &payload.device_token) {
+        return Err(err.into_response());
+    }
     let verified_auth = match authenticate_push_request(
         &state,
         "POST",
@@ -1010,7 +1012,11 @@ async fn register_device(
             payload.aliases,
             payload.watched_broadcast_channels,
             payload.hidden_broadcast_senders,
-            payload.kaposts_pubkey,
+            kaposts_pubkey_for_signer(
+                state.auth_mode,
+                payload.kaposts_pubkey,
+                verified_auth.wallet_binding.as_ref(),
+            ),
             kaposts_notify,
             payload.kaposts_watch_authors,
             payload.watch_only_addresses,
@@ -1073,6 +1079,9 @@ async fn update_registration(
         payload.primary_address.is_some(),
         payload.auth.is_some(),
     );
+    if let Err(err) = check_registration_rate(&state, &payload.device_token) {
+        return Err(err.into_response());
+    }
     let verified_auth = match authenticate_push_request(
         &state,
         "PUT",
@@ -1118,7 +1127,11 @@ async fn update_registration(
             payload.aliases,
             payload.watched_broadcast_channels,
             payload.hidden_broadcast_senders,
-            payload.kaposts_pubkey,
+            kaposts_pubkey_for_signer(
+                state.auth_mode,
+                payload.kaposts_pubkey,
+                verified_auth.wallet_binding.as_ref(),
+            ),
             kaposts_notify,
             payload.kaposts_watch_authors,
             payload.watch_only_addresses,
@@ -1408,6 +1421,51 @@ fn check_primary_binding(
         }));
     }
     Ok(())
+}
+
+/// KaPost pushes for a key go to the devices registered with it, so a device may register only
+/// its own: when signed, the signing wallet's key (x-only compare: `kaposts_pubkey` is the
+/// compressed form of the same key); unsigned, only in legacy mode, like a primary address.
+/// Every app that sends one signs (K, KaPost and Desktop; KaPost always sends a primary address,
+/// which needs a signature). Anything else is dropped, not refused, so the rest of the
+/// registration still goes through.
+fn kaposts_pubkey_for_signer(
+    mode: PushAuthMode,
+    kaposts_pubkey: Option<String>,
+    wallet_binding: Option<&WalletBinding>,
+) -> Option<String> {
+    let pubkey = kaposts_pubkey?;
+    let kept = match wallet_binding {
+        Some(binding) => kaposts_key_matches_wallet(&pubkey, &binding.wallet_pubkey),
+        None => mode == PushAuthMode::Legacy,
+    };
+    if !kept && !pubkey.trim().is_empty() {
+        warn!(
+            "[Push] dropped a kaposts_pubkey that is not the {} wallet's key",
+            if wallet_binding.is_some() { "signing" } else { "(unsigned)" }
+        );
+    }
+    kept.then_some(pubkey)
+}
+
+/// Rate-limits register and update per device token, before any signature work. A token that
+/// doesn't parse is left to the registry, which refuses it.
+fn check_registration_rate(state: &PushApi, device_token: &str) -> Result<(), PushApiError> {
+    let Ok(token) = normalize_device_token(device_token) else {
+        return Ok(());
+    };
+    let allowed = state
+        .registration_limiter
+        .lock()
+        .map_err(|_| PushApiError::internal("failed to lock registration limiter"))?
+        .allow(&token, unix_time_ms());
+    if allowed {
+        Ok(())
+    } else {
+        Err(PushApiError::too_many_requests(
+            "too many registrations for this device, try again shortly",
+        ))
+    }
 }
 
 fn authenticate_unregister_request(
@@ -2080,6 +2138,41 @@ impl RingLimiter {
     }
 }
 
+/// Registers and updates per device token in a sliding minute. An app registers on launch and
+/// updates when a setting changes; this is well above that and bounds what one token can make
+/// the single registry thread do. (Not per client IP: this router is served without the peer
+/// address, and a forwarded header is whatever the caller wrote.)
+const REGISTRATION_WINDOW_MS: u64 = 60_000;
+const MAX_REGISTRATIONS_PER_TOKEN: usize = 30;
+
+#[derive(Default)]
+struct RegistrationLimiter {
+    by_token: HashMap<String, VecDeque<u64>>,
+    pruned_at_ms: u64,
+}
+
+impl RegistrationLimiter {
+    /// Counts the call and returns true, or returns false (and counts nothing) when the token is
+    /// at its limit. Once a window, tokens with no call left in it are forgotten.
+    fn allow(&mut self, token: &str, now_ms: u64) -> bool {
+        let cutoff = now_ms.saturating_sub(REGISTRATION_WINDOW_MS);
+        if now_ms.saturating_sub(self.pruned_at_ms) >= REGISTRATION_WINDOW_MS {
+            self.by_token
+                .retain(|_, times| times.back().is_some_and(|&t| t > cutoff));
+            self.pruned_at_ms = now_ms;
+        }
+        let times = self.by_token.entry(token.to_string()).or_default();
+        while times.front().is_some_and(|&t| t <= cutoff) {
+            times.pop_front();
+        }
+        if times.len() >= MAX_REGISTRATIONS_PER_TOKEN {
+            return false;
+        }
+        times.push_back(now_ms);
+        true
+    }
+}
+
 #[derive(Default)]
 struct NonceStore {
     expiries_by_nonce: HashMap<String, u64>,
@@ -2132,6 +2225,19 @@ impl NonceStore {
             };
             self.expiries_by_nonce.remove(&expired_nonce);
         }
+    }
+}
+
+/// A key shortened for a notification subtitle: its first 6 and last 4 characters. By chars, not
+/// bytes: the key is not validated here, and a byte index inside a multi-byte character panics.
+fn short_key(key: &str) -> String {
+    let chars: Vec<char> = key.trim().chars().collect();
+    if chars.len() > 12 {
+        let head: String = chars[..6].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}…{tail}")
+    } else {
+        chars.into_iter().collect()
     }
 }
 
@@ -2588,5 +2694,63 @@ mod tests {
         // exactly the fallback verify_wallet_binding_from_auth performs.
         assert!(verify_schnorr_signature(&wallet_pubkey, &canonical, &signature_hex).is_err());
         assert!(verify_schnorr_signature(&wallet_pubkey, &legacy, &signature_hex).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod registration_guard_tests {
+    use super::*;
+
+    fn signer(pubkey: &str) -> WalletBinding {
+        WalletBinding {
+            wallet_pubkey: pubkey.to_string(),
+            wallet_address: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_kaposts_pubkey_is_kept_only_for_its_own_signer() {
+        let own = "ab".repeat(32);
+        let other = format!("02{}", "cd".repeat(32));
+        let keep = |mode, key: &str, binding: Option<&WalletBinding>| {
+            kaposts_pubkey_for_signer(mode, Some(key.to_string()), binding)
+        };
+        let binding = signer(&own);
+        for key in [format!("02{own}"), format!("03{own}"), own.clone()] {
+            assert_eq!(keep(PushAuthMode::Mixed, &key, Some(&binding)), Some(key.clone()));
+        }
+        // Someone else's key, signed by this wallet: dropped, in every mode.
+        for mode in [PushAuthMode::Legacy, PushAuthMode::Mixed, PushAuthMode::Strict] {
+            assert_eq!(keep(mode, &other, Some(&binding)), None);
+        }
+        // Unsigned: only legacy mode, which takes any unsigned claim, keeps it.
+        assert_eq!(keep(PushAuthMode::Mixed, &other, None), None);
+        assert_eq!(keep(PushAuthMode::Legacy, &other, None), Some(other.clone()));
+        assert_eq!(kaposts_pubkey_for_signer(PushAuthMode::Mixed, None, Some(&binding)), None);
+    }
+
+    #[test]
+    fn registrations_are_limited_per_token_and_forgotten_after_the_window() {
+        let mut limiter = RegistrationLimiter::default();
+        let start = 1_000_000;
+        for i in 0..MAX_REGISTRATIONS_PER_TOKEN {
+            assert!(limiter.allow("token-a", start + i as u64));
+        }
+        assert!(!limiter.allow("token-a", start + 100));
+        // Another device is not held back by the first.
+        assert!(limiter.allow("token-b", start + 100));
+        // A window later the first may register again, and idle tokens are pruned.
+        let later = start + REGISTRATION_WINDOW_MS + 1_000;
+        assert!(limiter.allow("token-a", later));
+        assert_eq!(limiter.by_token.len(), 1);
+    }
+
+    #[test]
+    fn a_short_key_never_cuts_inside_a_character() {
+        assert_eq!(short_key(&"ab".repeat(33)), "ababab…abab");
+        assert_eq!(short_key(" 02ab "), "02ab");
+        // 13 multi-byte characters: a byte index at 6 or len-4 would land inside one.
+        assert_eq!(short_key(&"é".repeat(13)), "éééééé…éééé");
+        assert_eq!(short_key(&format!("a{}", "€".repeat(12))), "a€€€€€…€€€€");
     }
 }
