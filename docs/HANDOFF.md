@@ -3,6 +3,11 @@
 Current state and next steps, so a fresh session (any device, from a clone) can continue
 without the chat history. Last updated 2026-10-02 after `a2438df` on `KaspaSilver/KaChat-Indexer`.
 
+> **Open from the K iOS app (2026-11-24):** `KPLAY_ARCADE_LEADERBOARD.md` (the arcade boards),
+> `ROOM_MENTION_PUSHES.md` (push for @mentions in rooms) and `K_NOTIFICATION_SWITCHES.md`
+> (`notify_sound`, `kaposts_notify_mentions`, `mutable-content` on `address_activity`). Each says
+> what to build; add a Status note with the commit when done.
+
 > **2026-11-18:** KaChat on mobile is now four apps (KaChat, KaPost, KaPay, KaPlay), each on
 > iPhone and Android. `KACHAT_APPS.md` breaks down their repos, push topics, routes and
 > payloads, and replaces the repo table below.
