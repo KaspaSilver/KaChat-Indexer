@@ -4,7 +4,26 @@
 K iOS session (`KaspaSilver/K-iPhone`, `KaChat/Views/Explorer/ExplorerAPI.swift`, `ExplorerKStats`;
 not yet committed there).
 
-> **Status (2026-11-25): §1-§3 done in the indexer session** (not yet deployed). Fees start the day
+> **Update (2026-11-25, later): K needs much less from this. Please trim before deploying.**
+> The owner's goal: the indexer tracks only what nobody else can serve, and K uses outside sources
+> for the rest. K now gets network fee history from Kaspalytics (kaspalytics.com's daily total and
+> average fee per transaction since 2023-10), so:
+> - **§3 `/network/fees` is not needed.** Drop the endpoint, the `kachat_fee_hours` table and its
+>   trigger, and the ingest changes that keep input and output amounts (back to the old ingest
+>   flags), including the change to Kaspa Quick Start's `kachat/run-ingest.sh`. K never reads it.
+> - **§2 without `activeAddresses`, `feesSompi` and `feesSince`.** Drop the hourly totals behind
+>   them. Keep `categories`, `previous` and `series` (counts from tables the indexer already has).
+> - **§1: no `last30d`** (the card is 24 Hours, 7 Days, All Time) and **no new categories to
+>   index**: leave out `paymentNotices`, `kusdtTransfers`, `kusdtSwaps` and `kachatNames`. Keep
+>   `arcadeScores` (it counts a room already followed). K still maps any of them if served.
+>
+> What the Explorer takes from elsewhere, so the indexer never needs to: blocks, transactions,
+> addresses, balances, hashrate, supply, block reward, the fee estimate (kaspa.stream's REST API);
+> live blocks and the mempool (K's own node); price and market cap (CoinGecko, then Gate.io);
+> fees (Kaspalytics); kUSDT holdings (Trestly). From this indexer, only the K Activity counts.
+
+> **Status (2026-11-25): §1-§3 done in the indexer session** (not yet deployed; see the update
+> above: §2's address and fee totals and all of §3 can come out). Fees start the day
 > the new ingest settings go live: there is no fee history before that.
 > - §1: every `/stats` category has `last30d`, and a new category `arcadeScores` counts
 >   `#kplay-arcade` stamps. Not served:
@@ -36,12 +55,11 @@ API and K's own node, except two things neither has, which come from this indexe
 1. **K Activity**: how many transactions K's protocols made in the last 24 hours, 7 days and all
    time (owner, 2026-11-25: no 30 days), by protocol, with the window before for a "+8.9%" change, a bar per hour / day /
    month, the addresses that sent them and the fees they paid.
-2. **Network fees**: the average fee one Kaspa transaction paid over the last 24 hours, and total
-   fees per hour, day or month.
+2. ~~**Network fees**~~: since dropped, K reads them from Kaspalytics.
 
 The app already reads `/stats` (24h, 7d, all time) and shows what's there. Everything below is
 read the moment it's served: **no app update needed**. Until then the card leaves the missing
-parts off (no bars, no change line, no footer) and the fee tile says "demo".
+parts off (no bars, no change line).
 
 ## 1. `/stats`: new categories
 
@@ -73,9 +91,7 @@ for the session.
   "to": 1795615628000,
   "categories": { "messages": 3038, "groupMessages": 53, "kaposts": 59, "publicChats": 169 },
   "previous":   { "messages": 2911, "groupMessages": 61, "kaposts": 48, "publicChats": 140 },
-  "series": [ { "t": 1795532400000, "count": 131 } ],
-  "activeAddresses": 812,
-  "feesSompi": 2418000000
+  "series": [ { "t": 1795532400000, "count": 131 } ]
 }
 ```
 
@@ -84,10 +100,9 @@ for the session.
 - `series`: oldest first. `day`: 24 hourly buckets. `week`: 7 daily. `all`: one per calendar month
   since `indexedSince`. `t` is the bucket's start (ms, UTC); the last bucket is
   the one still filling.
-- `activeAddresses`: distinct sender addresses of the counted transactions in the window.
-- `feesSompi`: total network fees those transactions paid in the window.
+- ~~`activeAddresses`~~ and ~~`feesSompi`~~: not needed (see the update at the top).
 
-## 3. `GET /network/fees?period=day|week|month|all`
+## 3. `GET /network/fees?period=day|week|month|all` (not needed: see the update at the top)
 
 Every accepted Kaspa transaction, not just K's, coinbase excluded. The fee is inputs minus
 outputs; the indexer database this runs beside already has both.
