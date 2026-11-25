@@ -2,7 +2,8 @@
 
 **Status:** done, commit 0816402 (transaction processor). Deletes are recorded in
 `kachat_room_deletes` and applied in either arrival order; the delete row stays in the room
-history; no push. The webserver needed no change. Live after the next kachat image rebuild.
+history; no push; KaPlay's rooms take none (d65265a). The webserver needed no change. The
+indexer has no panel-marked machinery rooms beyond KaPlay's three. Live after the next kachat image rebuild.
 
 **For:** the indexer session: the transaction processor that writes room (broadcast) messages, the
 webserver's room history read, and room pushes (`notify_broadcast`).
