@@ -141,6 +141,42 @@ pub fn remove_kaposts_denied(pubkey_hex: &str) {
     }
 }
 
+/// Address blocklist (`kachat_address_blocklist`, refreshed by the flag task in main.rs):
+/// nothing sent from these addresses is stored. Addresses as canonical text for public chats and
+/// game stamps, and as lowercase-hex x-only keys for KaPosts, whose senders are pubkeys.
+static BLOCKED_ADDRESSES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+static BLOCKED_XONLY: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Replace the address blocklist: the addresses and their x-only keys.
+pub fn set_address_blocklist(addresses: Vec<String>, xonly: Vec<String>) {
+    if let Ok(mut guard) = BLOCKED_ADDRESSES.write() {
+        *guard = addresses;
+    }
+    if let Ok(mut guard) = BLOCKED_XONLY.write() {
+        *guard = xonly;
+    }
+}
+
+/// Is this sender address (canonical text) blocked?
+pub fn is_address_blocked(address: &str) -> bool {
+    let address = address.trim().to_ascii_lowercase();
+    BLOCKED_ADDRESSES
+        .read()
+        .map(|g| g.iter().any(|a| *a == address))
+        .unwrap_or(false)
+}
+
+/// Is this KaPosts author (pubkey hex) a blocked address's key? Compared by x-coordinate, like
+/// `is_kaposts_operator`.
+pub fn is_pubkey_blocked(pubkey_hex: &str) -> bool {
+    let pk = pubkey_hex.to_ascii_lowercase();
+    let xonly = if pk.len() >= 64 { &pk[pk.len() - 64..] } else { pk.as_str() };
+    BLOCKED_XONLY
+        .read()
+        .map(|g| g.iter().any(|p| p == xonly))
+        .unwrap_or(false)
+}
+
 /// KaPosts "operator" identities as lowercase-hex **x-only** pubkeys (32 bytes / 64 hex) — the
 /// x-coordinate of THIS indexer owner's key, decoded from the kaspa address they entered in the
 /// dashboard. When an author whose pubkey shares this x-coordinate publishes an on-chain
@@ -1082,7 +1118,7 @@ impl KProtocolProcessor {
             Ok(action_type) => {
             // Personal-mode block/mute: drop everything authored by a denylisted pubkey.
             if let Some(pk) = action_sender_pubkey(&action_type) {
-                if is_kaposts_denied(pk) {
+                if is_kaposts_denied(pk) || is_pubkey_blocked(pk) {
                     tracing::debug!(
                         "Skipping KaPosts content from blocked/muted author {} (tx {})",
                         pk, transaction_id
@@ -1344,6 +1380,12 @@ impl KProtocolProcessor {
                 }
             },
         };
+
+        // Address blocklist: a blocked sender's room messages and game stamps are never stored.
+        if is_address_blocked(&sender_address) {
+            debug!("Broadcast {} from blocked address {} not stored", transaction_id, sender_address);
+            return Ok(BcastOutcome::Done);
+        }
 
         let block_time = transaction.block_time.unwrap_or(0);
         let result = sqlx::query(
@@ -3907,5 +3949,24 @@ mod k_profile_validation_tests {
         assert!(validate_k_profile(&b64(b"a"), None, "%%").is_err());
         let long = "x".repeat(MAX_K_NICKNAME_CHARS + 1);
         assert!(validate_k_profile(&b64(long.as_bytes()), None, &b64(b"hi")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod address_blocklist_tests {
+    use super::*;
+
+    #[test]
+    fn a_blocked_address_covers_its_rooms_and_its_kaposts_key() {
+        let x = "ab".repeat(32);
+        set_address_blocklist(vec!["kaspa:qblocked".to_string()], vec![x.clone()]);
+        assert!(is_address_blocked(" KASPA:QBLOCKED "));
+        assert!(!is_address_blocked("kaspa:qother"));
+        // A compressed key (02/03 || x) and the bare x-only key are the same author.
+        assert!(is_pubkey_blocked(&format!("02{x}")));
+        assert!(is_pubkey_blocked(&format!("03{}", x.to_uppercase())));
+        assert!(!is_pubkey_blocked(&format!("02{}", "cd".repeat(32))));
+        set_address_blocklist(Vec::new(), Vec::new());
+        assert!(!is_pubkey_blocked(&format!("02{x}")));
     }
 }

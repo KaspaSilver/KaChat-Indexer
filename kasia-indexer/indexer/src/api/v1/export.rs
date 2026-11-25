@@ -308,6 +308,114 @@ pub async fn gc_self_stash_orphans(State(state): State<ExportApi>) -> impl IntoR
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct PurgeSenderRequest {
+    address: String,
+}
+
+/// Where a record's sender sits in one chat partition, and the partition of its payload.
+struct SenderIndex {
+    partition: &'static str,
+    /// The sender is the key's first 34 bytes (else the value is the sender, written once known).
+    sender_prefixed: bool,
+    /// Where the tx id starts in the key, counted from its end.
+    tx_id_from_end: usize,
+    payload: &'static str,
+    group: bool,
+}
+
+const SENDER_INDEXES: [SenderIndex; 10] = [
+    SenderIndex { partition: "contextual_message_by_sender", sender_prefixed: true, tx_id_from_end: 32, payload: "tx-id-to-contextual-message", group: false },
+    SenderIndex { partition: "contextual_message_by_inbox", sender_prefixed: false, tx_id_from_end: 32, payload: "tx-id-to-contextual-message", group: false },
+    SenderIndex { partition: "handshake_by_sender", sender_prefixed: true, tx_id_from_end: 32, payload: "tx-id-to-handshake", group: false },
+    SenderIndex { partition: "handshake_by_receiver", sender_prefixed: false, tx_id_from_end: 32, payload: "tx-id-to-handshake", group: false },
+    SenderIndex { partition: "payment_by_sender", sender_prefixed: true, tx_id_from_end: 32, payload: "tx_id_to_payment", group: false },
+    SenderIndex { partition: "payment_by_receiver", sender_prefixed: false, tx_id_from_end: 32, payload: "tx_id_to_payment", group: false },
+    SenderIndex { partition: "self_stash_by_owner", sender_prefixed: true, tx_id_from_end: 32, payload: "tx-id-to-self-stash", group: false },
+    SenderIndex { partition: "group_message_by_blinded_group_id", sender_prefixed: false, tx_id_from_end: 32, payload: "tx-id-to-group-message", group: true },
+    // sender | block_time | block_hash | version | tx_id | recipient(34)
+    SenderIndex { partition: "group_control_by_sender", sender_prefixed: true, tx_id_from_end: 66, payload: "tx-id-to-group-control", group: true },
+    SenderIndex { partition: "group_control_by_recipient", sender_prefixed: false, tx_id_from_end: 32, payload: "tx-id-to-group-control", group: true },
+];
+
+/// POST /personal/purge-sender `{"address"}` — remove every chat record the address sent
+/// (direct chats, handshakes, payments, self-stash, group messages and controls), for the
+/// address blocklist. The address is blocked here at once, ahead of the next file reload.
+/// Answers `{"chats": n, "groups": n}`, counted in transactions.
+pub async fn purge_sender(State(state): State<ExportApi>, Json(req): Json<PurgeSenderRequest>) -> impl IntoResponse {
+    let sender = kaspa_rpc_core::RpcAddress::try_from(req.address.trim().to_string())
+        .ok()
+        .and_then(|rpc| indexer_db::AddressPayload::try_from(&rpc).ok());
+    let Some(sender) = sender else {
+        return (StatusCode::BAD_REQUEST, "{\"error\":\"invalid address\"}".to_string()).into_response();
+    };
+    indexer_actors::add_blocked_address(sender);
+    let res = tokio::task::spawn_blocking(move || purge_sender_records(&state.tx_keyspace, &sender)).await;
+    match res {
+        Ok(Ok((chats, groups))) => {
+            tracing::info!("purge-sender {}: {chats} chat and {groups} group transaction(s) removed", req.address.trim());
+            (StatusCode::OK, format!("{{\"chats\":{chats},\"groups\":{groups}}}")).into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!("purge-sender failed: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"purge failed\"}".to_string()).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"purge failed\"}".to_string()).into_response(),
+    }
+}
+
+/// Snapshot every index entry of the sender, then remove them and their payloads in one write
+/// transaction (retried on a conflict with the live indexer). Returns (chat, group) tx counts.
+fn purge_sender_records(ks: &TxKeyspace, sender: &indexer_db::AddressPayload) -> anyhow::Result<(usize, usize)> {
+    use indexer_db::IntoBytes;
+    let sender = sender.as_bytes();
+    loop {
+        let mut removals: Vec<(fjall::TxPartition, Vec<u8>)> = Vec::new();
+        let mut chat_txs = std::collections::HashSet::new();
+        let mut group_txs = std::collections::HashSet::new();
+        {
+            let rtx = ks.read_tx();
+            for index in &SENDER_INDEXES {
+                let part = ks.open_partition(index.partition, PartitionCreateOptions::default())?;
+                let payload = ks.open_partition(index.payload, PartitionCreateOptions::default())?;
+                let mut take = |key: &[u8]| {
+                    if key.len() < index.tx_id_from_end {
+                        return;
+                    }
+                    let start = key.len() - index.tx_id_from_end;
+                    let tx_id = key[start..start + 32].to_vec();
+                    removals.push((part.clone(), key.to_vec()));
+                    removals.push((payload.clone(), tx_id.clone()));
+                    if index.group { group_txs.insert(tx_id) } else { chat_txs.insert(tx_id) };
+                };
+                if index.sender_prefixed {
+                    for kv in rtx.prefix(&part, sender) {
+                        take(&kv?.0);
+                    }
+                } else {
+                    for kv in rtx.iter(&part) {
+                        let (k, v) = kv?;
+                        if v.as_ref() == sender {
+                            take(&k);
+                        }
+                    }
+                }
+            }
+        }
+        if removals.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut wtx = ks.write_tx()?;
+        for (part, key) in &removals {
+            wtx.remove(part, key.as_slice());
+        }
+        if wtx.commit()?.is_ok() {
+            return Ok((chat_txs.len(), group_txs.len()));
+        }
+        tracing::warn!("purge-sender: commit conflict, retrying");
+    }
+}
+
 fn decode_hex(s: &str) -> anyhow::Result<Vec<u8>> {
     if s.len() % 2 != 0 {
         anyhow::bail!("odd hex");
@@ -315,4 +423,54 @@ fn decode_hex(s: &str) -> anyhow::Result<Vec<u8>> {
     let mut out = vec![0u8; s.len() / 2];
     faster_hex::hex_decode(s.as_bytes(), &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod purge_sender_tests {
+    use super::*;
+    use indexer_db::{AddressPayload, IntoBytes};
+
+    fn key(prefix: &[u8], tx: u8, tail: usize) -> Vec<u8> {
+        let mut k = prefix.to_vec();
+        k.extend_from_slice(&[0u8; 41]); // block_time, block_hash, version
+        k.extend_from_slice(&[tx; 32]);
+        k.extend_from_slice(&vec![9u8; tail]);
+        k
+    }
+
+    #[test]
+    fn a_blocked_sender_loses_every_record_and_no_one_else_does() {
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let ks = fjall::Config::new(dir.path()).open_transactional().expect("keyspace");
+        let open = |name: &str| ks.open_partition(name, PartitionCreateOptions::default()).expect("partition");
+        let blocked = AddressPayload::from_xonly_pubkey([1; 32]);
+        let other = AddressPayload::from_xonly_pubkey([2; 32]);
+        let mut wtx = ks.write_tx().expect("write");
+        // Blocked: a message by sender key (tx 1), a handshake known only by its value (tx 2),
+        // a group control by sender (tx 3, tx id before the 34-byte recipient).
+        wtx.insert(&open("contextual_message_by_sender"), key(blocked.as_bytes(), 1, 0), []);
+        wtx.insert(&open("tx-id-to-contextual-message"), [1u8; 32], b"m1");
+        wtx.insert(&open("handshake_by_receiver"), key(other.as_bytes(), 2, 0), blocked.as_bytes());
+        wtx.insert(&open("tx-id-to-handshake"), [2u8; 32], b"h2");
+        wtx.insert(&open("group_control_by_sender"), key(blocked.as_bytes(), 3, 34), []);
+        wtx.insert(&open("tx-id-to-group-control"), [3u8; 32], b"g3");
+        // Someone else's message (tx 4) stays.
+        wtx.insert(&open("contextual_message_by_sender"), key(other.as_bytes(), 4, 0), []);
+        wtx.insert(&open("tx-id-to-contextual-message"), [4u8; 32], b"m4");
+        assert!(wtx.commit().expect("commit").is_ok());
+
+        assert_eq!(purge_sender_records(&ks, &blocked).expect("purge"), (2, 1));
+        let rtx = ks.read_tx();
+        let count = |name: &str| rtx.iter(&open(name)).count();
+        assert_eq!(count("contextual_message_by_sender"), 1);
+        assert_eq!(count("handshake_by_receiver"), 0);
+        assert_eq!(count("group_control_by_sender"), 0);
+        assert_eq!(count("tx-id-to-handshake"), 0);
+        assert_eq!(count("tx-id-to-group-control"), 0);
+        assert!(rtx.get(&open("tx-id-to-contextual-message"), [4u8; 32]).expect("read").is_some());
+        assert!(rtx.get(&open("tx-id-to-contextual-message"), [1u8; 32]).expect("read").is_none());
+        // Nothing left: a second purge finds nothing.
+        drop(rtx);
+        assert_eq!(purge_sender_records(&ks, &blocked).expect("purge"), (0, 0));
+    }
 }

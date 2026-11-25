@@ -2626,6 +2626,7 @@ dependencies = [
  "base64 0.21.7",
  "clap",
  "hex",
+ "kaspa-addresses",
  "reqwest",
  "serde",
  "serde_json",

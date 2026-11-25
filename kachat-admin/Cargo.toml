@@ -20,6 +20,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 anyhow = "1.0.100"
 hex = "0.4"
+# Address blocklist: parse and check addresses against this indexer's network.
+kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa.git" }
 base64 = "0.21"
 # HTTP client to proxy the vendored kasia (chat) indexer's /metrics into the dashboard.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -126,8 +126,9 @@ async fn import_contextual_messages(
                 .ok()
                 .and_then(|rpc| AddressPayload::try_from(&rpc).ok())
             {
-                Some(a) => a,
-                None => {
+                // A blocked address's history is not imported either.
+                Some(a) if !indexer_actors::is_blocked_address(&a) => a,
+                _ => {
                     skipped += 1;
                     continue;
                 }

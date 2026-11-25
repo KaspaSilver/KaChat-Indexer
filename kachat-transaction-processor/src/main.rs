@@ -113,6 +113,17 @@ fn operator_address_to_xonly(token: &str) -> Option<String> {
     }
 }
 
+/// A blocked address's x-only key (lowercase hex), to match KaPosts authors: a Schnorr address
+/// carries it as its 32-byte payload, an ECDSA one as a compressed key (`02/03 || x`).
+fn blocked_address_xonly(address: &str) -> Option<String> {
+    let addr = kaspa_addresses::Address::try_from(address.to_string()).ok()?;
+    match addr.payload.len() {
+        32 => Some(hex::encode(&addr.payload)),
+        33 => Some(hex::encode(&addr.payload[1..])),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing with default INFO level
@@ -274,6 +285,18 @@ async fn main() -> Result<()> {
                     .collect();
                 k_protocol::set_kaposts_denylist(list);
             }
+            // Address blocklist: addresses nothing is stored from.
+            if let Ok(rows) = sqlx::query("SELECT address FROM kachat_address_blocklist")
+                .fetch_all(&flags_pool)
+                .await
+            {
+                let addresses: Vec<String> = rows
+                    .iter()
+                    .map(|r| r.get::<String, _>("address").trim().to_ascii_lowercase())
+                    .collect();
+                let xonly = addresses.iter().filter_map(|a| blocked_address_xonly(a)).collect();
+                k_protocol::set_address_blocklist(addresses, xonly);
+            }
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }
     });
@@ -377,4 +400,14 @@ async fn main() -> Result<()> {
 
     info!("Transaction Processor shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod blocked_address_tests {
+    #[test]
+    fn a_schnorr_address_gives_its_xonly_key() {
+        let x = super::blocked_address_xonly("kaspa:qq77ha90czy6yxxjay5jj2htwgtkftgmxvl3e2m0mj4em585900cycedvprs9");
+        assert_eq!(x.map(|k| k.len()), Some(64));
+        assert_eq!(super::blocked_address_xonly("kaspa:nope"), None);
+    }
 }

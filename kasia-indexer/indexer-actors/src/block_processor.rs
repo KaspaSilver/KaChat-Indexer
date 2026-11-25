@@ -583,6 +583,14 @@ impl BlockProcessor {
             }
             _ => crate::personal_allows(sender.as_ref(), &receiver),
         };
+        // Address blocklist: nothing a blocked address sends is stored. A group message names
+        // its sender's key, so it is caught even before the sender's address is known; any other
+        // record with an unknown sender is caught when the sender resolves
+        // (virtual_chain_processor `handle_sender_address`).
+        let blocked = sender.as_ref().is_some_and(crate::is_blocked_address)
+            || matches!(&op, SealedOperation::GroupMessageV1(gm)
+                if decode_fixed_hex::<32>(gm.sender_pub).is_ok_and(|pk| crate::is_blocked_xonly(&pk)));
+        let store_content = store_content && !blocked;
         if store_content {
         iter::once(op).try_for_each(|op| match op {
             SealedOperation::SealedMessageOrSealedHandshakeVNone(hk) => {

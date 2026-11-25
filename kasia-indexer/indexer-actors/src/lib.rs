@@ -49,6 +49,55 @@ static PERSONAL_INBOX_TAGS: LazyLock<RwLock<HashSet<[u8; INBOX_TAG_LEN]>>> =
 static PERSONAL_GROUP_IDS: LazyLock<RwLock<HashSet<[u8; BLINDED_GROUP_ID_LEN]>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
 
+/// Address blocklist (the panel's Indexer > Manage > Block): nothing these addresses send is
+/// stored. Reloaded from the file the admin API writes (indexer main.rs) and added to at once by
+/// POST /personal/purge-sender.
+static BLOCKED_ADDRESSES: LazyLock<RwLock<HashSet<AddressPayload>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+
+/// Chat partitions keyed by tx id that hold a record's payload: removed with a blocked sender's
+/// record. (`tx_id_to_payment` keeps the underscore spelling it was created with.)
+pub const CHAT_TX_ID_PARTITIONS: [&str; 6] = [
+    "tx-id-to-handshake",
+    "tx-id-to-contextual-message",
+    "tx_id_to_payment",
+    "tx-id-to-self-stash",
+    "tx-id-to-group-message",
+    "tx-id-to-group-control",
+];
+
+/// Replace the address blocklist.
+pub fn set_blocked_addresses(addrs: HashSet<AddressPayload>) {
+    if let Ok(mut guard) = BLOCKED_ADDRESSES.write() {
+        *guard = addrs;
+    }
+}
+
+/// Add one address to the blocklist now, ahead of the next reload.
+pub fn add_blocked_address(addr: AddressPayload) {
+    if let Ok(mut guard) = BLOCKED_ADDRESSES.write() {
+        guard.insert(addr);
+    }
+}
+
+/// Is `addr` blocked? A zero (unknown) sender never is.
+pub fn is_blocked_address(addr: &AddressPayload) -> bool {
+    *addr != AddressPayload::default()
+        && BLOCKED_ADDRESSES
+            .read()
+            .map(|g| g.contains(addr))
+            .unwrap_or(false)
+}
+
+/// Is the Schnorr address of this x-only key blocked? A group message names its sender's key
+/// before the sender's address is known.
+pub fn is_blocked_xonly(pubkey: &[u8; 32]) -> bool {
+    BLOCKED_ADDRESSES
+        .read()
+        .map(|g| g.iter().any(|a| a.matches_xonly_pubkey(pubkey)))
+        .unwrap_or(false)
+}
+
 /// Union of every device's registered `watch_only_addresses` (Address Activity push). The push
 /// registry keeps this in sync; the block processor consults it to decide whether an accepted tx
 /// credits a watched address without a per-output DB lookup. Empty = the feature is fully inert
@@ -256,5 +305,24 @@ mod personal_group_tests {
         // Reset globals so nothing leaks into other tests / real runs.
         set_personal_addresses(Vec::new());
         set_personal_group_ids(HashSet::new());
+    }
+}
+
+#[cfg(test)]
+mod blocklist_tests {
+    use super::*;
+
+    #[test]
+    fn a_blocked_address_is_matched_by_address_and_by_key() {
+        let blocked = AddressPayload::from_xonly_pubkey([5; 32]);
+        set_blocked_addresses(HashSet::from([blocked]));
+        assert!(is_blocked_address(&blocked));
+        assert!(is_blocked_xonly(&[5; 32]));
+        assert!(!is_blocked_address(&AddressPayload::from_xonly_pubkey([6; 32])));
+        assert!(!is_blocked_xonly(&[6; 32]));
+        // An unknown sender is never blocked.
+        assert!(!is_blocked_address(&AddressPayload::default()));
+        set_blocked_addresses(HashSet::new());
+        assert!(!is_blocked_address(&blocked));
     }
 }

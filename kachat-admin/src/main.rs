@@ -25,6 +25,8 @@ use sqlx::{Row, postgres::PgPoolOptions, PgPool};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 
+mod blocklist;
+
 #[derive(Parser, Debug)]
 #[command(name = "kachat-admin", about = "Ops/admin dashboard for the KaChat indexer")]
 struct Args {
@@ -75,6 +77,13 @@ struct Args {
     /// File the chat indexer reads its personal-mode address allowlist from (shared volume).
     #[arg(long, default_value = "/app/data/personal_addresses.txt")]
     personal_file: String,
+    /// File the chat indexer reads the address blocklist from (shared volume), rewritten from
+    /// `kachat_address_blocklist` on every change and at start.
+    #[arg(long, default_value = "/app/data/blocked_addresses.txt")]
+    blocklist_file: String,
+    /// Chat indexer endpoint that purges everything one address sent.
+    #[arg(long, default_value = "http://127.0.0.1:8600/personal/purge-sender")]
+    chat_purge_sender_url: String,
     /// File the chat indexer reads its personal-mode GROUP-id allowlist from (shared volume).
     #[arg(long, default_value = "/app/data/personal_group_ids.txt")]
     personal_groups_file: String,
@@ -139,6 +148,8 @@ struct AppState {
     personal_groups_file: String,
     chat_data_dir: String,
     libretranslate_url: String,
+    blocklist_file: String,
+    chat_purge_sender_url: String,
 }
 
 fn now_ms() -> i64 {
@@ -179,6 +190,12 @@ async fn main() -> anyhow::Result<()> {
     .execute(&pool)
     .await;
 
+    // The address blocklist (the processor creates it too), and the chat indexer's copy of it.
+    let _ = sqlx::query(blocklist::CREATE_TABLE).execute(&pool).await;
+    if let Err(e) = blocklist::write_file(&pool, &args.blocklist_file).await {
+        tracing::warn!("could not write the address blocklist file {}: {e}", args.blocklist_file);
+    }
+
     let admin_token: Option<std::sync::Arc<str>> = args
         .admin_token
         .as_deref()
@@ -207,6 +224,8 @@ async fn main() -> anyhow::Result<()> {
         personal_groups_file: args.personal_groups_file.clone(),
         chat_data_dir: network_default(&args.chat_data_dir, "/app/data/mainnet", "/app/data/testnet"),
         libretranslate_url: args.libretranslate_url.clone(),
+        blocklist_file: args.blocklist_file.clone(),
+        chat_purge_sender_url: args.chat_purge_sender_url.clone(),
     };
 
     let app = Router::new()
@@ -228,6 +247,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/kaposts/denylist/add", post(post_denylist_add))
         .route("/api/kaposts/denylist/remove", post(post_denylist_remove))
         .route("/api/chat/purge", post(post_chat_purge))
+        .route("/api/blocklist", get(blocklist::get_blocklist))
+        .route("/api/blocklist/add", post(blocklist::post_blocklist_add))
+        .route("/api/blocklist/remove", post(blocklist::post_blocklist_remove))
         .route("/api/translate-status", get(get_translate_status))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         // No CORS layer (kachat-audits IDX-003): the dashboard is same-origin or

@@ -23,6 +23,34 @@ use tracing::{error, info, warn};
 use crate::node::Node;
 use crate::{Args, Prefetched, Window, spk_address};
 
+/// How often the address blocklist is reread.
+const BLOCKLIST_REFRESH: Duration = Duration::from_secs(15);
+
+/// The address blocklist (`kachat_address_blocklist`, kept by the admin API): no profile is
+/// stored for these addresses. Reread every `BLOCKLIST_REFRESH`; a missing table is an empty list.
+#[derive(Default)]
+struct Blocklist {
+    addresses: HashSet<String>,
+    read_at: Option<Instant>,
+}
+
+impl Blocklist {
+    async fn refresh(&mut self, pool: &PgPool) {
+        if self.read_at.is_some_and(|at| at.elapsed() < BLOCKLIST_REFRESH) {
+            return;
+        }
+        self.read_at = Some(Instant::now());
+        match sqlx::query_scalar::<_, String>("SELECT address FROM kachat_address_blocklist").fetch_all(pool).await {
+            Ok(rows) => self.addresses = rows.into_iter().map(|a| a.trim().to_ascii_lowercase()).collect(),
+            Err(e) => warn!("[profiles] could not read the address blocklist ({e})"),
+        }
+    }
+
+    fn blocks(&self, address: &str) -> bool {
+        self.addresses.contains(&address.to_ascii_lowercase())
+    }
+}
+
 /// Where the profiles follower stands (one row).
 #[derive(Debug, Default)]
 struct State {
@@ -291,7 +319,9 @@ pub async fn run(args: &Args) -> Result<()> {
     let mut window = Window::default();
     let mut last_heartbeat = Instant::now() - Duration::from_secs(60);
     let mut pruned_streak = 0u32;
+    let mut blocklist = Blocklist::default();
     loop {
+        blocklist.refresh(&pool).await;
         let from = follower.checkpoint.ok_or_else(|| anyhow!("lost the checkpoint"))?;
         let (batch, last_daa) = match node.next_batch(from, args.min_confirmations, window.0).await {
             Ok(b) => {
@@ -364,6 +394,10 @@ pub async fn run(args: &Args) -> Result<()> {
             for t in batch.accepted.iter().filter(|t| applied_set.contains(&t.id)) {
                 let spk = &t.outputs[0].script_public_key;
                 let Some(address) = spk_address(prefix, spk) else { continue };
+                if blocklist.blocks(&address) {
+                    info!("[profiles] not saved: {address} is blocked (tx {})", hex::encode(t.id));
+                    continue;
+                }
                 sqlx::query(
                     r#"INSERT INTO profile_saves (tx_id, spk, address, block, daa, block_time, profile)
                        VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (tx_id) DO NOTHING"#,
@@ -388,6 +422,9 @@ pub async fn run(args: &Args) -> Result<()> {
                 match follower.registry.profiles.get(spk) {
                     Some((json, (daa, txid))) => {
                         let Some(address) = spk_address(prefix, spk) else { continue };
+                        if blocklist.blocks(&address) {
+                            continue;
+                        }
                         // updated_at = the record's own block time (also right after a reorg
                         // restores an older record); created_at only on the first insert.
                         sqlx::query(

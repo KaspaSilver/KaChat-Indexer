@@ -115,6 +115,49 @@ fn load_personal_addresses() {
     indexer_actors::set_personal_inbox_tags(inbox_tags);
 }
 
+/// The address blocklist file the admin API writes (`KASIA_BLOCKLIST_FILE`, default
+/// `/app/data/blocked_addresses.txt`, one address per line).
+fn blocklist_path() -> String {
+    std::env::var("KASIA_BLOCKLIST_FILE").unwrap_or_else(|_| "/app/data/blocked_addresses.txt".to_string())
+}
+
+/// Read the blocklist file into the indexer's list. A missing file is an empty list.
+fn load_blocked_addresses(path: &str) {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut addrs = std::collections::HashSet::new();
+    for t in content.split(['\n', '\r', ',', ' ', '\t']).map(str::trim).filter(|t| !t.is_empty()) {
+        match kaspa_rpc_core::RpcAddress::try_from(t.to_string())
+            .ok()
+            .and_then(|rpc| indexer_db::AddressPayload::try_from(&rpc).ok())
+        {
+            Some(ap) => {
+                addrs.insert(ap);
+            }
+            None => tracing::warn!("Blocklist: skipping unparseable address '{t}'"),
+        }
+    }
+    info!("Address blocklist: {} address(es)", addrs.len());
+    indexer_actors::set_blocked_addresses(addrs);
+}
+
+/// Reread the blocklist whenever the file changes (checked every 15 s), so no restart is needed.
+fn spawn_blocklist_reload() {
+    let path = blocklist_path();
+    load_blocked_addresses(&path);
+    tokio::spawn(async move {
+        let modified = |path: &str| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let mut seen = modified(&path);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let now = modified(&path);
+            if now != seen {
+                seen = now;
+                load_blocked_addresses(&path);
+            }
+        }
+    });
+}
+
 /// NO_HANDSHAKE_MESSAGING.md §1: `inboxTag(recipient) = first 16 bytes of
 /// SHA-256("kachat-inbox:v1:" + recipient)`, where `recipient` is the full address string,
 /// lowercased, with its prefix. Returns the raw 16 bytes (the on-chain form is their lowercase hex).
@@ -184,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
 
     load_personal_addresses();
     load_personal_group_ids();
+    spawn_blocklist_reload();
 
     // fjall's default caps background workers at cpus.min(4) = 4 flush + 4 compaction regardless of
     // core count. With our ~30 partitions on a 16-core host that starves compaction: L0 runs pile

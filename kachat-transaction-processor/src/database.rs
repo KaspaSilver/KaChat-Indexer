@@ -175,6 +175,7 @@ impl KDbClient {
 
         // Step 1c: idempotently ensure the KaPosts personal-mode block/mute denylist exists.
         self.create_denylist_schema().await?;
+        self.create_address_blocklist_schema().await?;
 
         // Step 1c': safe nickname decode + one-off cleanup of undecodable nicknames (IDX-005).
         self.create_safe_nickname_decode().await?;
@@ -699,6 +700,25 @@ impl KDbClient {
                 pubkey BYTEA PRIMARY KEY,
                 kind VARCHAR(8) NOT NULL DEFAULT 'block',
                 added_at BIGINT NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Address blocklist (the panel's Indexer > Manage > Block): addresses nothing is stored
+    /// from. The admin API adds and purges; the processor, the chat indexer and the profiles
+    /// follower each reload it. `purged` = rows removed when the address was added.
+    async fn create_address_blocklist_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_address_blocklist (
+                address TEXT PRIMARY KEY,
+                note TEXT NOT NULL DEFAULT '',
+                added_at BIGINT NOT NULL DEFAULT 0,
+                purged BIGINT NOT NULL DEFAULT 0
             )
             "#,
         )

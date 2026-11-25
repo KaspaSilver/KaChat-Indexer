@@ -277,6 +277,11 @@ impl Api {
                 "/personal/purge-all",
                 post(export::purge_all).with_state(self.export_api.clone()),
             )
+            // Address blocklist: remove every chat record one address sent.
+            .route(
+                "/personal/purge-sender",
+                post(export::purge_sender).with_state(self.export_api.clone()),
+            )
             // KaChat fork: GC self-stash index entries orphaned by a missing payload row.
             // Top-level path (not under the "/self-stash" nest) to avoid a route conflict.
             .route(

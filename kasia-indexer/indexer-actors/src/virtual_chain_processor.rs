@@ -4,7 +4,7 @@ use crate::data_source::{Command, Request};
 use crate::push::{PushEvent, PushEventKind, parse_self_stash_alias};
 use crate::util::ToHex64;
 use crate::virtual_chain_syncer::{NotificationAck, VirtualChainSyncer};
-use fjall::{TxKeyspace, WriteTransaction};
+use fjall::{PartitionCreateOptions, TxKeyspace, WriteTransaction};
 use indexer_db::messages::contextual_message::{
     ContextualMessageByInboxKey, ContextualMessageByInboxPartition, ContextualMessageBySenderKey,
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
@@ -34,7 +34,7 @@ use indexer_db::processing::pending_senders::{
     PendingResolutionKey, PendingSenderResolutionPartition,
 };
 use indexer_db::processing::tx_id_to_acceptance::{
-    Action, LookupOutput, TxIDToAcceptancePartition,
+    AcceptanceKey, Action, LookupOutput, TxIDToAcceptancePartition,
 };
 use indexer_db::{AddressPayload, IntoBytes, PartitionId, TryFromBytes};
 use kaspa_consensus_core::BlueWorkType;
@@ -793,6 +793,58 @@ impl VirtualProcessor {
         Ok(())
     }
 
+    /// The resolved sender is blocked: drop what waited on it instead of completing it. Records
+    /// still to be indexed by sender are never written; the ones already written under the
+    /// receiver, inbox tag, group or recipient (with an unknown sender) are removed, along with
+    /// the payload. No push.
+    fn discard_blocked_sender(
+        &self,
+        key: &AcceptanceKey,
+        tx_id: [u8; 32],
+        daa: DaaScore,
+    ) -> anyhow::Result<()> {
+        let open = |name: &str| self.tx_keyspace.open_partition(name, PartitionCreateOptions::default());
+        let payloads = crate::CHAT_TX_ID_PARTITIONS.map(open);
+        loop {
+            let mut wtx = self.tx_keyspace.write_tx()?;
+            self.pending_sender_resolution_partition.remove_wtx(
+                &mut wtx,
+                &PendingResolutionKey {
+                    accepting_daa_score: daa.into(),
+                    tx_id,
+                },
+            );
+            self.tx_id_to_acceptance_partition.resolve_entries_wtx(
+                &mut wtx,
+                key,
+                entry_key_len,
+                |wtx, entry| {
+                    if !matches!(entry.action, Action::UpdateValueSender) {
+                        return Ok(());
+                    }
+                    let name = match entry.partition_id {
+                        PartitionId::HandshakeByReceiver => "handshake_by_receiver",
+                        PartitionId::ContextualMessageByInbox => "contextual_message_by_inbox",
+                        PartitionId::PaymentByReceiver => "payment_by_receiver",
+                        PartitionId::GroupMessageByBlindedGroupId => "group_message_by_blinded_group_id",
+                        PartitionId::GroupControlByRecipient => "group_control_by_recipient",
+                        _ => return Ok(()),
+                    };
+                    wtx.remove(&open(name)?, entry.key);
+                    Ok(())
+                },
+            )?;
+            for payload in &payloads {
+                wtx.remove(payload.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?, tx_id);
+            }
+            if wtx.commit()?.is_ok() {
+                debug!(tx_id = %tx_id.to_hex_64(), "Dropped a blocked sender's record");
+                return Ok(());
+            }
+            warn!("Conflict detected, retry dropping a blocked sender's record");
+        }
+    }
+
     fn handle_sender_address(
         &self,
         sender: RpcAddress,
@@ -805,6 +857,9 @@ impl VirtualProcessor {
             .tx_id_to_acceptance_partition
             .key_by_tx_id(&tx_id)?
             .expect("Key must exists");
+        if crate::is_blocked_address(&sender) {
+            return self.discard_blocked_sender(&key, tx_id, daa);
+        }
         loop {
             let mut wtx = self.tx_keyspace.write_tx()?;
             let push_events = std::cell::RefCell::new(Vec::new());
@@ -819,42 +874,7 @@ impl VirtualProcessor {
             self.tx_id_to_acceptance_partition.resolve_entries_wtx(
                 &mut wtx,
                 &key,
-                |partition_id| match partition_id {
-                    PartitionId::Metadata
-                    | PartitionId::BlockCompactHeaders
-                    | PartitionId::BlockDaaIndex
-                    | PartitionId::BlockGaps
-                    | PartitionId::TxIdToHandshake
-                    | PartitionId::TxIdToPayment
-                    | PartitionId::AcceptingBlockToTxIds
-                    | PartitionId::TxIdToAcceptance
-                    | PartitionId::PendingSenders
-                    | PartitionId::TxIDToSelfStash
-                    | PartitionId::TxIdToGroupMessage
-                    | PartitionId::GroupInviteByTag
-                    | PartitionId::TxIdToGroupInvite
-                    | PartitionId::TxIdToGroupControl => {
-                        panic!("Unexpected partition id")
-                    }
-                    PartitionId::HandshakeByReceiver => size_of::<HandshakeKeyByReceiver>(),
-                    PartitionId::HandshakeBySender => size_of::<HandshakeKeyBySender>(),
-                    PartitionId::ContextualMessageBySender => {
-                        size_of::<ContextualMessageBySenderKey>()
-                    }
-                    PartitionId::ContextualMessageByInbox => {
-                        size_of::<ContextualMessageByInboxKey>()
-                    }
-                    PartitionId::PaymentByReceiver => size_of::<PaymentKeyByReceiver>(),
-                    PartitionId::PaymentBySender => size_of::<PaymentKeyBySender>(),
-                    PartitionId::SelfStashByOwner => size_of::<SelfStashKeyByOwner>(),
-                    PartitionId::GroupMessageByBlindedGroupId => {
-                        size_of::<GroupMessageKeyByBlindedGroupId>()
-                    }
-                    PartitionId::GroupControlByRecipient => {
-                        size_of::<GroupControlKeyByRecipient>()
-                    }
-                    PartitionId::GroupControlBySender => size_of::<GroupControlKeyBySender>(),
-                },
+                entry_key_len,
                 |wtx, entry| match entry.partition_id {
                     PartitionId::Metadata
                     | PartitionId::BlockCompactHeaders
@@ -1267,6 +1287,47 @@ impl From<Cursor> for DbCursor {
 
 type DaaScore = u64;
 type Continue = bool;
+
+/// The key length of an acceptance entry for `partition_id` (only the partitions that wait on a
+/// sender have entries).
+fn entry_key_len(partition_id: PartitionId) -> usize {
+    match partition_id {
+        PartitionId::Metadata
+        | PartitionId::BlockCompactHeaders
+        | PartitionId::BlockDaaIndex
+        | PartitionId::BlockGaps
+        | PartitionId::TxIdToHandshake
+        | PartitionId::TxIdToPayment
+        | PartitionId::AcceptingBlockToTxIds
+        | PartitionId::TxIdToAcceptance
+        | PartitionId::PendingSenders
+        | PartitionId::TxIDToSelfStash
+        | PartitionId::TxIdToGroupMessage
+        | PartitionId::GroupInviteByTag
+        | PartitionId::TxIdToGroupInvite
+        | PartitionId::TxIdToGroupControl => {
+            panic!("Unexpected partition id")
+        }
+        PartitionId::HandshakeByReceiver => size_of::<HandshakeKeyByReceiver>(),
+        PartitionId::HandshakeBySender => size_of::<HandshakeKeyBySender>(),
+        PartitionId::ContextualMessageBySender => {
+            size_of::<ContextualMessageBySenderKey>()
+        }
+        PartitionId::ContextualMessageByInbox => {
+            size_of::<ContextualMessageByInboxKey>()
+        }
+        PartitionId::PaymentByReceiver => size_of::<PaymentKeyByReceiver>(),
+        PartitionId::PaymentBySender => size_of::<PaymentKeyBySender>(),
+        PartitionId::SelfStashByOwner => size_of::<SelfStashKeyByOwner>(),
+        PartitionId::GroupMessageByBlindedGroupId => {
+            size_of::<GroupMessageKeyByBlindedGroupId>()
+        }
+        PartitionId::GroupControlByRecipient => {
+            size_of::<GroupControlKeyByRecipient>()
+        }
+        PartitionId::GroupControlBySender => size_of::<GroupControlKeyBySender>(),
+    }
+}
 
 #[cfg(test)]
 mod tests {

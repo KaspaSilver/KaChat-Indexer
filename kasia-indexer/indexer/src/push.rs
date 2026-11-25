@@ -3523,6 +3523,11 @@ impl PushDispatcher {
     }
 
     async fn handle_event(&mut self, event: PushEvent) -> anyhow::Result<()> {
+        // Address blocklist backstop: nothing from a blocked address rings, whatever path the
+        // event came by.
+        if indexer_actors::is_blocked_address(&event.sender) {
+            return Ok(());
+        }
         let mut tokens = match event.kind {
             PushEventKind::GroupMessage => {
                 let Some(group_id) = event.blinded_group_id else {
