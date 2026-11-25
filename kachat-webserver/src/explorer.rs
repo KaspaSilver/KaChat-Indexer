@@ -3,9 +3,9 @@
 //! Periods share one bucket layout: `day` = the last 24 hours, `week` and `month` = the last 7 and
 //! 30 UTC days, `all` = every calendar month with data. The last bucket is the one still filling.
 //! Counts come from the KaPosts and room tables, and from the chat indexer's hourly and monthly
-//! counts (`/stats/buckets`). Fees and senders come from the hourly totals the processor's
-//! `transactions` trigger keeps (`kachat_fee_hours`, `kachat_k_hours`, `kachat_k_senders`), so
-//! they start the day that trigger first saw input amounts.
+//! counts (`/stats/buckets`). Fees and senders come from the hourly totals the profiles follower
+//! keeps from the node's accepted transactions (`kachat_fee_hours`, `kachat_k_hours`,
+//! `kachat_k_senders`), so they start the day that follower first counted them.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -245,7 +245,7 @@ pub async fn activity(pool: &sqlx::PgPool, chat: Option<ChatBuckets>, period: Pe
     if period != Period::All {
         out["previous"] = serde_json::json!(counts.previous);
     }
-    // Senders and fees exist from the first hour the trigger saw input amounts (`feesSince`).
+    // Senders and fees exist from the first hour the profiles follower counted (`feesSince`).
     if let Some(row) = k_fees
         && let Ok(Some(since)) = row.try_get::<Option<i64>, _>("s")
     {
@@ -258,7 +258,7 @@ pub async fn activity(pool: &sqlx::PgPool, chat: Option<ChatBuckets>, period: Pe
     out
 }
 
-/// GET /network/fees body for one period. None until the trigger has counted any fee.
+/// GET /network/fees body for one period. None until any fee has been counted.
 pub async fn network_fees(pool: &sqlx::PgPool, period: Period, now: i64) -> Option<serde_json::Value> {
     let rows = sqlx::query("SELECT hour, fees_sompi, transactions FROM kachat_fee_hours ORDER BY hour")
         .fetch_all(pool)

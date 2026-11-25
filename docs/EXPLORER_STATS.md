@@ -19,14 +19,18 @@ not yet committed there).
 >     (ms), the first hour they cover.
 > - §3: `GET /network/fees?period=` as specified, plus `since`. It answers 503 until the first
 >   fee is counted.
->   - The ingest now keeps input amounts (resolved by simply-kaspa) and output amounts. Rows
->     still last one hour.
->   - The `transactions` insert trigger adds each transaction's fee (inputs minus outputs) to
->     `kachat_fee_hours`, kept for good.
->   - Coinbase (no inputs) and transactions with an unresolved input are left out.
->   - Acceptance isn't tracked, so a rare rejected double-spend still counts.
->   - **Kaspa Quick Start mounts its own `kachat/run-ingest.sh`**, which needs the same two flag
->     changes before fees are counted.
+>   - The profiles follower, which already reads every accepted transaction from the node with
+>     each input's spent amount, adds each fee (inputs minus outputs) to `kachat_fee_hours`.
+>     It also adds K's fees and senders to `kachat_k_hours` / `kachat_k_senders`. All three are
+>     kept for good.
+>   - The hourly totals are written in the same commit as the follower's checkpoint, so a batch
+>     is never counted twice.
+>   - Coinbase and transactions with an unknown input amount are left out. Only accepted
+>     transactions count.
+>   - A reorg that removes already-counted chain blocks leaves their fees counted (rare: the
+>     follower waits for confirmations).
+>   - No ingest change is needed. A first version used the ingest's input amounts, which its
+>     block path never fills; that was reverted.
 
 ## Why
 
