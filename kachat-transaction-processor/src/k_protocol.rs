@@ -1575,6 +1575,11 @@ impl KProtocolProcessor {
         block_time: i64,
         envelope: &Option<(String, String)>,
     ) -> Result<Option<bool>> {
+        // KaPlay's rooms take no deletes: a move, a result or a score can't be taken back
+        // (kaplay_content_ok already refuses anything but game messages there).
+        if KAPLAY_ROOMS.contains(&channel) && envelope.is_some() {
+            return Ok(None);
+        }
         if self.room_delete_waiting(tx, channel, sender).await? {
             info!("Broadcast {} on #{} not stored: its sender deleted it", hex::encode(tx), channel);
             return Ok(None);
@@ -4684,5 +4689,11 @@ mod room_delete_tests {
         assert_eq!(stored(&p).await, [4, 5, 7, 10, 11, 12, 13, 14]);
         // ...and a reaction on that message is still stored.
         assert_eq!(store(&p, 15, ROOM, "bob", &react(10)).await, Some(true));
+
+        // KaPlay's rooms take no deletes.
+        let stamp = r#"{"type":"arcade","v":1}"#;
+        assert_eq!(store(&p, 16, "kplay-arcade", "alice", stamp).await, Some(true));
+        assert_eq!(store(&p, 17, "kplay-arcade", "alice", &del(16)).await, None);
+        assert_eq!(stored(&p).await, [4, 5, 7, 10, 11, 12, 13, 14, 15, 16]);
     }
 }
