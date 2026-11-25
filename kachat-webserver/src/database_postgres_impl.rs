@@ -699,14 +699,17 @@ impl PostgresDbManager {
         }
         let poll_ids: Vec<Vec<u8>> = meta.keys().filter_map(|k| hex::decode(k).ok()).collect();
 
-        // Per-option counts of the CURRENT vote per voter (latest by chain time).
+        // Per-option counts of the CURRENT vote per voter (latest by chain time). A voter is
+        // their x-only key (the last 32 bytes), so 02x, 03x and x are one voter.
         let count_rows = sqlx::query(
             r#"
             WITH current AS (
-                SELECT DISTINCT ON (poll_id, voter_pubkey) poll_id, option_index
+                SELECT DISTINCT ON (poll_id, substring(voter_pubkey from octet_length(voter_pubkey) - 31))
+                    poll_id, option_index
                 FROM k_poll_votes
                 WHERE poll_id = ANY($1::bytea[])
-                ORDER BY poll_id, voter_pubkey, block_time DESC, transaction_id DESC
+                ORDER BY poll_id, substring(voter_pubkey from octet_length(voter_pubkey) - 31),
+                    block_time DESC, transaction_id DESC
             )
             SELECT encode(poll_id, 'hex') as pid, option_index, COUNT(*) as cnt
             FROM current GROUP BY poll_id, option_index
@@ -724,14 +727,17 @@ impl PostgresDbManager {
             counts.entry(pid).or_default().insert(oi, cnt as u64);
         }
 
-        // The requester's current vote per poll (option index), if any.
+        // The requester's current vote per poll (option index), if any, under any form of
+        // their key (matched on the x-only key, as the tally).
         let mut myvotes: HashMap<String, i32> = HashMap::new();
         if !requester_pubkey.is_empty() {
             let mv = sqlx::query(
                 r#"
                 SELECT DISTINCT ON (poll_id) encode(poll_id, 'hex') as pid, option_index
                 FROM k_poll_votes
-                WHERE poll_id = ANY($1::bytea[]) AND voter_pubkey = $2
+                WHERE poll_id = ANY($1::bytea[])
+                  AND substring(voter_pubkey from octet_length(voter_pubkey) - 31)
+                    = substring($2 from octet_length($2) - 31)
                 ORDER BY poll_id, block_time DESC, transaction_id DESC
                 "#,
             )
@@ -794,6 +800,24 @@ const DEFAULT_BROADCAST_CHANNELS: [&str; 18] = [
     "chess-arena",
     "chess-bots",
 ];
+
+/// KaPlay's hidden rooms: followed for the boards, never listed as public rooms.
+const KAPLAY_CHANNELS: [&str; 3] = [crate::chess::ARENA_CHANNEL, crate::chess::BOTS_CHANNEL, crate::arcade::ARCADE_CHANNEL];
+
+/// The tracked rooms from the configured list (None = the defaults), without KaPlay's.
+fn public_rooms(configured: Option<&str>) -> Vec<String> {
+    let mut channels: Vec<String> = match configured {
+        Some(list) => list
+            .split(['\n', '\r', ',', ' ', '\t'])
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => DEFAULT_BROADCAST_CHANNELS.iter().map(|s| s.to_string()).collect(),
+    };
+    channels.retain(|c| !KAPLAY_CHANNELS.contains(&c.as_str()));
+    channels.dedup();
+    channels
+}
 
 #[async_trait]
 #[allow(unused_variables)]
@@ -1404,9 +1428,12 @@ impl DatabaseInterface for PostgresDbManager {
                     SELECT 1 FROM k_follows kf
                     WHERE kf.sender_pubkey = $2 AND kf.followed_user_pubkey = ANY($1)
                 ) as is_followed,
-                (SELECT COUNT(*) FROM k_follows WHERE followed_user_pubkey = ANY($1)) as followers_count,
-                (SELECT COUNT(*) FROM k_follows WHERE sender_pubkey = ANY($1)) as following_count,
-                (SELECT COUNT(*) FROM k_blocks WHERE sender_pubkey = ANY($1)) as blocked_count
+                (SELECT COUNT(DISTINCT substring(sender_pubkey from octet_length(sender_pubkey) - 31))
+                   FROM k_follows WHERE followed_user_pubkey = ANY($1)) as followers_count,
+                (SELECT COUNT(DISTINCT substring(followed_user_pubkey from octet_length(followed_user_pubkey) - 31))
+                   FROM k_follows WHERE sender_pubkey = ANY($1)) as following_count,
+                (SELECT COUNT(DISTINCT substring(blocked_user_pubkey from octet_length(blocked_user_pubkey) - 31))
+                   FROM k_blocks WHERE sender_pubkey = ANY($1)) as blocked_count
             FROM k_broadcasts b
             WHERE b.sender_pubkey = ANY($1)
             ORDER BY b.block_time DESC
@@ -1464,9 +1491,12 @@ impl DatabaseInterface for PostgresDbManager {
                         SELECT 1 FROM k_follows kf
                         WHERE kf.sender_pubkey = $2 AND kf.followed_user_pubkey = ANY($1)
                     ) as is_followed,
-                    (SELECT COUNT(*) FROM k_follows WHERE followed_user_pubkey = ANY($1)) as followers_count,
-                    (SELECT COUNT(*) FROM k_follows WHERE sender_pubkey = ANY($1)) as following_count,
-                    (SELECT COUNT(*) FROM k_blocks WHERE sender_pubkey = ANY($1)) as blocked_count
+                    (SELECT COUNT(DISTINCT substring(sender_pubkey from octet_length(sender_pubkey) - 31))
+                       FROM k_follows WHERE followed_user_pubkey = ANY($1)) as followers_count,
+                    (SELECT COUNT(DISTINCT substring(followed_user_pubkey from octet_length(followed_user_pubkey) - 31))
+                       FROM k_follows WHERE sender_pubkey = ANY($1)) as following_count,
+                    (SELECT COUNT(DISTINCT substring(blocked_user_pubkey from octet_length(blocked_user_pubkey) - 31))
+                       FROM k_blocks WHERE sender_pubkey = ANY($1)) as blocked_count
             "#;
 
             let status_row = sqlx::query(status_query)
@@ -4237,9 +4267,10 @@ impl DatabaseInterface for PostgresDbManager {
             .map_err(|e| DatabaseError::QueryError(e.to_string()))
     }
 
-    /// The same effective set the processor indexes (`k_protocol::channel_is_tracked`):
+    /// The public rooms of the set the processor indexes (`k_protocol::channel_is_tracked`):
     /// `k_vars['broadcast_channels']` when set (an empty value = none), else the defaults;
-    /// nothing at all while `feature_broadcasts` is off.
+    /// nothing at all while `feature_broadcasts` is off. KaPlay's hidden rooms are never listed
+    /// (docs/KPLAY_ONE_ROOM.md), whatever the list or `feature_kaplay` says.
     async fn get_tracked_broadcast_channels(&self) -> DatabaseResult<Vec<String>> {
         let rows = sqlx::query(
             "SELECT key, value FROM k_vars WHERE key IN ('broadcast_channels', 'feature_broadcasts')",
@@ -4257,16 +4288,7 @@ impl DatabaseInterface for PostgresDbManager {
                 _ => {}
             }
         }
-        let mut channels: Vec<String> = match configured {
-            Some(list) => list
-                .split(['\n', '\r', ',', ' ', '\t'])
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect(),
-            None => DEFAULT_BROADCAST_CHANNELS.iter().map(|s| s.to_string()).collect(),
-        };
-        channels.dedup();
-        Ok(channels)
+        Ok(public_rooms(configured.as_deref()))
     }
 
     async fn get_users_count(&self) -> DatabaseResult<u64> {
@@ -4684,5 +4706,22 @@ mod pubkey_variant_tests {
         assert_eq!(PostgresDbManager::pubkey_variants(&even), vec![even.clone(), odd.clone()]);
         assert_eq!(PostgresDbManager::pubkey_variants(&x), vec![even, odd]);
         assert_eq!(PostgresDbManager::pubkey_variants(&[1, 2, 3]), vec![vec![1, 2, 3]]);
+    }
+}
+
+#[cfg(test)]
+mod public_room_tests {
+    use super::public_rooms;
+
+    #[test]
+    fn kaplay_rooms_are_never_listed() {
+        let defaults = public_rooms(None);
+        assert!(defaults.contains(&"kaspa".to_string()));
+        assert!(!defaults.iter().any(|c| c.starts_with("chess-") || c == "kplay-arcade"));
+        assert_eq!(
+            public_rooms(Some("Kaspa\nchess-arena, kplay-arcade chess-bots\nkaspa-german")),
+            vec!["kaspa".to_string(), "kaspa-german".to_string()]
+        );
+        assert!(public_rooms(Some("")).is_empty());
     }
 }

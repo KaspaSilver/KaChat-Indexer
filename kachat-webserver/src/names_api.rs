@@ -133,14 +133,27 @@ fn owner_address(prefix: Prefix, xonly: &[u8]) -> Option<String> {
     (xonly.len() == 32).then(|| Address::new(prefix, Version::PubKey, xonly).to_string())
 }
 
-/// The x-only key behind a schnorr P2PK address (`kaspatest:q…`); `None` for anything else.
-fn address_key(address: &str) -> Option<Vec<u8>> {
-    let a = Address::try_from(address.trim()).ok()?;
+/// `address` parsed, if it is an address of `network` (this server's: `net()`). Names and
+/// profiles are kept per network, so another network's address has none here: a 400, like
+/// any address that does not parse.
+fn parse_on(network: Prefix, address: &str) -> Option<Address> {
+    Address::try_from(address.trim()).ok().filter(|a| a.prefix == network)
+}
+
+/// This server's network (`NETWORK`, as the names and profiles followers read it).
+fn net() -> Prefix {
+    crate::scheduled::network_prefix()
+}
+
+/// The x-only key behind a schnorr P2PK address of `network` (`kaspatest:q…`); `None` for
+/// anything else.
+fn address_key(network: Prefix, address: &str) -> Option<Vec<u8>> {
+    let a = parse_on(network, address)?;
     (a.version == Version::PubKey && a.payload.len() == 32).then(|| a.payload.to_vec())
 }
 
-fn normalize_address(address: &str) -> Option<String> {
-    Address::try_from(address.trim()).ok().map(|a| a.to_string())
+fn normalize_address(network: Prefix, address: &str) -> Option<String> {
+    parse_on(network, address).map(|a| a.to_string())
 }
 
 fn status_str(s: NameStatus) -> &'static str {
@@ -354,8 +367,8 @@ pub async fn by_owner(
     if let Err(e) = limit(&state, addr, 1).await {
         return e;
     }
-    let Some(key) = address_key(&address) else {
-        return err(StatusCode::BAD_REQUEST, "invalid_address", "a schnorr (q…) address is required");
+    let Some(key) = address_key(net(), &address) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_address", "a schnorr (q…) address of this network is required");
     };
     let c = match ctx(&state).await {
         Ok(c) => c,
@@ -568,8 +581,8 @@ pub async fn offers_by_buyer(
     if let Err(e) = limit(&state, addr, 1).await {
         return e;
     }
-    let Some(buyer) = address_key(&address) else {
-        return err(StatusCode::BAD_REQUEST, "invalid_address", "a schnorr (q…) address is required");
+    let Some(buyer) = address_key(net(), &address) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_address", "a schnorr (q…) address of this network is required");
     };
     let c = match ctx(&state).await {
         Ok(c) => c,
@@ -906,8 +919,8 @@ pub async fn profile(
     if let Err(e) = limit(&state, addr, 1).await {
         return e;
     }
-    let Some(address) = normalize_address(&address) else {
-        return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address");
+    let Some(address) = normalize_address(net(), &address) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address of this network");
     };
     let pool = match profiles_pool(&state).await {
         Ok(p) => p,
@@ -929,7 +942,7 @@ pub async fn profile(
 /// `heldNames`).
 async fn identity_for(c: &Ctx, address: &str) -> Result<Value, sqlx::Error> {
     let mut names: Vec<String> = Vec::new();
-    if let Some(key) = address_key(address) {
+    if let Some(key) = address_key(net(), address) {
         let rows = sqlx::query(
             "SELECT name, expires_at FROM names_utxos WHERE kind = 'name' AND NOT refuted AND owner = $1 ORDER BY created_daa ASC",
         )
@@ -998,8 +1011,8 @@ pub async fn identity(
     if let Err(e) = limit(&state, addr, 1).await {
         return e;
     }
-    let Some(address) = normalize_address(&address) else {
-        return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address");
+    let Some(address) = normalize_address(net(), &address) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address of this network");
     };
     let src = match identity_source(&state).await {
         Ok(s) => s,
@@ -1036,7 +1049,7 @@ pub async fn identity_batch(
         Err(e) => return e,
     };
     let wanted: Vec<(&String, String)> =
-        body.addresses.iter().filter_map(|raw| normalize_address(raw).map(|a| (raw, a))).collect();
+        body.addresses.iter().filter_map(|raw| normalize_address(net(), raw).map(|a| (raw, a))).collect();
     match identities(&src, wanted.iter().map(|(_, a)| a.clone()).collect()).await {
         Ok(found) => {
             let out: HashMap<String, Value> = wanted
@@ -1068,7 +1081,7 @@ async fn identities(src: &IdentitySource, mut addresses: Vec<String>) -> Result<
     // Names held per owner key, oldest first (as `identity_for`).
     let mut held: HashMap<Vec<u8>, Vec<String>> = HashMap::new();
     if let IdentitySource::Registry(c) = src {
-        let keys: Vec<Vec<u8>> = addresses.iter().filter_map(|a| address_key(a)).collect();
+        let keys: Vec<Vec<u8>> = addresses.iter().filter_map(|a| address_key(net(), a)).collect();
         if !keys.is_empty() {
             let rows = sqlx::query(
                 "SELECT owner, name, expires_at FROM names_utxos WHERE kind = 'name' AND NOT refuted AND owner = ANY($1) ORDER BY created_daa ASC",
@@ -1089,7 +1102,7 @@ async fn identities(src: &IdentitySource, mut addresses: Vec<String>) -> Result<
             let profile = profiles.remove(&address).unwrap_or(Value::Null);
             let v = match src {
                 IdentitySource::Registry(_) => {
-                    let names = address_key(&address).and_then(|k| held.get(&k).cloned()).unwrap_or_default();
+                    let names = address_key(net(), &address).and_then(|k| held.get(&k).cloned()).unwrap_or_default();
                     identity_json(&address, names, profile)
                 }
                 IdentitySource::ProfilesOnly(_) => profile_only_identity(&address, profile),
@@ -1441,9 +1454,9 @@ pub async fn profile_history(
         return err(StatusCode::BAD_REQUEST, "offset_too_far", "pages end 10000 rows deep");
     }
     let address = match q.address.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
-        Some(a) => match normalize_address(a) {
+        Some(a) => match normalize_address(net(), a) {
             Some(a) => Some(a),
-            None => return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address"),
+            None => return err(StatusCode::BAD_REQUEST, "invalid_address", "not a Kaspa address of this network"),
         },
         None => None,
     };
@@ -1543,13 +1556,24 @@ mod tests {
     fn owner_key_and_address_round_trip_the_builder_vector() {
         let key = hex::decode(XONLY).unwrap();
         assert_eq!(owner_address(Prefix::Testnet, &key).as_deref(), Some(ADDRESS));
-        assert_eq!(address_key(ADDRESS), Some(key));
-        assert_eq!(normalize_address(&format!("  {ADDRESS} ")).as_deref(), Some(ADDRESS));
+        assert_eq!(address_key(Prefix::Testnet, ADDRESS), Some(key));
+        assert_eq!(normalize_address(Prefix::Testnet, &format!("  {ADDRESS} ")).as_deref(), Some(ADDRESS));
+    }
+
+    #[test]
+    fn another_networks_address_is_not_one() {
+        // The same key on mainnet: a valid address, but not one this testnet server holds.
+        let mainnet = owner_address(Prefix::Mainnet, &hex::decode(XONLY).unwrap()).unwrap();
+        assert!(mainnet.starts_with("kaspa:"));
+        assert_eq!(address_key(Prefix::Testnet, &mainnet), None);
+        assert_eq!(normalize_address(Prefix::Testnet, &mainnet), None);
+        assert_eq!(address_key(Prefix::Mainnet, ADDRESS), None);
+        assert_eq!(normalize_address(Prefix::Mainnet, &mainnet).as_deref(), Some(mainnet.as_str()));
     }
 
     #[test]
     fn only_schnorr_addresses_name_an_owner() {
-        assert_eq!(address_key("not-an-address"), None);
+        assert_eq!(address_key(Prefix::Testnet, "not-an-address"), None);
         assert_eq!(owner_address(Prefix::Testnet, &[0u8; 31]), None);
     }
 
