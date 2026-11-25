@@ -1240,18 +1240,28 @@ const KACHAT_STATS_CATEGORIES: [(&str, &[&str]); 5] = [
     ),
 ];
 
-/// Run a `count(*) / FILTER(>d1) / FILTER(>d7)` query, returning (total, last24h, last7d).
-async fn stats_count3(pool: &sqlx::PgPool, sql: &str, d1: i64, d7: i64) -> (i64, i64, i64) {
+/// The windows a `/stats` category counts: since now-24h, now-7d and now-30d (ms).
+#[derive(Clone, Copy)]
+struct StatsCutoffs {
+    d1: i64,
+    d7: i64,
+    d30: i64,
+}
+
+/// Run a `count(*) / FILTER(>d1) / FILTER(>d7) / FILTER(>d30)` query, returning
+/// (total, last24h, last7d, last30d).
+async fn stats_count(pool: &sqlx::PgPool, sql: &str, c: StatsCutoffs) -> (i64, i64, i64, i64) {
     use sqlx::Row;
-    match sqlx::query(sql).bind(d1).bind(d7).fetch_one(pool).await {
+    match sqlx::query(sql).bind(c.d1).bind(c.d7).bind(c.d30).fetch_one(pool).await {
         Ok(r) => (
             r.get::<i64, _>("t"),
             r.get::<i64, _>("d1"),
             r.get::<i64, _>("d7"),
+            r.get::<i64, _>("d30"),
         ),
         Err(e) => {
             log_error!("stats query failed: {}", e);
-            (0, 0, 0)
+            (0, 0, 0, 0)
         }
     }
 }
@@ -1270,36 +1280,40 @@ async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
     }
 
     let now = stats_now_ms();
-    let d1 = now - 86_400_000;
-    let d7 = now - 7 * 86_400_000;
+    let cutoffs = StatsCutoffs { d1: now - 86_400_000, d7: now - 7 * 86_400_000, d30: now - 30 * 86_400_000 };
     let pool = &app_state.scheduled_pool;
 
-    let cat = |name: &str, c: (i64, i64, i64)| {
-        (name.to_string(), serde_json::json!({ "total": c.0, "last24h": c.1, "last7d": c.2 }))
+    let cat = |name: &str, c: (i64, i64, i64, i64)| {
+        (name.to_string(), serde_json::json!({ "total": c.0, "last24h": c.1, "last7d": c.2, "last30d": c.3 }))
     };
     let mut categories = serde_json::Map::new();
 
-    let kaposts = stats_count3(pool,
-        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7 \
-         FROM k_contents WHERE content_type IN ('post','reply','quote','poll')", d1, d7).await;
+    let kaposts = stats_count(pool,
+        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7, count(*) FILTER (WHERE block_time > $3) d30 \
+         FROM k_contents WHERE content_type IN ('post','reply','quote','poll')", cutoffs).await;
     let (k, v) = cat("kaposts", kaposts); categories.insert(k, v);
 
-    let actions = stats_count3(pool,
-        "SELECT count(*) t, count(*) FILTER (WHERE bt > $1) d1, count(*) FILTER (WHERE bt > $2) d7 FROM ( \
+    let actions = stats_count(pool,
+        "SELECT count(*) t, count(*) FILTER (WHERE bt > $1) d1, count(*) FILTER (WHERE bt > $2) d7, count(*) FILTER (WHERE bt > $3) d30 FROM ( \
            SELECT block_time bt FROM k_votes UNION ALL SELECT block_time FROM k_follows \
            UNION ALL SELECT block_time FROM k_edits UNION ALL SELECT block_time FROM k_deletes \
-           UNION ALL SELECT block_time FROM k_poll_votes) a", d1, d7).await;
+           UNION ALL SELECT block_time FROM k_poll_votes) a", cutoffs).await;
     let (k, v) = cat("kapostActions", actions); categories.insert(k, v);
 
-    let public_chats = stats_count3(pool,
-        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7 \
-         FROM kachat_broadcasts WHERE channel NOT IN ('chess-arena', 'chess-bots', 'kplay-arcade')", d1, d7).await;
+    let public_chats = stats_count(pool,
+        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7, count(*) FILTER (WHERE block_time > $3) d30 \
+         FROM kachat_broadcasts WHERE channel NOT IN ('chess-arena', 'chess-bots', 'kplay-arcade')", cutoffs).await;
     let (k, v) = cat("publicChats", public_chats); categories.insert(k, v);
 
-    let chess_moves = stats_count3(pool,
-        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7 \
-         FROM kachat_broadcasts WHERE channel = 'chess-arena' AND content LIKE '%\"a\":\"move\"%'", d1, d7).await;
+    let chess_moves = stats_count(pool,
+        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7, count(*) FILTER (WHERE block_time > $3) d30 \
+         FROM kachat_broadcasts WHERE channel = 'chess-arena' AND content LIKE '%\"a\":\"move\"%'", cutoffs).await;
     let (k, v) = cat("chessMoves", chess_moves); categories.insert(k, v);
+
+    let arcade = stats_count(pool,
+        "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7, count(*) FILTER (WHERE block_time > $3) d30 \
+         FROM kachat_broadcasts WHERE channel = 'kplay-arcade' AND content LIKE '%\"type\":\"arcade\"%'", cutoffs).await;
+    let (k, v) = cat("arcadeScores", arcade); categories.insert(k, v);
 
     // chessGames: games started per the leaderboard reducer (reuses the cached chess snapshot).
     let games_started = chess_snapshot(app_state).await.games_started;
@@ -1312,9 +1326,9 @@ async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
             let list = ops.iter().map(|o| format!("'{o}'")).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT count(DISTINCT tx_id) t, count(DISTINCT tx_id) FILTER (WHERE at > $1) d1, \
-                 count(DISTINCT tx_id) FILTER (WHERE at > $2) d7 FROM names_history WHERE op IN ({list})"
+                 count(DISTINCT tx_id) FILTER (WHERE at > $2) d7, count(DISTINCT tx_id) FILTER (WHERE at > $3) d30 FROM names_history WHERE op IN ({list})"
             );
-            let (k, v) = cat(key, stats_count3(pool, &sql, d1, d7).await);
+            let (k, v) = cat(key, stats_count(pool, &sql, cutoffs).await);
             categories.insert(k, v);
         }
     }

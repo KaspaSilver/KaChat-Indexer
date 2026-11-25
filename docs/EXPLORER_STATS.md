@@ -4,7 +4,19 @@
 K iOS session (`KaspaSilver/K-iPhone`, `KaChat/Views/Explorer/ExplorerAPI.swift`, `ExplorerKStats`;
 not yet committed there).
 
-> **Status:** open.
+> **Status (2026-11-25): §1 partly done in the indexer session** (not yet deployed).
+> - Every `/stats` category now has `last30d`: the Postgres ones, and the chat indexer's (its
+>   window scan counts 30 days too). New category: `arcadeScores` (`#kplay-arcade` stamps).
+> - Not done in §1: `paymentNotices`, `kachatNames` (the names live in the separate names stack;
+>   its own `/stats` already has the `kachat*` categories) and the two kUSDT counts (no covenant
+>   transactions are indexed).
+> - §2 and §3 are not started.
+>   - **§3 (network fees) can't be served from this indexer as it stands.** Its transaction feed
+>     keeps one hour, without input amounts or output values, so no fee can be computed. It would
+>     need a UTXO-resolving ingest or another source (kaspa.stream).
+>   - `feesSompi` in §2 has the same problem.
+>   - §2's per-protocol series and windows are doable, from the tables and the chat indexer's
+>     window scan; they wait on the owner's call.
 
 ## Why
 

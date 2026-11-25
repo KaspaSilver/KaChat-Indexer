@@ -1,4 +1,4 @@
-//! KaChat Stats: rolling 24h / 7d windows for the six chat-family categories.
+//! KaChat Stats: rolling 24h / 7d / 30d windows for the six chat-family categories.
 //!
 //! The `/stats` totals come from `approximate_len()` of the one-row-per-tx `tx-id-to-*` partitions,
 //! which carry no time, so they can only give all-time totals. This module adds the windows: a
@@ -25,16 +25,17 @@ use indexer_db::messages::handshake::HandshakeKeyBySender;
 use indexer_db::messages::payment::PaymentKeyBySender;
 use indexer_db::messages::self_stash::SelfStashKeyByOwner;
 
-/// category key -> (last24h, last7d)
-type Windows = HashMap<&'static str, (u64, u64)>;
+/// category key -> (last24h, last7d, last30d)
+type Windows = HashMap<&'static str, (u64, u64, u64)>;
 
 static CACHE: OnceLock<RwLock<Option<Windows>>> = OnceLock::new();
 fn cache() -> &'static RwLock<Option<Windows>> {
     CACHE.get_or_init(|| RwLock::new(None))
 }
 
-/// (last24h, last7d) for a category, or None until the first scan completes (keep it omitted, not 0).
-pub fn windows_for(category: &str) -> Option<(u64, u64)> {
+/// (last24h, last7d, last30d) for a category, or None until the first scan completes (keep it
+/// omitted, not 0).
+pub fn windows_for(category: &str) -> Option<(u64, u64, u64)> {
     cache().read().ok()?.as_ref()?.get(category).copied()
 }
 
@@ -52,30 +53,36 @@ fn scan(
     partition: &str,
     d1: u64,
     d7: u64,
+    d30: u64,
     decode: fn(&[u8]) -> Option<(u64, [u8; 32])>,
-) -> anyhow::Result<(u64, u64)> {
+) -> anyhow::Result<(u64, u64, u64)> {
     let part = tx_keyspace.open_partition(partition, PartitionCreateOptions::default())?;
     let rtx = tx_keyspace.read_tx();
     let mut s1: HashSet<[u8; 32]> = HashSet::new();
     let mut s7: HashSet<[u8; 32]> = HashSet::new();
+    let mut s30: HashSet<[u8; 32]> = HashSet::new();
     for kv in rtx.iter(&part) {
         let (k, _v) = kv?;
         if let Some((bt, tx)) = decode(k.as_ref()) {
+            if bt > d30 {
+                s30.insert(tx);
+            }
             if bt > d7 {
                 s7.insert(tx);
-                if bt > d1 {
-                    s1.insert(tx);
-                }
+            }
+            if bt > d1 {
+                s1.insert(tx);
             }
         }
     }
-    Ok((s1.len() as u64, s7.len() as u64))
+    Ok((s1.len() as u64, s7.len() as u64, s30.len() as u64))
 }
 
 fn compute(tx_keyspace: &TxKeyspace) -> Windows {
     let now = now_ms();
     let d1 = now.saturating_sub(24 * 3600 * 1000);
     let d7 = now.saturating_sub(7 * 24 * 3600 * 1000);
+    let d30 = now.saturating_sub(30 * 24 * 3600 * 1000);
 
     // (category, partition, key decoder). Decoders are non-capturing → fn pointers.
     let jobs: &[(&'static str, &str, fn(&[u8]) -> Option<(u64, [u8; 32])>)] = &[
@@ -101,7 +108,7 @@ fn compute(tx_keyspace: &TxKeyspace) -> Windows {
 
     let mut out: Windows = HashMap::new();
     for (cat, partition, decode) in jobs {
-        match scan(tx_keyspace, partition, d1, d7, *decode) {
+        match scan(tx_keyspace, partition, d1, d7, d30, *decode) {
             Ok(w) => {
                 out.insert(cat, w);
             }
