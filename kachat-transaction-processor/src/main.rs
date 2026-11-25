@@ -9,6 +9,7 @@ mod push_notify;
 mod queue;
 mod reindex;
 mod tips;
+mod word_filter;
 mod transaction_reindex_service;
 mod worker;
 
@@ -125,14 +126,15 @@ fn blocked_address_xonly(address: &str) -> Option<String> {
 }
 
 /// One refresh of what the admin dashboard controls: the `feature_kaposts` /
-/// `feature_broadcasts` / `feature_kaplay` keys from k_vars (absent key = default ON), the KaPosts
-/// operator addresses and tracked rooms, the personal-mode denylist and the address blocklist.
+/// `feature_broadcasts` / `feature_kaplay` / `feature_word_filter` keys from k_vars (absent key =
+/// default ON), the KaPosts operator addresses and tracked rooms, the personal-mode denylist, the
+/// address blocklist and the word filter's list.
 /// Flips the runtime switches and lists the processor consults per transaction. A failed read
 /// keeps what was there.
 async fn refresh_flags(flags_pool: &database::DbPool) {
     use sqlx::Row;
     if let Ok(rows) = sqlx::query(
-        "SELECT key, value FROM k_vars WHERE key IN ('feature_kaposts', 'feature_broadcasts', 'feature_kaplay', 'kaposts_operator_addresses', 'broadcast_channels')",
+        "SELECT key, value FROM k_vars WHERE key IN ('feature_kaposts', 'feature_broadcasts', 'feature_kaplay', 'feature_word_filter', 'kaposts_operator_addresses', 'broadcast_channels')",
     )
     .fetch_all(flags_pool)
     .await
@@ -146,6 +148,10 @@ async fn refresh_flags(flags_pool: &database::DbPool) {
                     std::sync::atomic::Ordering::Relaxed,
                 ),
                 "feature_kaplay" => k_protocol::FEATURE_KAPLAY.store(
+                    value.trim().to_lowercase() != "off",
+                    std::sync::atomic::Ordering::Relaxed,
+                ),
+                "feature_word_filter" => k_protocol::FEATURE_WORD_FILTER.store(
                     value.trim().to_lowercase() != "off",
                     std::sync::atomic::Ordering::Relaxed,
                 ),
@@ -198,6 +204,13 @@ async fn refresh_flags(flags_pool: &database::DbPool) {
             .collect();
         let xonly = addresses.iter().filter_map(|a| blocked_address_xonly(a)).collect();
         k_protocol::set_address_blocklist(addresses, xonly);
+    }
+    // Word filter: words that keep a message from being stored.
+    if let Ok(words) = sqlx::query_scalar::<_, String>("SELECT word FROM kachat_word_filter")
+        .fetch_all(flags_pool)
+        .await
+    {
+        k_protocol::set_word_filter(words);
     }
 }
 

@@ -8,6 +8,7 @@
 //   - GET  /api/moderation/recent   newest indexed content (for picking removal targets)
 //   - POST /api/moderation/remove   dry-run preview or atomic remove-all-by-pubkey
 //   - GET  /api/broadcasts          stored room messages, newest first, paged (channel, limit, offset)
+//   - GET  /api/word-filter         the word filter's list (+ add, remove, purge)
 //
 // It intentionally does NOT talk to Docker or the Kaspa node: container status/logs stay in
 // Portainer, and pipeline freshness is derived purely from the database.
@@ -27,6 +28,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 
 mod blocklist;
+/// The processor's matcher, shared so a purge finds exactly what the processor would drop.
+#[path = "../../kachat-transaction-processor/src/word_filter.rs"]
+#[allow(dead_code)] // `blocks` is the processor's
+mod word_filter;
+mod words;
 
 /// Moderation tombstones, shared with the processor: a transaction id here is never stored
 /// again. Written by the admin deletes below, in the same statement as each delete.
@@ -200,6 +206,9 @@ async fn main() -> anyhow::Result<()> {
     // the processor never stores it again (a reindex, a late copy of the tx).
     let _ = sqlx::query(CREATE_REMOVED_TXS).execute(&pool).await;
 
+    // The word filter's list (the processor creates and seeds it).
+    let _ = sqlx::query(words::CREATE_TABLE).execute(&pool).await;
+
     // The address blocklist (the processor creates it too), and the chat indexer's copy of it.
     let _ = sqlx::query(blocklist::CREATE_TABLE).execute(&pool).await;
     if let Err(e) = blocklist::write_file(&pool, &args.blocklist_file).await {
@@ -260,6 +269,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/blocklist", get(blocklist::get_blocklist))
         .route("/api/blocklist/add", post(blocklist::post_blocklist_add))
         .route("/api/blocklist/remove", post(blocklist::post_blocklist_remove))
+        .route("/api/word-filter", get(words::get_word_filter))
+        .route("/api/word-filter/add", post(words::post_word_filter_add))
+        .route("/api/word-filter/remove", post(words::post_word_filter_remove))
+        .route("/api/word-filter/purge", post(words::post_word_filter_purge))
         .route("/api/translate-status", get(get_translate_status))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         // No CORS layer (kachat-audits IDX-003): the dashboard is same-origin or
@@ -1523,6 +1536,8 @@ struct SettingsResponse {
     feature_kaplay: bool,
     /// New profile saves (the profiles follower).
     feature_profiles: bool,
+    /// The word filter (/api/word-filter).
+    feature_word_filter: bool,
     chat_indexer: bool,
     personal_addresses: String,
     personal_mode: bool,
@@ -1571,6 +1586,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         feature_broadcasts: on(kv_get(&state.pool, "feature_broadcasts").await),
         feature_kaplay: on(kv_get(&state.pool, "feature_kaplay").await),
         feature_profiles: on(kv_get(&state.pool, "feature_profiles").await),
+        feature_word_filter: on(kv_get(&state.pool, "feature_word_filter").await),
         chat_indexer: chat_indexer_running(),
         personal_mode: !personal.is_empty(),
         personal_addresses: personal,
@@ -1593,6 +1609,7 @@ struct SettingsUpdate {
     feature_broadcasts: Option<bool>,
     feature_kaplay: Option<bool>,
     feature_profiles: Option<bool>,
+    feature_word_filter: Option<bool>,
     chat_indexer: Option<bool>,
     /// Newline/comma/space separated kaspa: addresses. Empty string turns personal mode off.
     personal_addresses: Option<String>,
@@ -1632,6 +1649,9 @@ async fn post_settings(
     }
     if let Some(b) = req.feature_profiles {
         kv_set(&state.pool, "feature_profiles", if b { "on" } else { "off" }).await.map_err(ApiError::db)?;
+    }
+    if let Some(b) = req.feature_word_filter {
+        kv_set(&state.pool, "feature_word_filter", if b { "on" } else { "off" }).await.map_err(ApiError::db)?;
     }
     // Personal-mode allowlist files the chat indexer reads on startup. Writing either one means we
     // must restart the chat process so it reloads — but only ONCE, even if both are saved together.

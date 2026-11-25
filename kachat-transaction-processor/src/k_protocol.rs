@@ -227,6 +227,54 @@ pub fn is_pubkey_blocked(pubkey_hex: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Word filter (docs/WORD_FILTER.md): public-chat messages and KaPosts containing a listed word
+/// are not stored. `feature_word_filter` switches it (default on); the list is
+/// `kachat_word_filter`. Both are refreshed by the flag task in main.rs.
+pub static FEATURE_WORD_FILTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static WORD_FILTER: std::sync::RwLock<Option<std::sync::Arc<crate::word_filter::WordFilter>>> =
+    std::sync::RwLock::new(None);
+
+/// Replace the word filter's list.
+pub fn set_word_filter(entries: Vec<String>) {
+    let filter = std::sync::Arc::new(crate::word_filter::WordFilter::new(entries));
+    if let Ok(mut guard) = WORD_FILTER.write() {
+        *guard = Some(filter);
+    }
+}
+
+/// Whether the word filter is on and any of `texts` has a listed word.
+fn word_filtered(texts: &[String]) -> bool {
+    if !FEATURE_WORD_FILTER.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let filter = WORD_FILTER.read().ok().and_then(|g| g.clone());
+    filter.is_some_and(|f| f.blocks(texts))
+}
+
+/// The text a KaPost shows: its message (a post, reply, quote or edit), a poll's question and
+/// options, a profile broadcast's nickname and message. Votes, follows and the rest carry none.
+fn action_texts(action: &KActionType) -> Vec<String> {
+    use base64::{Engine as _, engine::general_purpose};
+    let decode = |b64: &str| {
+        general_purpose::STANDARD
+            .decode(b64.trim())
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    };
+    let encoded: Vec<&str> = match action {
+        KActionType::Broadcast(k) => vec![&k.base64_encoded_nickname, &k.base64_encoded_message],
+        KActionType::Post(k) => vec![&k.base64_encoded_message],
+        KActionType::Reply(k) => vec![&k.base64_encoded_message],
+        KActionType::Quote(k) => vec![&k.base64_encoded_message],
+        KActionType::Edit(k) => vec![&k.base64_encoded_message],
+        KActionType::Poll(k) => std::iter::once(k.base64_encoded_question.as_str())
+            .chain(k.options_b64_csv.split(','))
+            .collect(),
+        _ => Vec::new(),
+    };
+    encoded.into_iter().filter_map(decode).collect()
+}
+
 /// KaPosts "operator" identities as lowercase-hex **x-only** pubkeys (32 bytes / 64 hex) — the
 /// x-coordinate of THIS indexer owner's key, decoded from the kaspa address they entered in the
 /// dashboard. When an author whose pubkey shares this x-coordinate publishes an on-chain
@@ -1185,6 +1233,10 @@ impl KProtocolProcessor {
                     return Ok(());
                 }
             }
+            if word_filtered(&action_texts(&action_type)) {
+                info!("KaPosts tx {} not stored: word filter", transaction_id);
+                return Ok(());
+            }
             match action_type {
                 KActionType::Broadcast(k_broadcast) => {
                     self.save_k_broadcast_to_database(transaction, k_broadcast)
@@ -1331,6 +1383,12 @@ impl KProtocolProcessor {
                 "Broadcast {} on non-tracked channel '{}', skipping",
                 transaction_id, channel
             );
+            return Ok(BcastOutcome::Done);
+        }
+        // Word filter, before the sender lookup: a filtered message is never queued for retry.
+        // KaPlay's rooms hold game data, not chat.
+        if !KAPLAY_ROOMS.contains(&channel.as_str()) && word_filtered(&crate::word_filter::room_texts(content)) {
+            info!("Broadcast {} on #{} not stored: word filter", transaction_id, channel);
             return Ok(BcastOutcome::Done);
         }
 

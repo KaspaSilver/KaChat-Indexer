@@ -1,0 +1,192 @@
+# Default word filter (docs/WORD_FILTER.md): public chats and KaPosts (posts, replies, quotes,
+# polls, edits, profile broadcasts). A message containing any of these is not stored, so no app
+# using this indexer shows it. The processor copies this list into `kachat_word_filter` once, on
+# first start; after that the panel's list is the one used.
+#
+# Matching:
+#   - Not case-sensitive; accents are dropped (é -> e).
+#   - Common letter swaps are undone first: 0->o 1->i 3->e 4->a 5->s 7->t @->a $->s.
+#   - Stretched letters are undone: "fuuuck" and "shiiit" match.
+#   - Whole words only: "ass" does not match "class" or "assistant".
+#   - A trailing * matches any ending: "fuck*" matches fuck, fucks, fucking, fucker.
+#   - Two or more words match as a phrase.
+
+# --- Strong profanity -----------------------------------------------------------
+fuck*
+motherfuck*
+fck
+fcking
+fuk
+fuking
+wtf
+stfu
+gtfo
+shit
+shits
+shitty
+shitting
+shithead*
+bullshit*
+horseshit
+dipshit*
+shithole*
+ass
+asses
+asshole*
+arsehole*
+dumbass*
+jackass*
+badass*
+kickass
+bitch*
+sonofabitch
+son of a bitch
+bastard*
+cunt*
+twat*
+prick
+pricks
+piss
+pissed
+pissing
+goddamn*
+bollocks
+bugger*
+wanker*
+tosser*
+douche*
+douchebag*
+
+# --- Sexual and explicit ---------------------------------------------------------
+porn*
+pornhub
+xxx
+nsfw
+sex
+sexy
+sexting
+nude
+nudes
+naked
+dick
+dicks
+dickhead*
+cock
+cocks
+cocksuck*
+penis*
+vagina*
+pussy
+pussies
+tits
+titties
+boobs
+boobies
+blowjob*
+handjob*
+rimjob*
+cum
+cumming
+cumshot*
+jizz*
+orgasm*
+masturbat*
+jerk off
+jerking off
+dildo*
+vibrator*
+horny
+milf*
+hentai
+erotic*
+onlyfans
+camgirl*
+escort service
+hooker*
+whore*
+slut*
+skank*
+thot
+thots
+anal
+rape
+raped
+rapist*
+raping
+molest*
+pedo
+pedos
+pedophil*
+paedophil*
+child porn*
+cp links
+
+# --- Slurs: race, ethnicity, religion -----------------------------------------
+nigger*
+nigga*
+niggaz
+negro
+negroes
+coon
+coons
+spic
+spics
+spick
+wetback*
+beaner*
+chink
+chinks
+gook*
+jap
+japs
+kike*
+raghead*
+towelhead*
+sandnigger*
+paki
+pakis
+gyp
+gypped
+gypsies
+honky
+honkies
+redskin*
+injun*
+zipperhead*
+
+# --- Slurs: sexuality and gender ------------------------------------------------
+fag
+fags
+faggot*
+fagg*
+dyke*
+tranny
+trannies
+shemale*
+homo
+homos
+
+# --- Slurs: disability ----------------------------------------------------------
+retard
+retards
+retarded
+tard
+tards
+spaz
+spastic
+mongoloid*
+
+# --- Hate and violence -------------------------------------------------------------
+nazi
+nazis
+heil hitler
+sieg heil
+white power
+kkk
+gas the
+kill yourself
+killyourself
+kys
+go die
+hang yourself
+neck yourself

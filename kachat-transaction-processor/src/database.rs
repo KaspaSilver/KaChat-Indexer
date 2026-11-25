@@ -176,6 +176,7 @@ impl KDbClient {
         // Step 1c: idempotently ensure the KaPosts personal-mode block/mute denylist exists.
         self.create_denylist_schema().await?;
         self.create_address_blocklist_schema().await?;
+        self.create_word_filter_schema().await?;
 
         // Step 1c': safe nickname decode + one-off cleanup of undecodable nicknames (IDX-005).
         self.create_safe_nickname_decode().await?;
@@ -735,6 +736,52 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Word filter (docs/WORD_FILTER.md): words that keep a public-chat message or KaPost from
+    /// being stored. Seeded once from `word_filter_default.txt`, on the first start that finds no
+    /// `word_filter_seeded` key; from then on the panel's list is the one used, even when empty.
+    async fn create_word_filter_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS kachat_word_filter (
+                word TEXT PRIMARY KEY,
+                added_at BIGINT NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        let mut tx = self.pool.begin().await?;
+        let first = sqlx::query(
+            "INSERT INTO k_vars (key, value) VALUES ('word_filter_seeded', '1') ON CONFLICT (key) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if first {
+            let words: Vec<String> = include_str!("word_filter_default.txt")
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .filter_map(crate::word_filter::clean_entry)
+                .collect();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            sqlx::query(
+                "INSERT INTO kachat_word_filter (word, added_at) SELECT unnest($1::TEXT[]), $2 \
+                 ON CONFLICT (word) DO NOTHING",
+            )
+            .bind(&words)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            info!("Word filter seeded with {} default words", words.len());
+        }
+        tx.commit().await?;
         Ok(())
     }
 
