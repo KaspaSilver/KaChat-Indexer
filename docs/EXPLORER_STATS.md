@@ -33,20 +33,19 @@ not yet committed there).
 K now has its own block explorer (Kaspa Hub > Explorer). Its data comes from kaspa.stream's REST
 API and K's own node, except two things neither has, which come from this indexer:
 
-1. **K Activity**: how many transactions K's protocols made in the last 24 hours, 7 days, 30 days
-   and all time, by protocol, with the window before for a "+8.9%" change, a bar per hour / day /
+1. **K Activity**: how many transactions K's protocols made in the last 24 hours, 7 days and all
+   time (owner, 2026-11-25: no 30 days), by protocol, with the window before for a "+8.9%" change, a bar per hour / day /
    month, the addresses that sent them and the fees they paid.
 2. **Network fees**: the average fee one Kaspa transaction paid over the last 24 hours, and total
    fees per hour, day or month.
 
 The app already reads `/stats` (24h, 7d, all time) and shows what's there. Everything below is
 read the moment it's served: **no app update needed**. Until then the card leaves the missing
-parts off (no 30 Days, no bars, no change line, no footer) and the fee tile says "demo".
+parts off (no bars, no change line, no footer) and the fee tile says "demo".
 
-## 1. `/stats`: add `last30d`
+## 1. `/stats`: new categories
 
-Each category gains `last30d`, like `last24h` and `last7d`. With it the card offers 30 Days even
-before section 2 exists.
+`last24h`, `last7d` and `total` are all the card needs (no `last30d`).
 
 New categories the card maps (send them when you can count them):
 
@@ -62,9 +61,9 @@ Already mapped: `messages` + `groupMessages` (KaChat Messages), `handshakes`, `p
 `kaposts` + `kapostActions` (KaPosts), `publicChats`, `chessMoves`. `selfStash` and `groupUpdates`
 are left off the card on purpose (machinery).
 
-## 2. `GET /stats/activity?period=day|week|month|all`
+## 2. `GET /stats/activity?period=day|week|all`
 
-One period, complete. The app asks for all four; if any answers non-2xx it falls back to `/stats`
+One period, complete. The app asks for all three; if any answers non-2xx it falls back to `/stats`
 for the session.
 
 ```json
@@ -82,8 +81,8 @@ for the session.
 
 - `categories`: the same keys as `/stats`, counts inside `[from, to)`.
 - `previous`: the same counts for the window just before (`[from - length, from)`). Omit for `all`.
-- `series`: oldest first. `day`: 24 hourly buckets. `week`: 7 daily. `month`: 30 daily. `all`: one
-  per calendar month since `indexedSince`. `t` is the bucket's start (ms, UTC); the last bucket is
+- `series`: oldest first. `day`: 24 hourly buckets. `week`: 7 daily. `all`: one per calendar month
+  since `indexedSince`. `t` is the bucket's start (ms, UTC); the last bucket is
   the one still filling.
 - `activeAddresses`: distinct sender addresses of the counted transactions in the window.
 - `feesSompi`: total network fees those transactions paid in the window.
@@ -103,8 +102,8 @@ outputs; the indexer database this runs beside already has both.
 
 - `averageFeeSompi24h`: total fees over the last 24 hours divided by the transactions in them. The
   app reads it from the `day` answer (it may be in every answer).
-- `buckets`: oldest first, the same layout as `series` above (hourly for `day`, daily for `week` and
-  `month`, monthly for `all`).
+- `buckets`: oldest first: hourly for `day`, daily for `week` and `month` (the fees chart keeps 30
+  days), monthly for `all`.
 - Keeping hourly buckets for 30 days and a monthly rollup forever is enough.
 
 Add a Status note here with the commit when done.
