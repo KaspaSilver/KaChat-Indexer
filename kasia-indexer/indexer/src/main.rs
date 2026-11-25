@@ -464,6 +464,7 @@ async fn main() -> anyhow::Result<()> {
         .tx_id_to_group_control_partition(tx_id_to_group_control_partition.clone())
         .runtime(tokio::runtime::Handle::current())
         .push_tx(push_tx.clone())
+        .push_funds_tx(funds_push_tx.clone())
         .build();
 
     let mut ticker = Ticker::new(

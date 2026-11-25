@@ -31,8 +31,9 @@ pub const KACHAT_MARKER: &str = "\u{2060}";
 /// accent-free spellings (espanol/francais/portugues) are deliberate so the names survive
 /// normalization. `kaspa-romania` was added later (server-tracked default).
 /// The *effective* tracked set is `channel_is_tracked` (runtime-configurable — see below).
-pub const DEFAULT_BROADCAST_CHANNELS: [&str; 17] = [
+pub const DEFAULT_BROADCAST_CHANNELS: [&str; 18] = [
     "kaspa",
+    "report-bugs",
     "kachat-bugs",
     "kaspa-indonesia",
     "kaspa-czech",

@@ -4,7 +4,12 @@
 `emit_funds_received`; the `address_activity` push). **From:** the K iOS session (owner report:
 "when I find a block it pings me multiple times even though I only find one block").
 
-> **Status:** open.
+> **Status (2026-11-25): §1 done in the indexer session** (not yet deployed).
+> - A coinbase that credits a watched address is held at sighting (`hold_coinbase_credit`,
+>   `indexer-actors/src/lib.rs`). Its push is sent only when the virtual chain accepts that
+>   coinbase (`handle_vcc_addition`), so a block found rings once.
+> - Coinbases never accepted age out after 15 minutes.
+> - §2 (every payment on acceptance) is not done: ordinary payments still push on sighting.
 
 ## What happens
 

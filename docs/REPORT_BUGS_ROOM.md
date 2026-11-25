@@ -4,7 +4,12 @@
 defaults). **From:** the K iOS session (`KaspaSilver/K-iPhone`, `PublicChatService.featuredChannels`
 and `retiredChannels`; not yet committed there).
 
-> **Status:** open.
+> **Status (2026-11-25): §2-§5 done in the indexer session** (not yet deployed).
+> - §2: `report-bugs` is in the three `DEFAULT_BROADCAST_CHANNELS`; `kachat-bugs` stays (§3).
+> - §4: room pushes need nothing new.
+> - §5: `/stats` already counts every room but KaPlay's as public chats.
+> - **§1 is the owner's:** the live server has a saved room list, so add `report-bugs` under
+>   Public chats > Channels in the panel. Until then the live server doesn't track it.
 
 ## Why
 

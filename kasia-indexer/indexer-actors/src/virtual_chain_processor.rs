@@ -1,7 +1,7 @@
 pub mod message;
 
 use crate::data_source::{Command, Request};
-use crate::push::{PushEvent, PushEventKind, parse_self_stash_alias};
+use crate::push::{FundsPushEvent, PushEvent, PushEventKind, parse_self_stash_alias};
 use crate::util::ToHex64;
 use crate::virtual_chain_syncer::{NotificationAck, VirtualChainSyncer};
 use fjall::{PartitionCreateOptions, TxKeyspace, WriteTransaction};
@@ -89,6 +89,8 @@ pub struct VirtualProcessor {
 
     runtime: tokio::runtime::Handle,
     push_tx: Option<flume::Sender<PushEvent>>,
+    /// "Received" pushes for coinbases held by the block processor until accepted.
+    push_funds_tx: Option<flume::Sender<FundsPushEvent>>,
 }
 
 struct State {
@@ -660,6 +662,12 @@ impl VirtualProcessor {
         let block_hash = block.accepting_block_hash.as_bytes();
         let daa = state.processed_blocks.get(&block_hash).unwrap().0;
         for tx in &block.accepted_transaction_ids {
+            if let Some(event) = crate::take_coinbase_credit(&tx.as_bytes())
+                && let Some(funds_tx) = &self.push_funds_tx
+                && funds_tx.try_send(event).is_err()
+            {
+                warn!("Dropping funds push event; queue is full");
+            }
             let Some(key) = self
                 .tx_id_to_acceptance_partition
                 .key_by_tx_id(tx.as_ref())?

@@ -98,6 +98,30 @@ pub fn is_blocked_xonly(pubkey: &[u8; 32]) -> bool {
         .unwrap_or(false)
 }
 
+/// Coinbase credits to watched addresses, held from block sighting until the coinbase is
+/// accepted (RECEIVED_PUSH_COINBASE.md). A block found is merged by many blocks, each with its own
+/// coinbase paying the miner, and only the chain block's is accepted: pushing at sighting rang the
+/// miner once per merging block. Coinbases never accepted age out.
+static PENDING_COINBASE: LazyLock<std::sync::Mutex<std::collections::HashMap<[u8; 32], (std::time::Instant, crate::push::FundsPushEvent)>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// How long a coinbase credit waits for its acceptance.
+const PENDING_COINBASE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Hold a coinbase's credit until the coinbase is accepted.
+pub fn hold_coinbase_credit(event: crate::push::FundsPushEvent) {
+    if let Ok(mut pending) = PENDING_COINBASE.lock() {
+        let now = std::time::Instant::now();
+        pending.retain(|_, (at, _)| now.duration_since(*at) < PENDING_COINBASE_TTL);
+        pending.insert(event.tx_id, (now, event));
+    }
+}
+
+/// The credit held for this coinbase, now that it is accepted.
+pub fn take_coinbase_credit(tx_id: &[u8; 32]) -> Option<crate::push::FundsPushEvent> {
+    PENDING_COINBASE.lock().ok()?.remove(tx_id).map(|(_, event)| event)
+}
+
 /// Union of every device's registered `watch_only_addresses` (Address Activity push). The push
 /// registry keeps this in sync; the block processor consults it to decide whether an accepted tx
 /// credits a watched address without a per-output DB lookup. Empty = the feature is fully inert
@@ -324,5 +348,21 @@ mod blocklist_tests {
         assert!(!is_blocked_address(&AddressPayload::default()));
         set_blocked_addresses(HashSet::new());
         assert!(!is_blocked_address(&blocked));
+    }
+
+    #[test]
+    fn a_coinbase_credit_is_sent_once_when_accepted() {
+        let event = crate::push::FundsPushEvent {
+            credited: vec![(AddressPayload::from_xonly_pubkey([7; 32]), 194_000_000)],
+            senders: Vec::new(),
+            tx_id: [9; 32],
+            timestamp: 0,
+            daa_score: 0,
+            chat_tx: false,
+        };
+        hold_coinbase_credit(event);
+        assert!(take_coinbase_credit(&[8; 32]).is_none());
+        assert!(take_coinbase_credit(&[9; 32]).is_some());
+        assert!(take_coinbase_credit(&[9; 32]).is_none());
     }
 }

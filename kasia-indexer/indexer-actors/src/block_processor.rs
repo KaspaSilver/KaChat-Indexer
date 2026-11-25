@@ -488,6 +488,12 @@ impl BlockProcessor {
             daa_score: block_header.daa_score,
             chat_tx: parse_sealed_operation(&tx.payload).is_some(),
         };
+        // A coinbase is pushed when accepted, not on sighting (RECEIVED_PUSH_COINBASE.md):
+        // virtual_chain_processor `handle_vcc_addition` sends it.
+        if tx.subnetwork_id == kaspa_consensus_core::subnets::SUBNETWORK_ID_COINBASE {
+            crate::hold_coinbase_credit(event);
+            return Ok(());
+        }
         if funds_tx.try_send(event).is_err() {
             warn!("Dropping funds push event; queue is full");
         }

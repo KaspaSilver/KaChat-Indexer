@@ -774,8 +774,9 @@ impl PostgresDbManager {
 /// The processor's fallback room list when `k_vars['broadcast_channels']` is unset. Kept in sync
 /// with `DEFAULT_BROADCAST_CHANNELS` in kachat-transaction-processor/src/k_protocol.rs (and
 /// kachat-admin, which shows it as suggestions).
-const DEFAULT_BROADCAST_CHANNELS: [&str; 17] = [
+const DEFAULT_BROADCAST_CHANNELS: [&str; 18] = [
     "kaspa",
+    "report-bugs",
     "kachat-bugs",
     "kaspa-indonesia",
     "kaspa-czech",
