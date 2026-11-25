@@ -1,7 +1,7 @@
 //! K Explorer (EXPLORER_STATS.md §2-§3): `/stats/activity?period=` and `/network/fees?period=`.
 //!
-//! Periods share one bucket layout: `day` = the last 24 hours, `week` and `month` = the last 7 and
-//! 30 UTC days, `all` = every calendar month with data. The last bucket is the one still filling.
+//! Periods share one bucket layout: `day` = the last 24 hours, `week` = the last 7 UTC days, `all`
+//! = every calendar month with data (K stats show 24 hours, 7 days and all time). The last bucket is the one still filling.
 //! Counts come from the KaPosts and room tables, and from the chat indexer's hourly and monthly
 //! counts (`/stats/buckets`). Fees and senders come from the hourly totals the profiles follower
 //! keeps from the node's accepted transactions (`kachat_fee_hours`, `kachat_k_hours`,
@@ -38,7 +38,6 @@ const K_EVENTS: &str = "\
 pub enum Period {
     Day,
     Week,
-    Month,
     All,
 }
 
@@ -47,7 +46,6 @@ impl Period {
         match value.unwrap_or("day").trim() {
             "day" => Some(Period::Day),
             "week" => Some(Period::Week),
-            "month" => Some(Period::Month),
             "all" => Some(Period::All),
             _ => None,
         }
@@ -57,7 +55,6 @@ impl Period {
         match self {
             Period::Day => "day",
             Period::Week => "week",
-            Period::Month => "month",
             Period::All => "all",
         }
     }
@@ -67,7 +64,6 @@ impl Period {
         match self {
             Period::Day => Some((HOUR_MS, 24)),
             Period::Week => Some((DAY_MS, 7)),
-            Period::Month => Some((DAY_MS, 30)),
             Period::All => None,
         }
     }
@@ -211,7 +207,7 @@ pub async fn activity(
     for r in sqlx::query(&sql).bind(range_from).bind(layout.to).fetch_all(pool).await? {
         counts.add(&layout, r.get::<String, _>("c").as_str(), r.get("h"), r.get("n"));
     }
-    // Chats: hourly counts reach 60 days back, enough for a month and the month before it.
+    // Chats: hourly counts reach 14 days back, enough for a week and the week before it.
     let chat_counts = if period == Period::All { &chat.months } else { &chat.hours };
     for category in CHAT_CATEGORIES {
         for (&at, &n) in chat_counts.get(category).into_iter().flatten() {
@@ -333,10 +329,11 @@ mod tests {
     }
 
     #[test]
-    fn a_month_is_30_days_and_all_is_calendar_months() {
-        let l = Layout::new(Period::Month, NOW, None);
-        assert_eq!(l.starts.len(), 30);
+    fn a_week_is_7_days_and_all_is_calendar_months() {
+        let l = Layout::new(Period::Week, NOW, None);
+        assert_eq!(l.starts.len(), 7);
         assert_eq!(*l.starts.last().unwrap(), NOW.div_euclid(DAY_MS) * DAY_MS);
+        assert_eq!(Period::parse(Some("month")), None);
         // Data since 2026-09-15 -> September, October, November.
         let l = Layout::new(Period::All, NOW, Some(1_789_430_400_000));
         assert_eq!(l.starts, vec![1_788_220_800_000, 1_790_812_800_000, 1_793_491_200_000]);
