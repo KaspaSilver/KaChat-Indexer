@@ -13,8 +13,10 @@
 >   a chat, handshake, group, self-stash) gives no `address_activity` push to a device that takes
 >   chat pushes (K, or a wildcard topic). KaPay on the same wallet still gets its "Funds
 >   received".
-> - **§2, self-sends:** a device's `watched_addresses` (the chatting address) now count as its
->   own, alongside `watch_only_addresses`. The block processor records outputs paying the chatting
+> - **§2, self-sends:** a device's own chatting address (its signer-bound `primary_address`, and
+>   `wallet_address`) now counts as its own, alongside `watch_only_addresses`. (Until the
+>   2026-11-25 audit, all of `watched_addresses` counted, which also holds chat contacts, so a
+>   contact's payment gave no "Received" push.) The block processor records outputs paying the chatting
 >   address of any device with watch-only addresses (without announcing them), so a later send
 >   from it is a self-send. This only covers outputs that arrive after the deploy: the first send
 >   from a chatting address funded before then can still ping once.

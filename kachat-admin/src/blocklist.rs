@@ -50,6 +50,9 @@ fn xonly_key(addr: &kaspa_addresses::Address) -> Option<Vec<u8>> {
 /// Rewrite the chat indexer's copy of the list (one address per line). Written to a temporary
 /// file and renamed, so the indexer never reads half a list.
 pub async fn write_file(pool: &PgPool, path: &str) -> anyhow::Result<()> {
+    // One writer at a time, so two changes can't interleave their temporary files.
+    static WRITING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _writing = WRITING.lock().await;
     let rows: Vec<String> = sqlx::query_scalar("SELECT address FROM kachat_address_blocklist ORDER BY address")
         .fetch_all(pool)
         .await?;
@@ -57,7 +60,7 @@ pub async fn write_file(pool: &PgPool, path: &str) -> anyhow::Result<()> {
     if !text.is_empty() {
         text.push('\n');
     }
-    let tmp = format!("{path}.tmp");
+    let tmp = format!("{path}.{}.tmp", std::process::id());
     tokio::fs::write(&tmp, text).await?;
     tokio::fs::rename(&tmp, path).await?;
     Ok(())
@@ -181,8 +184,9 @@ pub async fn post_blocklist_add(
 /// Everything in Postgres sent from the address, in one statement (all or nothing): KaPosts by
 /// its key, room messages and game stamps by address, its profile.
 async fn purge_postgres(pool: &PgPool, address: &str, xonly: Option<Vec<u8>>) -> Result<Purged, sqlx::Error> {
-    // `kx(col)`: a stored compressed key (33 bytes) reduced to its x-coordinate.
-    let kx = |col: &str| format!("(CASE WHEN length({col}) = 33 THEN substring({col} from 2) ELSE {col} END) = $1");
+    // `kx(col)`: the key in any of its three valid forms (`02x`, `03x`, bare `x`), as an `IN`
+    // list so each table's sender index can be used.
+    let kx = |col: &str| format!("{col} IN ('\\x02'::bytea || $1, '\\x03'::bytea || $1, $1)");
     let kaposts_tables = [
         ("k_contents", "sender_pubkey"),
         ("k_mentions", "sender_pubkey"),
@@ -195,6 +199,8 @@ async fn purge_postgres(pool: &PgPool, address: &str, xonly: Option<Vec<u8>>) ->
         ("k_hashtags", "sender_pubkey"),
         ("k_poll_votes", "voter_pubkey"),
         ("k_broadcasts", "sender_pubkey"),
+        // Its queued posts, so the scheduler doesn't relay them later.
+        ("k_scheduled_posts", "pubkey"),
     ];
     let deletes: Vec<String> = kaposts_tables
         .iter()

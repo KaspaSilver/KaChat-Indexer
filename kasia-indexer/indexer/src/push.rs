@@ -1166,11 +1166,7 @@ impl PushRegistry {
             if reg.watch_only_addresses.is_empty() {
                 continue;
             }
-            for address in &reg.watched_addresses {
-                if let Ok(payload) = address_to_payload(address) {
-                    own.insert(payload);
-                }
-            }
+            own.extend(own_addresses(&reg));
         }
         indexer_actors::set_watch_only_addresses(set);
         indexer_actors::set_self_send_addresses(own);
@@ -1179,8 +1175,9 @@ impl PushRegistry {
     /// Address Activity: devices to notify that `address` was credited. Matches devices whose
     /// `watch_only_addresses` include `address`, and drops any device that also watches one of
     /// `senders` (a self-send: the owner funded their own address, so no ping;
-    /// docs/KACHAT_WALLET_PUSH.md §1), counting its `watched_addresses` as its own too. Iterates all registrations (funds events are gated on the
-    /// global watch-only set, so this only runs for real hits).
+    /// docs/KACHAT_WALLET_PUSH.md §1), counting its own chatting address as its own too
+    /// (`own_addresses`). Iterates all registrations (funds events are gated on the global
+    /// watch-only set, so this only runs for real hits).
     pub fn watch_only_tokens(
         &self,
         address: &AddressPayload,
@@ -1205,11 +1202,7 @@ impl PushRegistry {
                 continue;
             }
             if payloads.iter().any(|p| senders.contains(p))
-                || reg
-                    .watched_addresses
-                    .iter()
-                    .filter_map(|a| address_to_payload(a).ok())
-                    .any(|p| senders.contains(&p))
+                || own_addresses(&reg).iter().any(|p| senders.contains(p))
             {
                 continue;
             }
@@ -4159,7 +4152,11 @@ impl ApnsClient {
             .header("apns-priority", "10");
         if let Some(collapse_id) = collapse_id {
             // APNs caps collapse-id at 64 bytes.
-            let trimmed = &collapse_id[..collapse_id.len().min(64)];
+            let mut end = collapse_id.len().min(64);
+            while !collapse_id.is_char_boundary(end) {
+                end -= 1;
+            }
+            let trimmed = &collapse_id[..end];
             req = req.header("apns-collapse-id", trimmed);
         }
         let req = req.json(payload);
@@ -4762,9 +4759,25 @@ fn normalize_hidden_broadcast_senders(
 }
 
 /// x-only form of a KaPosts pubkey hex: drops the `02`/`03` parity byte of a compressed key.
+/// A device's own chatting address for self-send checks: its signer-bound `primary_address`
+/// and `wallet_address`. Not `watched_addresses`, which also holds the device's chat contacts:
+/// counting those made every payment from a contact look like a self-send.
+fn own_addresses(reg: &DeviceRegistration) -> Vec<AddressPayload> {
+    [reg.primary_address.as_deref(), reg.wallet_address.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|a| !a.is_empty())
+        .filter_map(|a| address_to_payload(a).ok())
+        .collect()
+}
+
 fn kaposts_xonly(pubkey: &str) -> String {
     let pk = pubkey.trim().to_lowercase();
-    if pk.len() == 66 { pk[2..].to_string() } else { pk }
+    // `get`, not `[2..]`: a 66-byte non-ASCII string would panic the registry thread.
+    match pk.get(2..) {
+        Some(xonly) if pk.len() == 66 => xonly.to_string(),
+        _ => pk,
+    }
 }
 
 /// The bell list (PUSH_EXTENSIONS.md §3a): keep 66-hex (or 64-hex x-only) keys, lowercased, one
@@ -4791,12 +4804,11 @@ fn normalize_kaposts_watch_authors(authors: Vec<String>) -> Vec<String> {
 }
 
 fn normalize_kaposts_pubkey(pubkey: Option<String>) -> Option<String> {
+    // A KaPosts key: 64 hex (x-only) or 66 hex (02/03 compressed). Anything else is dropped.
     let pk = pubkey?.trim().to_lowercase();
-    if pk.is_empty() {
-        None
-    } else {
-        Some(pk)
-    }
+    let valid = pk.bytes().all(|b| b.is_ascii_hexdigit())
+        && (pk.len() == 64 || (pk.len() == 66 && (pk.starts_with("02") || pk.starts_with("03"))));
+    valid.then_some(pk)
 }
 
 /// The extra APNs topics a device may register for, on top of `KNOWN_APP_TOPICS`:
@@ -6145,17 +6157,17 @@ mod kaposts_watch_tests {
             create_shared_metrics(),
         );
         let addr = |b: u8| Address::new(Prefix::Mainnet, Version::PubKey, &[b; 32]);
-        let (chatting, spending) = (addr(1), addr(2));
+        let (chatting, spending, contact) = (addr(1), addr(2), addr(3));
         let payload = |a: &Address| AddressPayload::try_from(a).expect("payload");
         let (k, kapay) = ("ab".repeat(32), "cd".repeat(32));
-        let register = |registry: &mut PushRegistry, token: &str, watched: Vec<String>, app: Option<&str>| {
+        let register = |registry: &mut PushRegistry, token: &str, watched: Vec<String>, primary: Option<&Address>, app: Option<&str>| {
             registry.register(
                 token.to_string(),
                 "ios".to_string(),
                 watched,
                 vec![],
                 vec![],
-                Some(chatting.to_string()),
+                primary.map(|a| a.to_string()),
                 vec![],
                 vec![],
                 Default::default(),
@@ -6173,7 +6185,9 @@ mod kaposts_watch_tests {
                 None,
             )
         };
-        register(&mut registry, &k, vec![chatting.to_string()], Some(" K ")).expect("K registered");
+        // K watches its chatting address and a chat contact's.
+        let k_watched = vec![chatting.to_string(), contact.to_string()];
+        register(&mut registry, &k, k_watched.clone(), Some(&chatting), Some(" K ")).expect("K registered");
         assert_eq!(registry.get_registration(&k).unwrap().unwrap().app.as_deref(), Some("k"));
         assert!(registry.k_tokens(&[k.clone()]).unwrap().contains(&k));
 
@@ -6195,7 +6209,7 @@ mod kaposts_watch_tests {
         assert!(!takes_chat_push(false, Some("kapay.kachat.app")));
 
         // KaPay on the same wallet watches the spending address only.
-        register(&mut registry, &kapay, vec![], None).expect("KaPay registered");
+        register(&mut registry, &kapay, vec![], None, None).expect("KaPay registered");
         let matched = |registry: &PushRegistry, senders: Vec<AddressPayload>| {
             let mut tokens = registry.watch_only_tokens(&payload(&spending), &senders).unwrap();
             tokens.sort();
@@ -6205,11 +6219,13 @@ mod kaposts_watch_tests {
         // K sends KAS from its chatting address to its spending address: a self-send for K.
         assert_eq!(matched(&registry, vec![payload(&chatting)]), vec![kapay.clone()]);
         assert!(matched(&registry, vec![payload(&spending)]).is_empty());
+        // A chat contact paying K is not K's own money: both devices hear of it.
+        assert_eq!(matched(&registry, vec![payload(&contact)]), vec![k.clone(), kapay.clone()]);
 
         // An update without the field keeps K; an unknown value clears it.
-        register(&mut registry, &k, vec![chatting.to_string()], None).expect("re-registered");
+        register(&mut registry, &k, k_watched.clone(), Some(&chatting), None).expect("re-registered");
         assert_eq!(registry.get_registration(&k).unwrap().unwrap().app.as_deref(), Some("k"));
-        register(&mut registry, &k, vec![chatting.to_string()], Some("kapost")).expect("re-registered");
+        register(&mut registry, &k, k_watched, Some(&chatting), Some("kapost")).expect("re-registered");
         assert_eq!(registry.get_registration(&k).unwrap().unwrap().app, None);
         assert!(registry.k_tokens(&[k.clone()]).unwrap().is_empty());
     }

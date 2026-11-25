@@ -114,7 +114,9 @@ impl Layout {
                     starts: (0..n).map(|i| from + i * size).collect(),
                     from,
                     to: now,
-                    previous_from: Some(from - n * size),
+                    // The window before is as long as this one (`now - from`, the last bucket being
+                    // partly filled), so a flat rate reads as no change.
+                    previous_from: Some(from - (now - from)),
                     bucket_ms: Some(size),
                 }
             }
@@ -306,11 +308,13 @@ mod tests {
         assert_eq!(l.starts.len(), 24);
         assert_eq!(*l.starts.last().unwrap(), 1_795_618_800_000); // 15:00
         assert_eq!(l.from, 1_795_618_800_000 - 23 * HOUR_MS);
-        assert_eq!(l.previous_from, Some(l.from - 24 * HOUR_MS));
+        // 23.5 h so far, against the 23.5 h before them.
+        assert_eq!(l.previous_from, Some(l.from - (NOW - l.from)));
+        assert_eq!(NOW - l.from, 23 * HOUR_MS + HOUR_MS / 2);
         assert_eq!(l.bucket_of(NOW - 1), Some(1_795_618_800_000));
         assert_eq!(l.bucket_of(l.from - 1), None);
         assert!(l.in_previous(l.from - 1));
-        assert!(!l.in_previous(l.from - 24 * HOUR_MS - 1));
+        assert!(!l.in_previous(l.from - (NOW - l.from) - 1));
     }
 
     #[test]

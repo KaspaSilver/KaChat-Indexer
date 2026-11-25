@@ -87,9 +87,9 @@ struct Scanned {
     months: BTreeMap<u64, u64>,
 }
 
-/// Walk one by-* partition, counting each distinct tx_id once (at the block time it is first seen
-/// with): into the windows newer than each cutoff, its hour (the last `HOURS_KEPT_MS`) and its
-/// month. `decode` extracts (block_time_ms, tx_id) from a raw key.
+/// Walk one by-* partition, counting each transaction into the windows newer than each cutoff,
+/// its hour (the last `HOURS_KEPT_MS`) and its month. `decode` extracts (block_time_ms, tx_id)
+/// from a raw key.
 fn scan(
     tx_keyspace: &TxKeyspace,
     partition: &str,
@@ -100,12 +100,15 @@ fn scan(
     let hours_from = now.saturating_sub(HOURS_KEPT_MS);
     let part = tx_keyspace.open_partition(partition, PartitionCreateOptions::default())?;
     let rtx = tx_keyspace.read_tx();
+    // Deduped only inside the last `HOURS_KEPT_MS` (every window and hour is there): an all-time
+    // set would hold every tx id ever stored. Older months count each key once; the main source
+    // of repeats, a message's zero-sender key, is skipped by its decoder.
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let mut out = Scanned { windows: (0, 0, 0), hours: BTreeMap::new(), months: BTreeMap::new() };
     for kv in rtx.iter(&part) {
         let (k, _v) = kv?;
         let Some((bt, tx)) = decode(k.as_ref()) else { continue };
-        if !seen.insert(tx) {
+        if bt >= hours_from && !seen.insert(tx) {
             continue;
         }
         out.windows.0 += u64::from(bt > d1);
@@ -125,7 +128,12 @@ fn compute(tx_keyspace: &TxKeyspace) -> (Windows, Buckets) {
     // (category, partition, key decoder). Decoders are non-capturing → fn pointers.
     let jobs: &[(&'static str, &str, fn(&[u8]) -> Option<(u64, [u8; 32])>)] = &[
         ("messages", "contextual_message_by_sender", |k| {
-            ContextualMessageBySenderKey::try_read_from_bytes(k).ok().map(|x| (x.block_time.get(), x.tx_id))
+            // A message is first stored under a zero sender, then under its resolved one: count
+            // the resolved key only.
+            ContextualMessageBySenderKey::try_read_from_bytes(k)
+                .ok()
+                .filter(|x| x.sender != indexer_db::AddressPayload::default())
+                .map(|x| (x.block_time.get(), x.tx_id))
         }),
         ("handshakes", "handshake_by_sender", |k| {
             HandshakeKeyBySender::try_read_from_bytes(k).ok().map(|x| (x.block_time.get(), x.tx_id))

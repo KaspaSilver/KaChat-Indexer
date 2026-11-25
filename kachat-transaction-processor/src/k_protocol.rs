@@ -126,10 +126,12 @@ pub fn set_kaposts_denylist(list: Vec<String>) {
 
 /// Is this author pubkey (hex) blocked/muted, so its content must not be stored?
 pub fn is_kaposts_denied(pubkey_hex: &str) -> bool {
-    let pk = pubkey_hex.to_ascii_lowercase();
+    // By x-only key: `02x`, `03x` and the bare `x` are one author, and all three verify.
+    let tail = |pk: &str| pk.get(pk.len().saturating_sub(64)..).unwrap_or(pk).to_ascii_lowercase();
+    let xonly = tail(pubkey_hex);
     KAPOSTS_DENYLIST
         .read()
-        .map(|g| g.iter().any(|p| *p == pk))
+        .map(|g| g.iter().any(|p| tail(p) == xonly))
         .unwrap_or(false)
 }
 
@@ -181,7 +183,8 @@ pub fn is_address_blocked(address: &str) -> bool {
 /// `is_kaposts_operator`.
 pub fn is_pubkey_blocked(pubkey_hex: &str) -> bool {
     let pk = pubkey_hex.to_ascii_lowercase();
-    let xonly = if pk.len() >= 64 { &pk[pk.len() - 64..] } else { pk.as_str() };
+    // `get`, not a byte slice: a non-ASCII key would panic the worker.
+    let xonly = pk.get(pk.len().saturating_sub(64)..).unwrap_or(pk.as_str());
     BLOCKED_XONLY
         .read()
         .map(|g| g.iter().any(|p| p == xonly))
@@ -208,7 +211,8 @@ pub fn set_kaposts_operators(list: Vec<String>) {
 /// the trailing 64 hex chars.
 pub fn is_kaposts_operator(pubkey_hex: &str) -> bool {
     let pk = pubkey_hex.to_ascii_lowercase();
-    let xonly = if pk.len() >= 64 { &pk[pk.len() - 64..] } else { pk.as_str() };
+    // `get`, not a byte slice: a non-ASCII key would panic the worker.
+    let xonly = pk.get(pk.len().saturating_sub(64)..).unwrap_or(pk.as_str());
     KAPOSTS_OPERATORS
         .read()
         .map(|g| g.iter().any(|p| p == xonly))
@@ -652,8 +656,9 @@ impl KProtocolProcessor {
         // Parse public key from hex
         let public_key_bytes = match hex::decode(public_key_hex) {
             Ok(bytes) => {
-                if bytes.len() == 33 {
-                    // Remove the compression prefix byte for x-only key (Schnorr uses x-only keys)
+                if bytes.len() == 33 && matches!(bytes[0], 0x02 | 0x03) {
+                    // Remove the compression prefix byte for x-only key (Schnorr uses x-only keys).
+                    // Only 02/03: any other first byte would give one key 256 more identities.
                     bytes[1..].to_vec()
                 } else if bytes.len() == 32 {
                     // Already x-only format
@@ -3158,6 +3163,15 @@ impl KProtocolProcessor {
     ) -> Result<BcastOutcome> {
         let transaction_id = &transaction.transaction_id;
 
+        // The live gates again: a retry from the pending queue (bcast_pending) comes straight
+        // here, so a tip sent while KaPosts was off, or by a blocked author, must stop here too.
+        if !FEATURE_KAPOSTS.load(std::sync::atomic::Ordering::Relaxed)
+            || is_kaposts_denied(&k_tip.sender_pubkey)
+            || is_pubkey_blocked(&k_tip.sender_pubkey)
+        {
+            return Ok(BcastOutcome::Done);
+        }
+
         // Signature is over "tip:<post_id>:<author_pubkey>:<sealed_hex>".
         if !self.verify_kaspa_signature(
             &k_tip.signing_string(),
@@ -3774,7 +3788,10 @@ impl KProtocolProcessor {
 /// x-only part of a compressed pubkey hex (`02`/`03` + 64 hex), lowercased; other shapes as-is.
 fn xonly_hex(pk: &str) -> String {
     let pk = pk.trim().to_lowercase();
-    if pk.len() == 66 { pk[2..].to_string() } else { pk }
+    match pk.get(2..) {
+        Some(xonly) if pk.len() == 66 => xonly.to_string(),
+        _ => pk,
+    }
 }
 
 /// Who gets a mention push: each mentioned pubkey once per x-only key, never the author, never

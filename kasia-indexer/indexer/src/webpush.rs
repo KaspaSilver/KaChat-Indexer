@@ -54,12 +54,24 @@ pub struct WebPushSubscription {
 /// the service could be used to POST to arbitrary URLs (SSRF); every mainstream browser's push
 /// service is covered.
 pub fn endpoint_host_allowed(endpoint: &str) -> bool {
-    let Some(rest) = endpoint.strip_prefix("https://") else {
+    // Judge the host the HTTP client will really connect to: parse as it does (a `\` counts as
+    // `/`, so `https://evil\@fcm.googleapis.com/` is host `evil`), refuse userinfo and any port
+    // but 443.
+    if endpoint.contains('\\') {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
         return false;
     };
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.split('@').next_back().unwrap_or(""); // no userinfo tricks
-    let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    if url.port().is_some_and(|p| p != 443) {
+        return false;
+    }
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
     host == "fcm.googleapis.com"
         || host == "updates.push.services.mozilla.com"
         || host.ends_with(".push.apple.com")
@@ -208,6 +220,8 @@ impl WebPushClient {
             config,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
+                // A push service never redirects; following one could reach an internal host.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .context("building the Web Push HTTP client")?,
             jwt_cache: Mutex::new(HashMap::new()),
@@ -397,6 +411,11 @@ mod tests {
         assert!(!endpoint_host_allowed("https://fcm.googleapis.com.evil.example/x"));
         assert!(!endpoint_host_allowed("http://fcm.googleapis.com/x"));
         assert!(!endpoint_host_allowed("https://user@evil.example/x"));
+        // A `\` is a `/` to the HTTP client: these connect to evil.example / 127.0.0.1.
+        assert!(!endpoint_host_allowed("https://evil.example\\@fcm.googleapis.com/x"));
+        assert!(!endpoint_host_allowed("https://127.0.0.1\\@web.push.apple.com/a"));
+        assert!(!endpoint_host_allowed("https://fcm.googleapis.com:8443/x"));
+        assert!(endpoint_host_allowed("https://fcm.googleapis.com:443/x"));
     }
 
     #[test]

@@ -123,7 +123,15 @@ fn blocklist_path() -> String {
 
 /// Read the blocklist file into the indexer's list. A missing file is an empty list.
 fn load_blocked_addresses(path: &str) {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // Keep blocking what was blocked: an unreadable file must not unblock everyone.
+        Err(e) => {
+            tracing::warn!("Blocklist: could not read {path} ({e}); keeping the previous list");
+            return;
+        }
+    };
     let mut addrs = std::collections::HashSet::new();
     for t in content.split(['\n', '\r', ',', ' ', '\t']).map(str::trim).filter(|t| !t.is_empty()) {
         match kaspa_rpc_core::RpcAddress::try_from(t.to_string())
