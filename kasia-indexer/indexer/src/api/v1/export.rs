@@ -64,6 +64,15 @@ impl ExportApi {
 /// one-entry-per-tx `tx-id-to-*` partitions via approximate_len (O(1)-ish; exact enough for a
 /// dashboard). The KaPosts/chess/public-chat categories are served by the content indexer, which
 /// aggregates this endpoint. All-time totals only; the app shows a dash for the rolling windows.
+/// GET /stats/buckets — per chat category, distinct transactions per hour (the last 60 days) and
+/// per calendar month (all time), keyed by the bucket's start (ms UTC). 503 until the first scan.
+pub async fn get_stats_buckets() -> impl IntoResponse {
+    match crate::stats_windows::buckets() {
+        Some(buckets) => Json(buckets).into_response(),
+        None => (StatusCode::SERVICE_UNAVAILABLE, "{\"error\":\"still counting\"}").into_response(),
+    }
+}
+
 pub async fn get_stats(State(state): State<ExportApi>) -> impl IntoResponse {
     let count = |name: &str| -> u64 {
         state

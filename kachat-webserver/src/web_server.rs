@@ -721,6 +721,9 @@ impl WebServer {
                 .route("/chess/bots/leaderboard", get(handle_chess_bots_leaderboard))
                 // KaPlay Arcade: best checked Snake and 2048 scores (KPLAY_ARCADE_LEADERBOARD.md).
                 .route("/arcade/leaderboard", get(handle_arcade_leaderboard))
+                // K Explorer (EXPLORER_STATS.md §2-§3).
+                .route("/stats/activity", get(handle_stats_activity))
+                .route("/network/fees", get(handle_network_fees))
                 .route("/translate", post(crate::translate::handle_translate))
                 .route(
                     "/translate/languages",
@@ -1371,6 +1374,87 @@ async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
         *guard = Some((std::time::Instant::now(), value.clone()));
     }
     value
+}
+
+#[derive(Deserialize)]
+struct ExplorerQuery {
+    period: Option<String>,
+}
+
+/// The Explorer answers, cached 60 s per (endpoint, period) like `/stats`.
+static EXPLORER_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(&'static str, &'static str), (std::time::Instant, serde_json::Value)>>> =
+    std::sync::OnceLock::new();
+
+fn explorer_cached(endpoint: &'static str, period: crate::explorer::Period) -> Option<serde_json::Value> {
+    let cache = EXPLORER_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let guard = cache.lock().ok()?;
+    let (at, value) = guard.get(&(endpoint, period.name()))?;
+    (at.elapsed() < STATS_TTL).then(|| value.clone())
+}
+
+fn explorer_store(endpoint: &'static str, period: crate::explorer::Period, value: &serde_json::Value) {
+    let cache = EXPLORER_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert((endpoint, period.name()), (std::time::Instant::now(), value.clone()));
+    }
+}
+
+fn explorer_period(value: Option<&str>) -> Result<crate::explorer::Period, (StatusCode, Json<ApiError>)> {
+    crate::explorer::Period::parse(value).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError { error: "period must be day, week, month or all".to_string(), code: "INVALID_PERIOD".to_string() }),
+        )
+    })
+}
+
+/// GET /stats/activity?period=day|week|month|all — K's transactions in the period, by category,
+/// against the window before it, with a bar per bucket, active senders and the fees they paid.
+async fn handle_stats_activity(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<ExplorerQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+    let period = explorer_period(params.period.as_deref())?;
+    if let Some(value) = explorer_cached("activity", period) {
+        return Ok(Json(value));
+    }
+    let url = format!(
+        "{}/buckets",
+        std::env::var("CHAT_STATS_URL").unwrap_or_else(|_| "http://127.0.0.1:8600/stats".to_string())
+    );
+    let chat = match app_state.http.get(&url).timeout(Duration::from_secs(5)).send().await {
+        Ok(resp) if resp.status().is_success() => resp.json::<crate::explorer::ChatBuckets>().await.ok(),
+        _ => None,
+    };
+    let value = crate::explorer::activity(&app_state.scheduled_pool, chat, period, stats_now_ms()).await;
+    explorer_store("activity", period, &value);
+    Ok(Json(value))
+}
+
+/// GET /network/fees?period=day|week|month|all — every Kaspa transaction's fees, per bucket, and
+/// the average fee over the last 24 hours. 503 until the first fee is counted.
+async fn handle_network_fees(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<ExplorerQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+    let period = explorer_period(params.period.as_deref())?;
+    if let Some(value) = explorer_cached("fees", period) {
+        return Ok(Json(value));
+    }
+    match crate::explorer::network_fees(&app_state.scheduled_pool, period, stats_now_ms()).await {
+        Some(value) => {
+            explorer_store("fees", period, &value);
+            Ok(Json(value))
+        }
+        None => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError { error: "no fees counted yet".to_string(), code: "NOT_READY".to_string() }),
+        )),
+    }
 }
 
 async fn handle_get_thread(

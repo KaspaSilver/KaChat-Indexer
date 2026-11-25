@@ -252,6 +252,8 @@ impl Api {
                 "/stats",
                 get(export::get_stats).with_state(self.export_api.clone()),
             )
+            // K Explorer: hourly and monthly chat counts for the webserver's /stats/activity.
+            .route("/stats/buckets", get(export::get_stats_buckets))
             .merge(self.admin_router())
     }
 

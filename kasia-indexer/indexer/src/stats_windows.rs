@@ -12,7 +12,7 @@
 //! last24h <= last7d. The windows are drawn from the same stored set the totals are, so they stay
 //! consistent with `total`; whatever root the totals include, the windows include too.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,15 +28,49 @@ use indexer_db::messages::self_stash::SelfStashKeyByOwner;
 /// category key -> (last24h, last7d, last30d)
 type Windows = HashMap<&'static str, (u64, u64, u64)>;
 
-static CACHE: OnceLock<RwLock<Option<Windows>>> = OnceLock::new();
-fn cache() -> &'static RwLock<Option<Windows>> {
+/// Per category, distinct transactions per hour (the last `HOURS_KEPT_MS`) and per calendar month
+/// (all time), keyed by the bucket's start (ms UTC). Served at `/stats/buckets` for the webserver's
+/// `/stats/activity` (EXPLORER_STATS.md §2).
+#[derive(Default, Clone, serde::Serialize)]
+pub struct Buckets {
+    pub hours: HashMap<&'static str, BTreeMap<u64, u64>>,
+    pub months: HashMap<&'static str, BTreeMap<u64, u64>>,
+}
+
+/// 60 days of hours: a month's window and the month before it.
+const HOURS_KEPT_MS: u64 = 60 * 24 * 3600 * 1000;
+const HOUR_MS: u64 = 3600 * 1000;
+
+static CACHE: OnceLock<RwLock<Option<(Windows, Buckets)>>> = OnceLock::new();
+fn cache() -> &'static RwLock<Option<(Windows, Buckets)>> {
     CACHE.get_or_init(|| RwLock::new(None))
 }
 
 /// (last24h, last7d, last30d) for a category, or None until the first scan completes (keep it
 /// omitted, not 0).
 pub fn windows_for(category: &str) -> Option<(u64, u64, u64)> {
-    cache().read().ok()?.as_ref()?.get(category).copied()
+    cache().read().ok()?.as_ref()?.0.get(category).copied()
+}
+
+/// The hourly and monthly counts, or None until the first scan completes.
+pub fn buckets() -> Option<Buckets> {
+    cache().read().ok()?.as_ref().map(|(_, b)| b.clone())
+}
+
+/// The start (ms UTC) of the calendar month holding `ms`.
+pub fn month_start_ms(ms: u64) -> u64 {
+    // Civil-from-days (Howard Hinnant), then back to days for the 1st of that month.
+    let days = (ms / 86_400_000) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    // The 1st of the month: day-of-year of the month's first day, in the same March-based year.
+    let first_doy = (153 * mp + 2) / 5;
+    let first_days = era * 146_097 + 365 * yoe + yoe / 4 - yoe / 100 + first_doy - 719_468;
+    first_days as u64 * 86_400_000
 }
 
 fn now_ms() -> u64 {
@@ -46,43 +80,47 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Walk one by-* partition, counting distinct tx_ids whose block time is newer than each cutoff.
-/// `decode` extracts (block_time_ms, tx_id) from a raw key.
+/// One category's counts from one scan.
+struct Scanned {
+    windows: (u64, u64, u64),
+    hours: BTreeMap<u64, u64>,
+    months: BTreeMap<u64, u64>,
+}
+
+/// Walk one by-* partition, counting each distinct tx_id once (at the block time it is first seen
+/// with): into the windows newer than each cutoff, its hour (the last `HOURS_KEPT_MS`) and its
+/// month. `decode` extracts (block_time_ms, tx_id) from a raw key.
 fn scan(
     tx_keyspace: &TxKeyspace,
     partition: &str,
-    d1: u64,
-    d7: u64,
-    d30: u64,
+    now: u64,
     decode: fn(&[u8]) -> Option<(u64, [u8; 32])>,
-) -> anyhow::Result<(u64, u64, u64)> {
+) -> anyhow::Result<Scanned> {
+    let [d1, d7, d30] = [1, 7, 30].map(|days| now.saturating_sub(days * 24 * HOUR_MS));
+    let hours_from = now.saturating_sub(HOURS_KEPT_MS);
     let part = tx_keyspace.open_partition(partition, PartitionCreateOptions::default())?;
     let rtx = tx_keyspace.read_tx();
-    let mut s1: HashSet<[u8; 32]> = HashSet::new();
-    let mut s7: HashSet<[u8; 32]> = HashSet::new();
-    let mut s30: HashSet<[u8; 32]> = HashSet::new();
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut out = Scanned { windows: (0, 0, 0), hours: BTreeMap::new(), months: BTreeMap::new() };
     for kv in rtx.iter(&part) {
         let (k, _v) = kv?;
-        if let Some((bt, tx)) = decode(k.as_ref()) {
-            if bt > d30 {
-                s30.insert(tx);
-            }
-            if bt > d7 {
-                s7.insert(tx);
-            }
-            if bt > d1 {
-                s1.insert(tx);
-            }
+        let Some((bt, tx)) = decode(k.as_ref()) else { continue };
+        if !seen.insert(tx) {
+            continue;
         }
+        out.windows.0 += u64::from(bt > d1);
+        out.windows.1 += u64::from(bt > d7);
+        out.windows.2 += u64::from(bt > d30);
+        if bt >= hours_from {
+            *out.hours.entry(bt / HOUR_MS * HOUR_MS).or_default() += 1;
+        }
+        *out.months.entry(month_start_ms(bt)).or_default() += 1;
     }
-    Ok((s1.len() as u64, s7.len() as u64, s30.len() as u64))
+    Ok(out)
 }
 
-fn compute(tx_keyspace: &TxKeyspace) -> Windows {
+fn compute(tx_keyspace: &TxKeyspace) -> (Windows, Buckets) {
     let now = now_ms();
-    let d1 = now.saturating_sub(24 * 3600 * 1000);
-    let d7 = now.saturating_sub(7 * 24 * 3600 * 1000);
-    let d30 = now.saturating_sub(30 * 24 * 3600 * 1000);
 
     // (category, partition, key decoder). Decoders are non-capturing → fn pointers.
     let jobs: &[(&'static str, &str, fn(&[u8]) -> Option<(u64, [u8; 32])>)] = &[
@@ -106,16 +144,19 @@ fn compute(tx_keyspace: &TxKeyspace) -> Windows {
         }),
     ];
 
-    let mut out: Windows = HashMap::new();
+    let mut windows: Windows = HashMap::new();
+    let mut buckets = Buckets::default();
     for (cat, partition, decode) in jobs {
-        match scan(tx_keyspace, partition, d1, d7, d30, *decode) {
-            Ok(w) => {
-                out.insert(cat, w);
+        match scan(tx_keyspace, partition, now, *decode) {
+            Ok(scanned) => {
+                windows.insert(cat, scanned.windows);
+                buckets.hours.insert(cat, scanned.hours);
+                buckets.months.insert(cat, scanned.months);
             }
             Err(e) => tracing::warn!("[stats] window scan for {cat} failed: {e}"),
         }
     }
-    out
+    (windows, buckets)
 }
 
 /// Spawn the periodic window scanner (every ~5 min). It writes the cache that `get_stats` reads;
@@ -125,9 +166,9 @@ pub fn spawn_window_scanner(tx_keyspace: TxKeyspace) {
         loop {
             let ks = tx_keyspace.clone();
             match tokio::task::spawn_blocking(move || compute(&ks)).await {
-                Ok(windows) => {
+                Ok(scanned) => {
                     if let Ok(mut guard) = cache().write() {
-                        *guard = Some(windows);
+                        *guard = Some(scanned);
                     }
                 }
                 Err(e) => tracing::warn!("[stats] window scan task error: {e}"),
@@ -135,4 +176,18 @@ pub fn spawn_window_scanner(tx_keyspace: TxKeyspace) {
             tokio::time::sleep(Duration::from_secs(300)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::month_start_ms;
+
+    #[test]
+    fn month_starts_are_the_first_at_midnight_utc() {
+        // 2026-11-25 15:00 UTC -> 2026-11-01; 2024-02-29 -> 2024-02-01; 2026-01-01 stays.
+        assert_eq!(month_start_ms(1_795_618_800_000), 1_793_491_200_000);
+        assert_eq!(month_start_ms(1_709_164_800_000), 1_706_745_600_000);
+        assert_eq!(month_start_ms(1_767_225_600_000), 1_767_225_600_000);
+        assert_eq!(month_start_ms(1_767_225_599_999), 1_764_547_200_000);
+    }
 }

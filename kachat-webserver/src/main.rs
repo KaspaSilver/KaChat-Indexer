@@ -4,6 +4,7 @@ mod api_handlers;
 mod config;
 mod database_postgres_impl;
 mod database_trait;
+mod explorer;
 mod models;
 mod names;
 mod names_api;

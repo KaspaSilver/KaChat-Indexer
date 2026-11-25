@@ -836,6 +836,40 @@ impl KDbClient {
         .execute(&self.pool)
         .await?;
 
+        // Hourly totals the K Explorer reads (EXPLORER_STATS.md §2-§3), written by the trigger
+        // below and kept for good (one row an hour). `hour` = the hour's start, ms UTC.
+        //   kachat_fee_hours: every transaction with resolved inputs (coinbase has none): fees
+        //     (inputs minus outputs) and how many.
+        //   kachat_k_hours / kachat_k_senders: the same for kchat:1: transactions, and the
+        //     distinct senders (input 0's script) each hour.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kachat_fee_hours (
+                hour BIGINT PRIMARY KEY,
+                fees_sompi BIGINT NOT NULL DEFAULT 0,
+                transactions BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kachat_k_hours (
+                hour BIGINT PRIMARY KEY,
+                fees_sompi BIGINT NOT NULL DEFAULT 0,
+                transactions BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kachat_k_senders (
+                hour BIGINT NOT NULL,
+                sender BYTEA NOT NULL,
+                PRIMARY KEY (hour, sender)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Fire on KaChat payloads only:
         //   - canonical KaChat payloads ('kchat:1:' = hex 6b636861743a313a) — covers both KaChat
         //     posts and KaChat broadcasts, since both start with `kchat:1:`;
@@ -846,14 +880,21 @@ impl KDbClient {
         sqlx::query(
             r#"
             CREATE OR REPLACE FUNCTION notify_transaction() RETURNS TRIGGER AS $$
+            DECLARE
+                is_k BOOLEAN := substr(encode(NEW.payload, 'hex'), 1, 16) = '6b636861743a313a';
+                at_hour BIGINT := COALESCE(NEW.block_time, (extract(epoch from now()) * 1000)::BIGINT) / 3600000 * 3600000;
+                in_sum NUMERIC;
+                unresolved BIGINT;
+                out_sum NUMERIC;
+                fee BIGINT;
             BEGIN
-                IF substr(encode(NEW.payload, 'hex'), 1, 16) = '6b636861743a313a'
+                IF is_k
                    OR substr(encode(NEW.payload, 'hex'), 1, 34) = '636970685f6d73673a313a62636173743a' THEN
                     PERFORM pg_notify('transaction_channel', encode(NEW.transaction_id, 'hex'));
                 END IF;
                 -- Count every kchat:1: transaction (what KaChat writes), by minute and kind. Never
                 -- allowed to fail the ingester's insert: a counting error only loses that count.
-                IF substr(encode(NEW.payload, 'hex'), 1, 16) = '6b636861743a313a' THEN
+                IF is_k THEN
                     BEGIN
                         INSERT INTO kachat_tx_minutes (minute, kind, n)
                         VALUES (
@@ -862,6 +903,33 @@ impl KDbClient {
                             1
                         )
                         ON CONFLICT (minute, kind) DO UPDATE SET n = kachat_tx_minutes.n + 1;
+                    EXCEPTION WHEN OTHERS THEN
+                        NULL;
+                    END;
+                END IF;
+                -- Fees per hour: inputs (amounts resolved by the ingester) minus outputs. Skipped
+                -- when the ingester keeps no inputs or an input's amount is missing; never fails
+                -- the insert either.
+                IF cardinality(NEW.inputs) > 0 THEN
+                    BEGIN
+                        SELECT sum(i.previous_outpoint_amount), count(*) FILTER (WHERE i.previous_outpoint_amount IS NULL)
+                          INTO in_sum, unresolved FROM unnest(NEW.inputs) i;
+                        SELECT COALESCE(sum(o.amount), 0) INTO out_sum FROM unnest(NEW.outputs) o;
+                        IF unresolved = 0 AND in_sum >= out_sum THEN
+                            fee := (in_sum - out_sum)::BIGINT;
+                            INSERT INTO kachat_fee_hours (hour, fees_sompi, transactions) VALUES (at_hour, fee, 1)
+                            ON CONFLICT (hour) DO UPDATE SET fees_sompi = kachat_fee_hours.fees_sompi + EXCLUDED.fees_sompi,
+                                transactions = kachat_fee_hours.transactions + 1;
+                            IF is_k THEN
+                                INSERT INTO kachat_k_hours (hour, fees_sompi, transactions) VALUES (at_hour, fee, 1)
+                                ON CONFLICT (hour) DO UPDATE SET fees_sompi = kachat_k_hours.fees_sompi + EXCLUDED.fees_sompi,
+                                    transactions = kachat_k_hours.transactions + 1;
+                            END IF;
+                        END IF;
+                        IF is_k AND NEW.inputs[1].previous_outpoint_script IS NOT NULL THEN
+                            INSERT INTO kachat_k_senders (hour, sender) VALUES (at_hour, NEW.inputs[1].previous_outpoint_script)
+                            ON CONFLICT DO NOTHING;
+                        END IF;
                     EXCEPTION WHEN OTHERS THEN
                         NULL;
                     END;

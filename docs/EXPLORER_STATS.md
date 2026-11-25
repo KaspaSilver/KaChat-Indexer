@@ -4,19 +4,29 @@
 K iOS session (`KaspaSilver/K-iPhone`, `KaChat/Views/Explorer/ExplorerAPI.swift`, `ExplorerKStats`;
 not yet committed there).
 
-> **Status (2026-11-25): §1 partly done in the indexer session** (not yet deployed).
-> - Every `/stats` category now has `last30d`: the Postgres ones, and the chat indexer's (its
->   window scan counts 30 days too). New category: `arcadeScores` (`#kplay-arcade` stamps).
-> - Not done in §1: `paymentNotices`, `kachatNames` (the names live in the separate names stack;
->   its own `/stats` already has the `kachat*` categories) and the two kUSDT counts (no covenant
->   transactions are indexed).
-> - §2 and §3 are not started.
->   - **§3 (network fees) can't be served from this indexer as it stands.** Its transaction feed
->     keeps one hour, without input amounts or output values, so no fee can be computed. It would
->     need a UTXO-resolving ingest or another source (kaspa.stream).
->   - `feesSompi` in §2 has the same problem.
->   - §2's per-protocol series and windows are doable, from the tables and the chat indexer's
->     window scan; they wait on the owner's call.
+> **Status (2026-11-25): §1-§3 done in the indexer session** (not yet deployed). Fees start the day
+> the new ingest settings go live: there is no fee history before that.
+> - §1: every `/stats` category has `last30d`, and a new category `arcadeScores` counts
+>   `#kplay-arcade` stamps. Not served:
+>   - `paymentNotices` and the kUSDT counts: not indexed.
+>   - `kachatNames`: the separate names stack's own `/stats` has its `kachat*` categories.
+> - §2: `GET /stats/activity?period=` as specified.
+>   - `categories`, `previous` and `series` count from the KaPosts and room tables plus the chat
+>     indexer's hourly and monthly counts (its new `/stats/buckets`), over the full history.
+>   - `series` leaves out `selfStash` and `groupUpdates`, as the card does.
+>   - `activeAddresses` (distinct input-0 senders) and `feesSompi` come from hourly totals kept
+>     from deploy on. Both are only sent once those totals exist, together with `feesSince`
+>     (ms), the first hour they cover.
+> - §3: `GET /network/fees?period=` as specified, plus `since`. It answers 503 until the first
+>   fee is counted.
+>   - The ingest now keeps input amounts (resolved by simply-kaspa) and output amounts. Rows
+>     still last one hour.
+>   - The `transactions` insert trigger adds each transaction's fee (inputs minus outputs) to
+>     `kachat_fee_hours`, kept for good.
+>   - Coinbase (no inputs) and transactions with an unresolved input are left out.
+>   - Acceptance isn't tracked, so a rare rejected double-spend still counts.
+>   - **Kaspa Quick Start mounts its own `kachat/run-ingest.sh`**, which needs the same two flag
+>     changes before fees are counted.
 
 ## Why
 
