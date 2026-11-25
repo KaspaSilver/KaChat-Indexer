@@ -4,6 +4,12 @@
 K iOS session (`KaspaSilver/K-iPhone`, `KaChat/Views/Explorer/ExplorerAPI.swift`, `ExplorerKStats`;
 not yet committed there).
 
+> **Update (2026-11-25, owner):** K stats need only **24 hours, 7 days and all time**.
+> - `/stats` serves `last24h`, `last7d` and `total`; `last30d` is gone.
+> - `/stats/activity` and `/network/fees` take `period=day|week|all`. `month` now answers 400.
+> - **K must stop asking for `month`.** The app falls back to `/stats` for the session when any
+>   period answers non-2xx, so drop the 30 Days option.
+>
 > **Status (2026-11-25): §1-§3 done in the indexer session** (not yet deployed). Fees start the day
 > the new ingest settings go live: there is no fee history before that.
 > - §1: every `/stats` category has `last30d`, and a new category `arcadeScores` counts

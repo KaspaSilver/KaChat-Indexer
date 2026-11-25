@@ -1,7 +1,8 @@
 //! K Explorer (EXPLORER_STATS.md §2-§3): `/stats/activity?period=` and `/network/fees?period=`.
 //!
 //! Periods share one bucket layout: `day` = the last 24 hours, `week` = the last 7 UTC days, `all`
-//! = every calendar month with data (K stats show 24 hours, 7 days and all time). The last bucket is the one still filling.
+//! = every calendar month with data (K stats show 24 hours, 7 days and all time). The last bucket
+//! is the one still filling.
 //! Counts come from the KaPosts and room tables, and from the chat indexer's hourly and monthly
 //! counts (`/stats/buckets`). Fees and senders come from the hourly totals the profiles follower
 //! keeps from the node's accepted transactions (`kachat_fee_hours`, `kachat_k_hours`,
