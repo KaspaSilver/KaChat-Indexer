@@ -1,0 +1,29 @@
+# What the .kachat names server (this image) is built from and runs, for Kaspa Quick Start's
+# "update available" check: a commit touching one of these paths (or under a prefix ending in /)
+# is a names-server update. One path per line, # for comments. Keep it current when the names
+# image starts or stops using a file.
+
+# The image itself: Dockerfile, supervisord, run scripts.
+docker/kachat-names/
+
+# The names registry engine and the follower (names and profiles).
+kachat-names/
+kachat-names-follower/
+
+# kachat-webserver, run with KACHAT_WEBSERVER_ONLY=names. Only these files run in that mode.
+# Startup, config, and the shared router, app state, rate limiting and middleware:
+kachat-webserver/Cargo.toml
+kachat-webserver/src/main.rs
+kachat-webserver/src/config.rs
+kachat-webserver/src/web_server.rs
+# The /names, /offers, /market, /profiles and /identity handlers:
+kachat-webserver/src/names.rs
+kachat-webserver/src/names_api.rs
+
+# Left out on purpose:
+# - The rest of kachat-webserver/src (KaPosts, chess, arcade, rooms, translation, scheduled
+#   posts). The names-only router never serves them. database_postgres_impl.rs is used only to
+#   open the connection pool.
+# - The root Cargo.toml and Cargo.lock. The image rewrites the workspace members, and their
+#   changes are almost always other crates' dependencies. A dependency change for the names
+#   server shows up in kachat-webserver/Cargo.toml or the two names crates above.
