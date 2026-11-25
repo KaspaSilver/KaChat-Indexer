@@ -54,12 +54,21 @@ const WATCH_ONLY_RATE_MAX: usize = 30;
 /// so without a limit one stalled connection held up every push behind it.
 const PUSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// HTTP/2 pings on the pooled APNs/FCM connection. A connection dropped while idle (by Apple or
+/// a NAT) never closes on its own: a timed-out stream leaves it in the pool, so every later push
+/// waited the full request timeout and failed. A ping that goes unanswered closes it instead.
+const PUSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const PUSH_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The HTTP client for APNs and FCM, with the timeouts above.
 pub(crate) fn push_http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(PUSH_CONNECT_TIMEOUT)
         .timeout(PUSH_REQUEST_TIMEOUT)
+        .http2_keep_alive_interval(PUSH_KEEPALIVE_INTERVAL)
+        .http2_keep_alive_timeout(PUSH_KEEPALIVE_TIMEOUT)
+        .http2_keep_alive_while_idle(true)
+        .tcp_keepalive(PUSH_KEEPALIVE_INTERVAL)
         .build()
 }
 
@@ -955,17 +964,19 @@ impl PushRegistry {
     pub fn tokens_for_group(&self, group_id: &[u8; 32]) -> anyhow::Result<Vec<String>> {
         self.metrics.increment_db_read_ops_total(1);
         let db_read_started = Instant::now();
-        let result: anyhow::Result<Vec<String>> = {
+        let result: anyhow::Result<Vec<String>> = (|| {
             let rtx = self.tx_keyspace.read_tx();
-            self.watched_group_partition
-                .get_by_group_id_prefix(&rtx, group_id)
-                .map(|entry| {
-                    let key = entry?;
-                    token_from_index_key(key.as_ref(), group_id.len())
-                        .ok_or_else(|| anyhow::anyhow!("Invalid group watcher index key"))
-                })
-                .collect()
-        };
+            let mut tokens = Vec::new();
+            for entry in self.watched_group_partition.get_by_group_id_prefix(&rtx, group_id) {
+                let key = entry?;
+                // One unreadable key must not cost everyone else in the group their push.
+                match token_from_index_key(key.as_ref(), group_id.len()) {
+                    Some(token) => tokens.push(token),
+                    None => warn!("[Push] skipped an unreadable group watcher key"),
+                }
+            }
+            Ok(tokens)
+        })();
         self.metrics
             .increment_db_read_time_ms_total(elapsed_ms_u64(db_read_started));
         if result.is_err() {
@@ -980,17 +991,18 @@ impl PushRegistry {
     ) -> anyhow::Result<Vec<String>> {
         self.metrics.increment_db_read_ops_total(1);
         let db_read_started = Instant::now();
-        let result: anyhow::Result<Vec<String>> = {
+        let result: anyhow::Result<Vec<String>> = (|| {
             let rtx = self.tx_keyspace.read_tx();
-            self.primary_address_partition
-                .get_by_address_prefix(&rtx, address)
-                .map(|entry| {
-                    let key = entry?;
-                    token_from_index_key(key.as_ref(), size_of::<AddressPayload>())
-                        .ok_or_else(|| anyhow::anyhow!("Invalid primary address index key"))
-                })
-                .collect()
-        };
+            let mut tokens = Vec::new();
+            for entry in self.primary_address_partition.get_by_address_prefix(&rtx, address) {
+                let key = entry?;
+                match token_from_index_key(key.as_ref(), size_of::<AddressPayload>()) {
+                    Some(token) => tokens.push(token),
+                    None => warn!("[Push] skipped an unreadable primary address key"),
+                }
+            }
+            Ok(tokens)
+        })();
         self.metrics
             .increment_db_read_time_ms_total(elapsed_ms_u64(db_read_started));
         if result.is_err() {
@@ -3193,6 +3205,11 @@ impl PushDispatcher {
             data.insert("thread_id".to_string(), thread_id);
             data.insert("tx_id".to_string(), tx_hex.clone());
             data.insert("ts".to_string(), event.timestamp.to_string());
+            info!(
+                "[Push] address_activity tx {tx_hex} address ...{} devices={}",
+                key_tail(&data["address"]),
+                tokens.len()
+            );
             // Collapse id omitted: our sent_cache already dedups per (tx, address), and a single
             // tx-wide collapse id would merge two distinct address credits into one notification.
             self.deliver(tokens, &payload, &data, None, true).await;
@@ -3972,7 +3989,17 @@ enum ApnsError {
 impl std::fmt::Display for ApnsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ApnsError::Request(err) => write!(f, "request error: {err}"),
+            ApnsError::Request(err) => {
+                // reqwest's own text is only "error sending request"; the cause (a timeout, a
+                // reset connection) is in the source chain.
+                write!(f, "request error: {err}")?;
+                let mut source = std::error::Error::source(err);
+                while let Some(cause) = source {
+                    write!(f, ": {cause}")?;
+                    source = cause.source();
+                }
+                Ok(())
+            }
             ApnsError::Auth(err) => write!(f, "auth error: {err}"),
             ApnsError::Rejected { status, reason } => {
                 write!(
@@ -4130,11 +4157,18 @@ impl ApnsClient {
             let trimmed = &collapse_id[..collapse_id.len().min(64)];
             req = req.header("apns-collapse-id", trimmed);
         }
-        let resp = req
-            .json(payload)
-            .send()
-            .await
-            .map_err(ApnsError::Request)?;
+        let req = req.json(payload);
+        let retry = req.try_clone();
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            // A pooled connection that died while idle fails at once; one more try opens a fresh
+            // one. A timeout is not retried: Apple may already have it, and it would show twice.
+            Err(err) if !err.is_timeout() && retry.is_some() => {
+                let retry = retry.expect("checked above");
+                retry.send().await.map_err(ApnsError::Request)?
+            }
+            Err(err) => return Err(ApnsError::Request(err)),
+        };
 
         if resp.status().is_success() {
             return Ok(());
@@ -4547,6 +4581,12 @@ fn token_from_index_key(key: &[u8], prefix_len: usize) -> Option<String> {
     let token = std::str::from_utf8(token_bytes).ok()?;
     if token.is_empty() {
         return None;
+    }
+    // A Web Push device is keyed by its endpoint URL (checked against the allowed push hosts when
+    // it registered), whose '/' the charset below refuses. Refusing it failed the whole group's
+    // lookup, so no one in a group a browser watched got its pushes.
+    if token.starts_with("https://") {
+        return (!token.chars().any(|c| c.is_whitespace() || c.is_control())).then(|| token.to_string());
     }
     // Tokens are stored already-normalized (APNs = lowercase hex; FCM = case-sensitive
     // base64url-ish with ':'), so return the stored bytes VERBATIM. Do NOT restrict to hex or
@@ -5052,7 +5092,7 @@ mod tests {
         MAX_ALIASES, MAX_WATCH_ONLY_ADDRESSES, MAX_WATCHED_ADDRESSES, PushRegistry,
         PushRegistryActor, WalletBinding, address_to_payload, format_kas, normalize_device_token,
         normalize_platform, normalize_wallet_pubkey, normalize_watch_only_addresses,
-        resolve_wallet_binding, validate_registration_limits,
+        resolve_wallet_binding, token_from_index_key, validate_registration_limits,
     };
     use indexer_actors::metrics::create_shared_metrics;
     use indexer_db::push::{
@@ -5098,6 +5138,19 @@ mod tests {
         );
         // odd length / too short rejected
         assert!(normalize_device_token("abc").is_err());
+    }
+
+    #[test]
+    fn a_web_endpoint_reads_back_from_a_group_key() {
+        let group_id = [7u8; 32];
+        let endpoint = "https://fcm.googleapis.com/fcm/send/abc:DEF_123-x";
+        let key = [group_id.as_slice(), endpoint.as_bytes()].concat();
+        assert_eq!(token_from_index_key(&key, group_id.len()).as_deref(), Some(endpoint));
+        let fcm = "a".repeat(80) + ":B_c-d";
+        let key = [group_id.as_slice(), fcm.as_bytes()].concat();
+        assert_eq!(token_from_index_key(&key, group_id.len()), Some(fcm));
+        let key = [group_id.as_slice(), b"https://push.example/a b".as_slice()].concat();
+        assert_eq!(token_from_index_key(&key, group_id.len()), None);
     }
 
     #[test]
