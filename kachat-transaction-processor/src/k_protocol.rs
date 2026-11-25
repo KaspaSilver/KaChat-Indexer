@@ -76,6 +76,42 @@ pub fn set_broadcast_channels(list: Vec<String>) {
 /// game records, not chat rooms an operator lists.
 pub const KAPLAY_ROOMS: [&str; 3] = ["kplay-arcade", "chess-arena", "chess-bots"];
 
+/// Most a KaPlay room message may hold. A game record is a few hundred bytes, and the rooms are
+/// never pruned, so the 1 MB voice-note cap of the chat rooms does not apply.
+pub const MAX_KAPLAY_CONTENT_BYTES: usize = 32 * 1024;
+
+/// The `type`s a KaPlay room's boards read: `#chess-arena` duels and tournaments (`chess_t`),
+/// `#chess-bots` bot results (`chess_bot`, CHESS_BOT_LEADERBOARD.md), `#kplay-arcade` arcade
+/// stamps (`arcade`, KPLAY_ARCADE_LEADERBOARD.md) and, as the one KaPlay room, the two chess
+/// kinds too (KPLAY_ONE_ROOM.md). None for a room that is not KaPlay's.
+fn kaplay_room_types(channel: &str) -> Option<&'static [&'static str]> {
+    match channel {
+        "kplay-arcade" => Some(&["arcade", "chess_t", "chess_bot"]),
+        "chess-arena" => Some(&["chess_t"]),
+        "chess-bots" => Some(&["chess_bot"]),
+        _ => None,
+    }
+}
+
+/// Whether `content` may be stored in `channel` (trimmed, lowercased): anything in a chat room;
+/// in a KaPlay room, a JSON object of at most `MAX_KAPLAY_CONTENT_BYTES` whose `type` is one the
+/// room's boards read. Anything else would be kept for good and replayed by every board.
+pub fn kaplay_content_ok(channel: &str, content: &str) -> Result<(), &'static str> {
+    let Some(types) = kaplay_room_types(channel) else {
+        return Ok(());
+    };
+    if content.len() > MAX_KAPLAY_CONTENT_BYTES {
+        return Err("over 32 KB");
+    }
+    let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(content.trim()) else {
+        return Err("not a JSON object");
+    };
+    match o.get("type").and_then(|t| t.as_str()) {
+        Some(t) if types.contains(&t) => Ok(()),
+        _ => Err("not a type this room's boards read"),
+    }
+}
+
 /// Whether `channel` (already trimmed + lowercased by the caller) is in the effective tracked set.
 /// Not configured → the compile-time defaults; configured → exact membership (empty → nothing).
 /// `KAPLAY_ROOMS` are always in it.
@@ -384,6 +420,15 @@ pub enum KActionType {
     Tip(crate::tips::KTip),
     Unknown(String),
 }
+
+/// `kchat:1:` kinds other KaChat services index (docs/KACHAT_APPS.md): chats, handshakes,
+/// payments, group messages and controls and the self-stash (the chat indexer), address
+/// profiles (the profiles follower) and `.kachat` names (the names stack). Every chat
+/// transaction reaches the processor too; these are skipped without a warning.
+const OTHER_SERVICES_ACTIONS: &[&str] = &[
+    "comm", "dm", "handshake", "pay", "payment", "gcomm", "gctl", "self_stash", "profile", "name",
+    "offer", "prices",
+];
 
 /// The author pubkey (hex) of a parsed K action, used by the personal-mode block/mute gate.
 /// `Unknown` actions carry no identity and are never gated here.
@@ -1203,6 +1248,11 @@ impl KProtocolProcessor {
                 KActionType::Tip(k_tip) => {
                     self.process_k_tip_in_database(transaction, k_tip).await?;
                 }
+                // Chat, payments, profiles and names are `kchat:1:` kinds other services index:
+                // not ours, and not news. WARN stays for a kind nobody knows.
+                KActionType::Unknown(action) if OTHER_SERVICES_ACTIONS.contains(&action.as_str()) => {
+                    debug!("K action '{}' in transaction {} is another service's, skipping", action, transaction_id);
+                }
                 KActionType::Unknown(action) => {
                     warn!(
                         "Unknown K protocol action '{}' in transaction {}",
@@ -1306,6 +1356,19 @@ impl KProtocolProcessor {
             return Ok(BcastOutcome::Done);
         }
 
+        // KaPlay's rooms are kept for good (the all-time boards replay them), so only what the
+        // boards read is stored there: a small JSON object of the room's kinds.
+        if let Err(reason) = kaplay_content_ok(&channel, content) {
+            info!("Broadcast {} on #{} rejected ({}), skipping", transaction_id, channel, reason);
+            return Ok(BcastOutcome::Done);
+        }
+
+        let transaction_id_bytes = hex::decode(transaction_id)?;
+        if self.is_removed(&transaction_id_bytes).await? {
+            info!("Broadcast {} was removed by the operator, not stored again", transaction_id);
+            return Ok(BcastOutcome::Done);
+        }
+
         // Sender (kachat-audits XP-012): the address input 0 spends from, accepted only when
         // output 0 pays that same address (the self-send every client writes). See
         // bcast_sender.rs for why this asks the node instead of addresses_transactions (which
@@ -1316,7 +1379,6 @@ impl KProtocolProcessor {
         // inline for up to ~12 s while the node is connected. Unknown is never final
         // (kachat-audits IDX-020): a tx still unresolved goes to the durable pending queue
         // (bcast_pending.rs), retried with backoff for at least an hour. Never guessed.
-        let transaction_id_bytes = hex::decode(transaction_id)?;
         let block_hash: Vec<u8> = match mode {
             BcastMode::Retry(hash) => hash.to_vec(),
             BcastMode::Live => {
@@ -1424,8 +1486,12 @@ impl KProtocolProcessor {
             // Reaction and edit envelopes are invisible protocol traffic (a reaction renders as a
             // pill; an edit rewrites an earlier bubble in place) — never push either.
             // A retry that lands minutes late (node was down) is history, not news: no push.
-            let stale = matches!(mode, BcastMode::Retry(_))
-                && crate::bcast_pending::now_ms() - block_time > crate::bcast_pending::PUSH_MAX_AGE_MS;
+            // Live, the ingester's backlog after an outage is history too, past the backlog age.
+            let age_ms = crate::bcast_pending::now_ms() - block_time;
+            let stale = match mode {
+                BcastMode::Retry(_) => age_ms > crate::bcast_pending::PUSH_MAX_AGE_MS,
+                BcastMode::Live => block_time > 0 && age_ms > crate::push_notify::BACKLOG_PUSH_MAX_AGE_MS,
+            };
             // A long voice note's or a large photo's parts ring once, for the first part to
             // arrive (docs/ROOM_VOICE_PART_PUSHES.md); every part is still saved above.
             if !stale
@@ -1512,9 +1578,6 @@ impl KProtocolProcessor {
             error!("Invalid signature for post {}, skipping", transaction_id);
             return Ok(()); // Skip posts with invalid signatures
         }
-        if !self.signature_is_fresh(&k_post.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         // KaChat exclusivity + text-only content policy (fork addition).
         if let Err(reason) = validate_kachat_message(&k_post.base64_encoded_message) {
@@ -1556,6 +1619,15 @@ impl KProtocolProcessor {
         // notifies the people who asked to hear about this author (PUSH_EXTENSIONS.md §3a).
         let inserted;
 
+        if self.is_removed(&transaction_id_bytes).await? {
+            info!("Post {} was removed by the operator, not stored again", transaction_id);
+            return Ok(());
+        }
+        // Every check passed: claim the signature in the transaction the post is written in.
+        let Some(mut db_tx) = self.begin_claimed(&k_post.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
+
         // Single query to insert post and all mentions/hashtags using CTE
         if k_post.mentioned_pubkeys.is_empty() {
             // No mentions - check if we have hashtags
@@ -1575,7 +1647,7 @@ impl KProtocolProcessor {
                 .bind(&sender_pubkey_bytes)
                 .bind(&sender_signature_bytes)
                 .bind(&k_post.base64_encoded_message)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
 
                 inserted = result.rows_affected() > 0;
@@ -1610,7 +1682,7 @@ impl KProtocolProcessor {
                 .bind(&sender_signature_bytes)
                 .bind(&k_post.base64_encoded_message)
                 .bind(&hashtags)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
 
                 inserted = result.rows_affected() > 0;
@@ -1671,7 +1743,7 @@ impl KProtocolProcessor {
                 .bind(&sender_signature_bytes)
                 .bind(&k_post.base64_encoded_message)
                 .bind(&mentioned_pubkeys_bytes)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
 
                 inserted = result.rows_affected() > 0;
@@ -1713,7 +1785,7 @@ impl KProtocolProcessor {
                 .bind(&k_post.base64_encoded_message)
                 .bind(&mentioned_pubkeys_bytes)
                 .bind(&hashtags)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
 
                 inserted = result.rows_affected() > 0;
@@ -1732,6 +1804,7 @@ impl KProtocolProcessor {
                 }
             }
         }
+        db_tx.commit().await?;
         Self::notify_mentions(
             &k_post.sender_pubkey,
             &k_post.mentioned_pubkeys,
@@ -1775,9 +1848,6 @@ impl KProtocolProcessor {
             error!("Invalid signature for reply {}, skipping", transaction_id);
             return Ok(()); // Skip replies with invalid signatures
         }
-        if !self.signature_is_fresh(&k_reply.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         // KaChat exclusivity + text-only content policy (fork addition).
         if let Err(reason) = validate_kachat_message(&k_reply.base64_encoded_message) {
@@ -1800,6 +1870,15 @@ impl KProtocolProcessor {
         // Extract hashtags from the message
         let hashtags = extract_hashtags_from_base64(&k_reply.base64_encoded_message);
 
+        if self.is_removed(&transaction_id_bytes).await? {
+            info!("Reply {} was removed by the operator, not stored again", transaction_id);
+            return Ok(());
+        }
+        // Every check passed: claim the signature in the transaction the reply is written in.
+        let Some(mut db_tx) = self.begin_claimed(&k_reply.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
+
         // Single query to insert reply and all mentions/hashtags using CTE
         if k_reply.mentioned_pubkeys.is_empty() {
             // No mentions - check if we have hashtags
@@ -1820,7 +1899,7 @@ impl KProtocolProcessor {
                 .bind(&sender_signature_bytes)
                 .bind(&k_reply.base64_encoded_message)
                 .bind(&post_id_bytes)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
 
                 if result.rows_affected() == 0 {
@@ -1855,7 +1934,7 @@ impl KProtocolProcessor {
                 .bind(&k_reply.base64_encoded_message)
                 .bind(&post_id_bytes)
                 .bind(&hashtags)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
 
                 if result.rows_affected() == 0 {
@@ -1917,7 +1996,7 @@ impl KProtocolProcessor {
                 .bind(&k_reply.base64_encoded_message)
                 .bind(&post_id_bytes)
                 .bind(&mentioned_pubkeys_bytes)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
 
                 if result.rows_affected() == 0 {
@@ -1959,7 +2038,7 @@ impl KProtocolProcessor {
                 .bind(&post_id_bytes)
                 .bind(&mentioned_pubkeys_bytes)
                 .bind(&hashtags)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
 
                 if result.rows_affected() == 0 {
@@ -1978,6 +2057,7 @@ impl KProtocolProcessor {
                 }
             }
         }
+        db_tx.commit().await?;
         // KaPosts push: notify the parent post's author of the reply.
         let parent_author = self.content_author_pubkey(&k_reply.post_id).await;
         Self::notify_mentions(
@@ -2031,9 +2111,6 @@ impl KProtocolProcessor {
             error!("Invalid signature for quote {}, skipping", transaction_id);
             return Ok(()); // Skip quotes with invalid signatures
         }
-        if !self.signature_is_fresh(&k_quote.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         // KaChat exclusivity + text-only content policy (fork addition).
         // A plain repost is a quote whose message is exactly the marker (empty body), so it
@@ -2060,6 +2137,15 @@ impl KProtocolProcessor {
         // Extract hashtags from the message
         let hashtags = extract_hashtags_from_base64(&k_quote.base64_encoded_message);
 
+        if self.is_removed(&transaction_id_bytes).await? {
+            info!("Quote {} was removed by the operator, not stored again", transaction_id);
+            return Ok(());
+        }
+        // Every check passed: claim the signature in the transaction the quote is written in.
+        let Some(mut db_tx) = self.begin_claimed(&k_quote.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
+
         // Single query to insert quote, mention, and hashtags using CTE
         if hashtags.is_empty() {
             // No hashtags - CTE with quote + mention only
@@ -2085,7 +2171,7 @@ impl KProtocolProcessor {
             .bind(&k_quote.base64_encoded_message)
             .bind(&content_id_bytes)
             .bind(&mentioned_pubkey_bytes)
-            .execute(&self.db_pool)
+            .execute(&mut *db_tx)
             .await?;
 
             if result.rows_affected() == 0 {
@@ -2130,7 +2216,7 @@ impl KProtocolProcessor {
             .bind(&content_id_bytes)
             .bind(&mentioned_pubkey_bytes)
             .bind(&hashtags)
-            .execute(&self.db_pool)
+            .execute(&mut *db_tx)
             .await?;
 
             if result.rows_affected() == 0 {
@@ -2148,6 +2234,7 @@ impl KProtocolProcessor {
                 );
             }
         }
+        db_tx.commit().await?;
         // KaPosts push: notify the quoted post's author of the quote/repost.
         if let Some(target) = self.content_author_pubkey(&k_quote.content_id).await {
             let snippet =
@@ -2214,9 +2301,6 @@ impl KProtocolProcessor {
             );
             return Ok(()); // Skip broadcasts with invalid signatures
         }
-        if !self.signature_is_fresh(&k_broadcast.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         // Convert hex strings to bytea for database storage
         let transaction_id_bytes = hex::decode(transaction_id)?;
@@ -2227,8 +2311,10 @@ impl KProtocolProcessor {
         // replacing the profile happen in one transaction; a signature already recorded for a
         // DIFFERENT transaction is a replay (anyone can re-post an old broadcast of someone's,
         // which would revert their profile) and is refused. Re-processing the same transaction
-        // stays a no-op, as before.
-        let mut db_tx = self.db_pool.begin().await?;
+        // stays a no-op, as before. The KaPosts signature claim is in the same transaction.
+        let Some(mut db_tx) = self.begin_claimed(&k_broadcast.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
         let first_use = sqlx::query(
             r#"
             INSERT INTO kachat_broadcast_signatures (sender_signature, transaction_id)
@@ -2324,9 +2410,6 @@ impl KProtocolProcessor {
             error!("Invalid signature for vote {}, skipping", transaction_id);
             return Ok(()); // Skip votes with invalid signatures
         }
-        if !self.signature_is_fresh(&k_vote.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         // Removal counter-action (fork addition): 'unvote' withdraws the sender's prior
         // upvote/downvote on this post. Delete the matching vote row (and its notification
@@ -2334,6 +2417,20 @@ impl KProtocolProcessor {
         if k_vote.vote == "unvote" {
             let sender_pubkey_bytes = hex::decode(&k_vote.sender_pubkey)?;
             let post_id_bytes = hex::decode(&k_vote.post_id)?;
+            let block_time = transaction.block_time.unwrap_or(0);
+            let Some(mut db_tx) = self.begin_claimed(&k_vote.sender_signature, transaction_id).await? else {
+                return Ok(());
+            };
+            // Last write by block time wins, as for follows: an unvote older than a later vote
+            // by this key (parallel workers, a reindex) changes nothing.
+            if !Self::relation_is_newest(&mut db_tx, "vote", &sender_pubkey_bytes, &post_id_bytes, "unvote", block_time)
+                .await?
+            {
+                db_tx.commit().await?;
+                info!("Unvote {} is older than a later vote on {} by the same key, skipping", transaction_id, k_vote.post_id);
+                return Ok(());
+            }
+            // `block_time <= $3` also spares a newer vote stored before votes were ordered.
             let delete_result = sqlx::query(
                 r#"
                 WITH deleted_votes AS (
@@ -2341,6 +2438,7 @@ impl KProtocolProcessor {
                     WHERE post_id = $1
                       AND substring(sender_pubkey from octet_length(sender_pubkey) - 31)
                         = substring($2 from octet_length($2) - 31)
+                      AND block_time <= $3
                     RETURNING transaction_id
                 )
                 DELETE FROM k_mentions
@@ -2350,8 +2448,10 @@ impl KProtocolProcessor {
             )
             .bind(&post_id_bytes)
             .bind(&sender_pubkey_bytes)
-            .execute(&self.db_pool)
+            .bind(block_time)
+            .execute(&mut *db_tx)
             .await?;
+            db_tx.commit().await?;
             info!(
                 "Processed K unvote: {} un-voted {} (removed prior vote, {} mention rows)",
                 hex::encode(&sender_pubkey_bytes),
@@ -2379,24 +2479,45 @@ impl KProtocolProcessor {
         // This keeps K-network engagement (votes on K-website posts, which are marker-filtered
         // and never stored) out of the database entirely. KaChat posts are indexed before
         // their votes arrive in normal operation, so legitimate KaChat votes are kept.
-        let target_is_kachat =
-            sqlx::query("SELECT 1 FROM k_contents WHERE transaction_id = $1 LIMIT 1")
+        let target_author: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT sender_pubkey FROM k_contents WHERE transaction_id = $1 LIMIT 1")
                 .bind(&post_id_bytes)
                 .fetch_optional(&self.db_pool)
-                .await?
-                .is_some();
-        if !target_is_kachat {
+                .await?;
+        let Some(target_author) = target_author else {
             info!(
                 "Vote {} targets non-KaChat content {}, skipping",
                 transaction_id, k_vote.post_id
             );
+            return Ok(());
+        };
+        // The vote's notification row goes to the post's author, and only when the payload names
+        // them (by x-only key): a vote can't drop a row into a third party's notifications.
+        let notify_author = same_xonly(&mentioned_pubkey_bytes, &target_author);
+        if !notify_author {
+            debug!(
+                "Vote {} names {} but {} is by someone else: no notification row",
+                transaction_id, k_vote.mentioned_pubkey, k_vote.post_id
+            );
+        }
+
+        // Every check passed: claim the signature in the transaction the vote is written in.
+        let Some(mut db_tx) = self.begin_claimed(&k_vote.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
+        // Last write by block time wins: a vote older than a later unvote by this key changes
+        // nothing.
+        if !Self::relation_is_newest(&mut db_tx, "vote", &sender_pubkey_bytes, &post_id_bytes, &k_vote.vote, block_time)
+            .await?
+        {
+            db_tx.commit().await?;
+            info!("Vote {} is older than a later unvote of {} by the same key, skipping", transaction_id, k_vote.post_id);
             return Ok(());
         }
 
         // One vote per key per post: a newer vote replaces this key's earlier one (a change of
         // mind, or the same vote again), an older one is dropped. Both in one transaction, so the
         // unique index never sees two.
-        let mut db_tx = self.db_pool.begin().await?;
         let replaced: Vec<(Vec<u8>, String)> = sqlx::query_as(
             r#"
             DELETE FROM k_votes
@@ -2441,13 +2562,13 @@ impl KProtocolProcessor {
         .await?
         .rows_affected()
             > 0;
-        if inserted {
+        if inserted && notify_author {
             sqlx::query(
                 "INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey) \
                  VALUES ($1, 'vote', $2, $3, $4)",
             )
             .bind(&transaction_id_bytes)
-            .bind(&mentioned_pubkey_bytes)
+            .bind(&target_author)
             .bind(block_time)
             .bind(&sender_pubkey_bytes)
             .execute(&mut *db_tx)
@@ -2478,17 +2599,15 @@ impl KProtocolProcessor {
             _ => None,
         };
         if let Some((action, kind, vote_body)) = vote_action {
-            if let Some(target) = self.content_author_pubkey(&post_id_for_log).await {
-                crate::push_notify::notify_kaposts(
-                    &target,
-                    &k_vote.sender_pubkey,
-                    action,
-                    kind,
-                    vote_body.to_string(),
-                    Some(post_id_for_log.clone()),
-                    transaction_id,
-                );
-            }
+            crate::push_notify::notify_kaposts(
+                &hex::encode(&target_author),
+                &k_vote.sender_pubkey,
+                action,
+                kind,
+                vote_body.to_string(),
+                Some(post_id_for_log.clone()),
+                transaction_id,
+            );
         }
         Ok(())
     }
@@ -2516,12 +2635,12 @@ impl KProtocolProcessor {
             );
             return Ok(());
         }
-        if !self.signature_is_fresh(&k_unquote.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         let sender_pubkey_bytes = hex::decode(&k_unquote.sender_pubkey)?;
         let content_id_bytes = hex::decode(&k_unquote.content_id)?;
+        let Some(mut db_tx) = self.begin_claimed(&k_unquote.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
 
         // Delete the sender's quote/repost row(s) referencing this content, plus their
         // notification mentions. Hashtags are removed by ON DELETE CASCADE on k_hashtags.
@@ -2541,8 +2660,9 @@ impl KProtocolProcessor {
         )
         .bind(&content_id_bytes)
         .bind(&sender_pubkey_bytes)
-        .execute(&self.db_pool)
+        .execute(&mut *db_tx)
         .await?;
+        db_tx.commit().await?;
 
         info!(
             "Processed K unquote: {} un-quoted {} (removed quote/repost, {} mention rows)",
@@ -2578,9 +2698,6 @@ impl KProtocolProcessor {
             &k_edit.sender_pubkey,
         ) {
             error!("Invalid signature for edit {}, skipping", transaction_id);
-            return Ok(());
-        }
-        if !self.signature_is_fresh(&k_edit.sender_signature, transaction_id).await? {
             return Ok(());
         }
 
@@ -2647,6 +2764,11 @@ impl KProtocolProcessor {
             return Ok(());
         }
 
+        // Every check passed: claim the signature in the transaction the edit is applied in.
+        let Some(mut db_tx) = self.begin_claimed(&k_edit.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
+
         // Audit row + idempotency (re-processing the same edit tx is a no-op).
         sqlx::query(
             r#"
@@ -2662,7 +2784,7 @@ impl KProtocolProcessor {
         .bind(&sender_signature_bytes)
         .bind(&post_id_bytes)
         .bind(&k_edit.base64_encoded_message)
-        .execute(&self.db_pool)
+        .execute(&mut *db_tx)
         .await?;
 
         // Apply in place. The guard keeps the latest edit by chain time regardless of the order
@@ -2678,10 +2800,11 @@ impl KProtocolProcessor {
         .bind(&k_edit.base64_encoded_message)
         .bind(edit_block_time)
         .bind(&post_id_bytes)
-        .execute(&self.db_pool)
+        .execute(&mut *db_tx)
         .await?;
 
         if applied.rows_affected() == 0 {
+            db_tx.commit().await?;
             info!(
                 "Edit {} superseded by a newer edit of {}, keeping the newer version",
                 transaction_id, k_edit.post_id
@@ -2716,10 +2839,12 @@ impl KProtocolProcessor {
                 .bind(&pk_bytes)
                 .bind(edit_block_time)
                 .bind(&sender_pubkey_bytes)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
             }
         }
+
+        db_tx.commit().await?;
 
         info!(
             "Applied K edit: {} edited {} (editedAt {})",
@@ -2753,9 +2878,6 @@ impl KProtocolProcessor {
             error!("Invalid signature for delete {}, skipping", transaction_id);
             return Ok(());
         }
-        if !self.signature_is_fresh(&k_delete.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         let block_time = transaction.block_time.unwrap_or(0);
         let transaction_id_bytes = hex::decode(transaction_id)?;
@@ -2764,7 +2886,11 @@ impl KProtocolProcessor {
 
         // The tombstone first, whether or not the post is indexed yet (IDX-039): a reindex can
         // process the post AFTER its delete, and the post's save then finds this and drops it.
-        // Keyed by the signer, so a forged delete only matches the forger's own posts.
+        // Keyed by the signer, so a forged delete only matches the forger's own posts. The
+        // signature is claimed in the same transaction.
+        let Some(mut db_tx) = self.begin_claimed(&k_delete.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
         sqlx::query(
             "INSERT INTO kachat_delete_tombstones (post_id, sender_pubkey, transaction_id, block_time) \
              VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
@@ -2773,8 +2899,9 @@ impl KProtocolProcessor {
         .bind(&sender_pubkey_bytes)
         .bind(&transaction_id_bytes)
         .bind(block_time)
-        .execute(&self.db_pool)
+        .execute(&mut *db_tx)
         .await?;
+        db_tx.commit().await?;
 
         // The target must be indexed and authored by the deleter. Without the original row we can't
         // verify ownership, so an unindexed target is skipped (rejects a forged delete of another's
@@ -2911,9 +3038,6 @@ impl KProtocolProcessor {
             error!("Invalid signature for poll {}, skipping", transaction_id);
             return Ok(());
         }
-        if !self.signature_is_fresh(&k_poll.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         // The question is a post's message: KaChat marker, non-empty, text-only.
         if let Err(reason) = validate_kachat_message(&k_poll.base64_encoded_question) {
@@ -2972,6 +3096,15 @@ impl KProtocolProcessor {
         let sender_pubkey_bytes = hex::decode(&k_poll.sender_pubkey)?;
         let sender_signature_bytes = hex::decode(&k_poll.sender_signature)?;
 
+        if self.is_removed(&transaction_id_bytes).await? {
+            info!("Poll {} was removed by the operator, not stored again", transaction_id);
+            return Ok(());
+        }
+        // Every check passed: claim the signature in the transaction the poll is written in.
+        let Some(mut db_tx) = self.begin_claimed(&k_poll.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
+
         // Store the question as the post content (content_type = 'poll').
         let inserted = sqlx::query(
             r#"
@@ -2987,9 +3120,10 @@ impl KProtocolProcessor {
         .bind(&sender_pubkey_bytes)
         .bind(&sender_signature_bytes)
         .bind(&k_poll.base64_encoded_question)
-        .execute(&self.db_pool)
+        .execute(&mut *db_tx)
         .await?;
         if inserted.rows_affected() == 0 {
+            db_tx.commit().await?;
             info!("Poll {} already indexed, skipping", transaction_id);
             return Ok(());
         }
@@ -3006,14 +3140,14 @@ impl KProtocolProcessor {
         .bind(&k_poll.options_b64_csv)
         .bind(k_poll.closes_at_ms)
         .bind(block_time)
-        .execute(&self.db_pool)
+        .execute(&mut *db_tx)
         .await?;
 
         // Mentions in the question notify like a post's (kchat only). Mirrors the post path.
         if k_poll.is_kchat {
             for pk_hex in &k_poll.mentioned_pubkeys {
                 let Ok(pk_bytes) = hex::decode(pk_hex) else { continue };
-                let _ = sqlx::query(
+                sqlx::query(
                     r#"
                     INSERT INTO k_mentions (content_id, content_type, mentioned_pubkey, block_time, sender_pubkey)
                     VALUES ($1, 'post', $2, $3, $4)
@@ -3024,10 +3158,12 @@ impl KProtocolProcessor {
                 .bind(&pk_bytes)
                 .bind(block_time)
                 .bind(&sender_pubkey_bytes)
-                .execute(&self.db_pool)
-                .await;
+                .execute(&mut *db_tx)
+                .await?;
             }
         }
+
+        db_tx.commit().await?;
 
         info!("Saved poll {} with {} options", transaction_id, decoded_options.len());
         // §3a: a poll is a top-level post too; notify the devices watching this author. (A
@@ -3041,8 +3177,9 @@ impl KProtocolProcessor {
     }
 
     /// Process a poll vote (§5.9). Every valid vote is stored; the current vote per pubkey (the
-    /// latest by chain time) is resolved at read time, so replay order does not matter. Votes
-    /// produce no notification and do not count as votes/replies on the post.
+    /// latest by chain time) is resolved at read time, so replay order does not matter. One
+    /// voter's key forms (`02x`, `03x`, `x`) are kept to one at insert time, so a key counts once.
+    /// Votes produce no notification and do not count as votes/replies on the post.
     pub async fn process_k_pollvote_in_database(
         &self,
         transaction: &Transaction,
@@ -3059,9 +3196,6 @@ impl KProtocolProcessor {
             &k_vote.sender_pubkey,
         ) {
             error!("Invalid signature for pollvote {}, skipping", transaction_id);
-            return Ok(());
-        }
-        if !self.signature_is_fresh(&k_vote.sender_signature, transaction_id).await? {
             return Ok(());
         }
 
@@ -3100,6 +3234,46 @@ impl KProtocolProcessor {
         let sender_pubkey_bytes = hex::decode(&k_vote.sender_pubkey)?;
         let sender_signature_bytes = hex::decode(&k_vote.sender_signature)?;
 
+        // Every check passed: claim the signature in the transaction the vote is written in.
+        let Some(mut db_tx) = self.begin_claimed(&k_vote.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
+        // One current vote per voter by x-only key: `02x`, `03x` and bare `x` are one voter, and
+        // the read path resolves each stored key form apart. A re-vote still replaces (the latest
+        // by chain time wins), so a vote under another form of this key is removed when this one
+        // is newer, and this one is dropped when that one is. The lock keeps two forms of one key
+        // voting on one poll at the same moment from both getting in.
+        let forms = key_forms(&sender_pubkey_bytes);
+        lock_pair(&mut db_tx, LOCK_POLLVOTE, &sender_pubkey_bytes, &poll_id_bytes).await?;
+        let newer_elsewhere: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM k_poll_votes WHERE poll_id = $1 AND voter_pubkey = ANY($2) \
+             AND voter_pubkey <> $3 AND block_time > $4)",
+        )
+        .bind(&poll_id_bytes)
+        .bind(&forms)
+        .bind(&sender_pubkey_bytes)
+        .bind(block_time)
+        .fetch_one(&mut *db_tx)
+        .await?;
+        if newer_elsewhere {
+            db_tx.commit().await?;
+            info!(
+                "Pollvote {} is older than this voter's vote under another form of the key, skipping",
+                transaction_id
+            );
+            return Ok(());
+        }
+        sqlx::query(
+            "DELETE FROM k_poll_votes WHERE poll_id = $1 AND voter_pubkey = ANY($2) \
+             AND voter_pubkey <> $3 AND block_time <= $4",
+        )
+        .bind(&poll_id_bytes)
+        .bind(&forms)
+        .bind(&sender_pubkey_bytes)
+        .bind(block_time)
+        .execute(&mut *db_tx)
+        .await?;
+
         sqlx::query(
             r#"
             INSERT INTO k_poll_votes (
@@ -3114,8 +3288,9 @@ impl KProtocolProcessor {
         .bind(k_vote.option_index)
         .bind(block_time)
         .bind(&sender_signature_bytes)
-        .execute(&self.db_pool)
+        .execute(&mut *db_tx)
         .await?;
+        db_tx.commit().await?;
 
         info!("Recorded pollvote {} on poll {}", transaction_id, k_vote.poll_id);
         Ok(())
@@ -3165,9 +3340,6 @@ impl KProtocolProcessor {
             &k_tip.sender_pubkey,
         ) {
             error!("Invalid signature for tip {}, skipping", transaction_id);
-            return Ok(BcastOutcome::Done);
-        }
-        if !self.signature_is_fresh(&k_tip.sender_signature, transaction_id).await? {
             return Ok(BcastOutcome::Done);
         }
 
@@ -3283,6 +3455,13 @@ impl KProtocolProcessor {
         let block_time = transaction.block_time.unwrap_or(0);
         let sender_pubkey_bytes = hex::decode(&k_tip.sender_pubkey)?;
         let sender_signature_bytes = hex::decode(&k_tip.sender_signature)?;
+        // Every check passed, the amount included: only now is the signature claimed, in the
+        // transaction the tip is written in. The signature does not cover the payment, so a
+        // copy of it in a tx that pays the author nothing is dropped above without burning it,
+        // and the real tip still counts.
+        let Some(mut db_tx) = self.begin_claimed(&k_tip.sender_signature, transaction_id).await? else {
+            return Ok(BcastOutcome::Done);
+        };
         // The k_mentions row (content_type 'tip', content_id = the tip tx) lists the tip in the
         // author's KaPosts notifications (get-notifications); written in the same statement so a
         // tip and its notification exist together or not at all.
@@ -3308,8 +3487,9 @@ impl KProtocolProcessor {
         .bind(&post_id_bytes)
         .bind(&author_pubkey_bytes)
         .bind(amount_i64)
-        .execute(&self.db_pool)
+        .execute(&mut *db_tx)
         .await?;
+        db_tx.commit().await?;
         if result.rows_affected() == 0 {
             info!("Tip {} already indexed, skipping", transaction_id);
             return Ok(BcastOutcome::Done);
@@ -3391,9 +3571,6 @@ impl KProtocolProcessor {
             );
             return Ok(()); // Skip block actions with invalid signatures
         }
-        if !self.signature_is_fresh(&k_block.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         // Extract block time
         let block_time = transaction.block_time.unwrap_or(0);
@@ -3403,11 +3580,22 @@ impl KProtocolProcessor {
         let blocked_user_pubkey_bytes = hex::decode(&k_block.blocked_user_pubkey)?;
 
         // Last write by block time wins (kachat-audits IDX-035): an older block or unblock
-        // processed after a newer opposing one (a reindex, a catch-up) changes nothing.
-        if !self
-            .relation_is_newest("block", &sender_pubkey_bytes, &blocked_user_pubkey_bytes, &k_block.blocking_action, block_time)
-            .await?
+        // processed after a newer opposing one (a reindex, a catch-up) changes nothing. The
+        // signature claim, this guard and the write share one transaction.
+        let Some(mut db_tx) = self.begin_claimed(&k_block.sender_signature, transaction_id).await? else {
+            return Ok(());
+        };
+        if !Self::relation_is_newest(
+            &mut db_tx,
+            "block",
+            &sender_pubkey_bytes,
+            relation_target(&blocked_user_pubkey_bytes),
+            &k_block.blocking_action,
+            block_time,
+        )
+        .await?
         {
+            db_tx.commit().await?;
             info!("Block action {} is older than a later one for the same pair, skipping", transaction_id);
             return Ok(());
         }
@@ -3434,8 +3622,9 @@ impl KProtocolProcessor {
                 .bind(&sender_signature_bytes)
                 .bind(&k_block.blocking_action)
                 .bind(&blocked_user_pubkey_bytes)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
+                db_tx.commit().await?;
 
                 if result.rows_affected() == 0 {
                     info!(
@@ -3477,8 +3666,9 @@ impl KProtocolProcessor {
                 .bind(&sender_pubkey_bytes)
                 .bind(&blocked_user_pubkey_bytes)
                 .bind(block_time)
-                .execute(&self.db_pool)
+                .execute(&mut *db_tx)
                 .await?;
+                db_tx.commit().await?;
 
                 info!(
                     "Processed K unblock: {} unblocked {} (deleted {} existing block records)",
@@ -3539,9 +3729,6 @@ impl KProtocolProcessor {
             );
             return Ok(()); // Skip follow actions with invalid signatures
         }
-        if !self.signature_is_fresh(&k_follow.sender_signature, transaction_id).await? {
-            return Ok(());
-        }
 
         // Extract block time
         let block_time = transaction.block_time.unwrap_or(0);
@@ -3549,6 +3736,8 @@ impl KProtocolProcessor {
         // Convert hex strings to bytea for database storage
         let sender_pubkey_bytes = hex::decode(&k_follow.sender_pubkey)?;
         let followed_user_pubkey_bytes = hex::decode(&k_follow.followed_user_pubkey)?;
+        // Every form of the follower's key (`02x`, `03x`, bare `x`): one follower.
+        let sender_forms = key_forms(&sender_pubkey_bytes);
 
         match k_follow.following_action.as_str() {
             "follow" => {
@@ -3574,14 +3763,37 @@ impl KProtocolProcessor {
                     );
                     return Ok(());
                 }
-                // Last write by block time wins (kachat-audits IDX-035).
-                if !self
-                    .relation_is_newest("follow", &sender_pubkey_bytes, &followed_user_pubkey_bytes, "follow", block_time)
-                    .await?
+                // Every check passed: the signature claim, the ordering guard and the write
+                // share one transaction. Last write by block time wins (kachat-audits IDX-035).
+                let Some(mut db_tx) = self.begin_claimed(&k_follow.sender_signature, transaction_id).await? else {
+                    return Ok(());
+                };
+                if !Self::relation_is_newest(
+                    &mut db_tx,
+                    "follow",
+                    &sender_pubkey_bytes,
+                    relation_target(&followed_user_pubkey_bytes),
+                    "follow",
+                    block_time,
+                )
+                .await?
                 {
+                    db_tx.commit().await?;
                     info!("Follow {} is older than a later unfollow of the same person, skipping", transaction_id);
                     return Ok(());
                 }
+                // Already followed under another form of the follower's key: the unique index
+                // only knows the key as written, so check every form (the lock keeps two forms
+                // following at the same moment from both getting in).
+                lock_pair(&mut db_tx, LOCK_FOLLOW, &sender_pubkey_bytes, relation_target(&followed_user_pubkey_bytes)).await?;
+                let follows_already: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM k_follows WHERE sender_pubkey = ANY($1) \
+                     AND substring(followed_user_pubkey from 2) = substring($2 from 2))",
+                )
+                .bind(&sender_forms)
+                .bind(&followed_user_pubkey_bytes)
+                .fetch_one(&mut *db_tx)
+                .await?;
 
                 // Insert follow record (skip if same sender already follows this user). The
                 // k_mentions row (content_type 'follow', content_id = the follow tx) lists the
@@ -3593,7 +3805,7 @@ impl KProtocolProcessor {
                         INSERT INTO k_follows (
                             transaction_id, block_time, sender_pubkey, sender_signature,
                             following_action, followed_user_pubkey
-                        ) VALUES ($1, $2, $3, $4, $5, $6)
+                        ) SELECT $1, $2, $3, $4, $5, $6 WHERE NOT $7
                         ON CONFLICT (sender_pubkey, (substring(followed_user_pubkey from 2)))
                         DO NOTHING
                         RETURNING transaction_id, block_time, sender_pubkey, followed_user_pubkey
@@ -3609,8 +3821,10 @@ impl KProtocolProcessor {
                 .bind(&sender_signature_bytes)
                 .bind(&k_follow.following_action)
                 .bind(&followed_user_pubkey_bytes)
-                .execute(&self.db_pool)
+                .bind(follows_already)
+                .execute(&mut *db_tx)
                 .await?;
+                db_tx.commit().await?;
 
                 if result.rows_affected() == 0 {
                     info!(
@@ -3639,20 +3853,30 @@ impl KProtocolProcessor {
             "unfollow" => {
                 // Last write by block time wins (kachat-audits IDX-035): an unfollow older than
                 // a later follow of the same person changes nothing.
-                if !self
-                    .relation_is_newest("follow", &sender_pubkey_bytes, &followed_user_pubkey_bytes, "unfollow", block_time)
-                    .await?
+                let Some(mut db_tx) = self.begin_claimed(&k_follow.sender_signature, transaction_id).await? else {
+                    return Ok(());
+                };
+                if !Self::relation_is_newest(
+                    &mut db_tx,
+                    "follow",
+                    &sender_pubkey_bytes,
+                    relation_target(&followed_user_pubkey_bytes),
+                    "unfollow",
+                    block_time,
+                )
+                .await?
                 {
+                    db_tx.commit().await?;
                     info!("Unfollow {} is older than a later follow of the same person, skipping", transaction_id);
                     return Ok(());
                 }
-                // Delete the follow for the same sender and followed user, unless it is newer,
-                // and its notification row with it (as an unvote does).
+                // Delete the follow for the same sender (any form of the key) and followed user,
+                // unless it is newer, and its notification row with it (as an unvote does).
                 let deleted: i64 = sqlx::query_scalar(
                     r#"
                     WITH deleted_follows AS (
                         DELETE FROM k_follows
-                        WHERE sender_pubkey = $1
+                        WHERE sender_pubkey = ANY($1)
                         AND substring(followed_user_pubkey from 2) = substring($2 from 2)
                         AND following_action = 'follow'
                         AND block_time <= $3
@@ -3666,11 +3890,12 @@ impl KProtocolProcessor {
                     SELECT COUNT(*) FROM deleted_follows
                     "#,
                 )
-                .bind(&sender_pubkey_bytes)
+                .bind(&sender_forms)
                 .bind(&followed_user_pubkey_bytes)
                 .bind(block_time)
-                .fetch_one(&self.db_pool)
+                .fetch_one(&mut *db_tx)
                 .await?;
+                db_tx.commit().await?;
 
                 info!(
                     "Processed K unfollow: {} unfollowed {} (deleted {} existing follow records)",
@@ -3691,17 +3916,23 @@ impl KProtocolProcessor {
         Ok(())
     }
 
-    /// kachat-audits IDX-035: records `action` as the newest for (kind, sender, x-only target)
-    /// and says whether it is. False when a later action for the same pair is already known,
-    /// so the caller changes nothing: whatever order a reindex or catch-up processes
-    /// transactions in, the last one on chain wins. A tie (same block time) lets the later
-    /// processed one through, which for the same transaction is the idempotent re-run.
-    /// False when this signature already came in another tx: a copy of a signed action, which
-    /// must not apply again. The same tx seen again (another block, a retry) is still fresh. Call
-    /// it only once the signature has verified, so a forged copy can't claim it first.
-    async fn signature_is_fresh(&self, signature_hex: &str, transaction_id: &str) -> Result<bool> {
+    /// Opens the database transaction a signed KaPosts action is written in, its signature
+    /// claimed in it first. None when this signature already came in another tx: a copy of a
+    /// signed action, which must not apply again (the transaction rolls back). The same tx seen
+    /// again (another block, a retry) is still fresh. Call it only once the signature has
+    /// verified and every other check has passed, right before the write: a copy dropped by a
+    /// check (a tip that pays the author nothing, an edit past its window) must not claim the
+    /// signature and so make the real action read as the replay. The claim commits with the
+    /// write. An action an ordering guard then refuses (older than a newer one by the same key)
+    /// still commits the claim: it is the real one, and its signature stays used.
+    async fn begin_claimed(
+        &self,
+        signature_hex: &str,
+        transaction_id: &str,
+    ) -> Result<Option<sqlx::Transaction<'static, sqlx::Postgres>>> {
         let signature = hex::decode(signature_hex)?;
         let tx_id = hex::decode(transaction_id)?;
+        let mut db_tx = self.db_pool.begin().await?;
         let first: Option<Vec<u8>> = sqlx::query_scalar(
             r#"
             WITH ins AS (
@@ -3718,9 +3949,9 @@ impl KProtocolProcessor {
         )
         .bind(&signature)
         .bind(&tx_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *db_tx)
         .await?;
-        // Another worker inserted it while this statement ran, after its snapshot: read it now.
+        // Another worker committed it while this statement ran, after its snapshot: read it now.
         let first = match first {
             Some(first) => first,
             None => {
@@ -3728,7 +3959,7 @@ impl KProtocolProcessor {
                     "SELECT transaction_id FROM kachat_used_signatures WHERE sender_signature = $1",
                 )
                 .bind(&signature)
-                .fetch_one(&self.db_pool)
+                .fetch_one(&mut *db_tx)
                 .await?
             }
         };
@@ -3738,23 +3969,36 @@ impl KProtocolProcessor {
                 transaction_id,
                 hex::encode(&first)
             );
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(true)
+        Ok(Some(db_tx))
     }
 
+    /// kachat-audits IDX-035: records `action` as the newest for (kind, sender, target) and says
+    /// whether it is. False when a later action for the same pair is already known, under any
+    /// form of the sender's key (`02x`, `03x`, bare `x`), so the caller changes nothing: whatever
+    /// order a reindex, a catch-up or parallel workers process transactions in, the last one on
+    /// chain wins. A tie (same block time) lets the later processed one through, which for the
+    /// same transaction is the idempotent re-run. `target` is the pair's other side as stored:
+    /// `relation_target` of a pubkey for follows and blocks, the post id for votes. Runs in the
+    /// caller's transaction, after its signature claim.
     async fn relation_is_newest(
-        &self,
+        conn: &mut sqlx::PgConnection,
         kind: &str,
         sender_pubkey: &[u8],
-        target_pubkey: &[u8],
+        target: &[u8],
         action: &str,
         block_time: i64,
     ) -> Result<bool> {
         let r = sqlx::query(
             r#"
+            WITH newer AS (
+                SELECT 1 FROM kachat_relation_last
+                WHERE kind = $1 AND sender_pubkey = ANY($6) AND target_xonly = $3 AND block_time > $5
+                LIMIT 1
+            )
             INSERT INTO kachat_relation_last (kind, sender_pubkey, target_xonly, action, block_time)
-            VALUES ($1, $2, substring($3 from 2), $4, $5)
+            SELECT $1, $2, $3, $4, $5 WHERE NOT EXISTS (SELECT 1 FROM newer)
             ON CONFLICT (kind, sender_pubkey, target_xonly) DO UPDATE
                 SET action = EXCLUDED.action, block_time = EXCLUDED.block_time
                 WHERE kachat_relation_last.block_time <= EXCLUDED.block_time
@@ -3762,13 +4006,84 @@ impl KProtocolProcessor {
         )
         .bind(kind)
         .bind(sender_pubkey)
-        .bind(target_pubkey)
+        .bind(target)
         .bind(action)
         .bind(block_time)
-        .execute(&self.db_pool)
+        .bind(key_forms(sender_pubkey))
+        .execute(&mut *conn)
         .await?;
         Ok(r.rows_affected() > 0)
     }
+
+    /// Whether the operator removed this transaction's content (`kachat_removed_txs`, written by
+    /// the admin API when it deletes a post or a room message). A removed transaction is never
+    /// stored again, whatever delivers it once more: the startup catch-up, a reindex, a retry.
+    async fn is_removed(&self, transaction_id_bytes: &[u8]) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kachat_removed_txs WHERE transaction_id = $1)",
+        )
+        .bind(transaction_id_bytes)
+        .fetch_one(&self.db_pool)
+        .await?)
+    }
+}
+
+/// The x-only key of a pubkey's bytes: the last 32 of a compressed `02/03 || x`, a bare `x` as
+/// it is. Other lengths as given.
+fn xonly_of(pk: &[u8]) -> &[u8] {
+    if pk.len() == 33 { &pk[1..] } else { pk }
+}
+
+/// Whether two pubkeys (bytes, any form) are the same key.
+fn same_xonly(a: &[u8], b: &[u8]) -> bool {
+    xonly_of(a) == xonly_of(b)
+}
+
+/// Every form one key is written in: bare `x`, `02 || x` and `03 || x`, plus the key as given
+/// when it is none of those (a malformed key only matches itself).
+fn key_forms(pk: &[u8]) -> Vec<Vec<u8>> {
+    let x = xonly_of(pk);
+    if x.len() != 32 {
+        return vec![pk.to_vec()];
+    }
+    let mut forms = vec![x.to_vec(), [&[2u8][..], x].concat(), [&[3u8][..], x].concat()];
+    if !forms.iter().any(|f| f == pk) {
+        forms.push(pk.to_vec());
+    }
+    forms
+}
+
+/// A follow's or block's target as `kachat_relation_last` stores it: `substring(pk from 2)`,
+/// the x-only part of the compressed key the payload carries.
+fn relation_target(pk: &[u8]) -> &[u8] {
+    pk.get(1..).unwrap_or_default()
+}
+
+/// Advisory-lock namespaces for `lock_pair` ("KF" follows, "KP" poll votes).
+const LOCK_FOLLOW: i32 = 0x4B46_0001;
+const LOCK_POLLVOTE: i32 = 0x4B50_0001;
+
+/// The second key of a `lock_pair` lock: FNV-1a over the x-only key and the target. A collision
+/// only makes two unrelated writes wait for each other.
+fn pair_lock_key(pubkey: &[u8], target: &[u8]) -> i32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for b in xonly_of(pubkey).iter().chain(target) {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h as i32
+}
+
+/// Serialises writes for one (x-only key, target) pair across workers until the caller's
+/// transaction ends: the insert-time checks that treat every form of a key as one person read,
+/// then write, and two forms of one key landing at once must not both pass.
+async fn lock_pair(conn: &mut sqlx::PgConnection, namespace: i32, pubkey: &[u8], target: &[u8]) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(namespace)
+        .bind(pair_lock_key(pubkey, target))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// x-only part of a compressed pubkey hex (`02`/`03` + 64 hex), lowercased; other shapes as-is.
@@ -3989,5 +4304,83 @@ mod address_blocklist_tests {
         assert!(!is_pubkey_blocked(&format!("02{}", "cd".repeat(32))));
         set_address_blocklist(Vec::new(), Vec::new());
         assert!(!is_pubkey_blocked(&format!("02{x}")));
+    }
+}
+
+#[cfg(test)]
+mod kaplay_room_tests {
+    use super::*;
+
+    #[test]
+    fn a_kaplay_room_keeps_only_what_its_boards_read() {
+        let arcade = r#"{"type":"arcade","v":1,"game":"snake","score":42}"#;
+        let duel = r#"{"type":"chess_t","v":1,"t":"duel-1","a":"join"}"#;
+        let bot = r#"{"a":"result","bot":3,"type":"chess_bot","v":2}"#;
+        // #kplay-arcade is the one KaPlay room: all three kinds (KPLAY_ONE_ROOM.md).
+        for content in [arcade, duel, bot] {
+            assert_eq!(kaplay_content_ok("kplay-arcade", content), Ok(()), "{content}");
+        }
+        assert_eq!(kaplay_content_ok("chess-arena", duel), Ok(()));
+        assert!(kaplay_content_ok("chess-arena", bot).is_err());
+        assert!(kaplay_content_ok("chess-arena", arcade).is_err());
+        assert_eq!(kaplay_content_ok("chess-bots", bot), Ok(()));
+        assert!(kaplay_content_ok("chess-bots", duel).is_err());
+        // Not an object, no type, a type that is not a string, an unknown type: dropped.
+        for content in ["gm", "", "[1,2]", r#""arcade""#, r#"{"v":1}"#, r#"{"type":7}"#, r#"{"type":"reaction"}"#] {
+            assert!(kaplay_content_ok("kplay-arcade", content).is_err(), "{content}");
+        }
+        // 32 KB at most, padding included.
+        let fits = format!(r#"{{"type":"arcade","pad":"{}"}}"#, "x".repeat(MAX_KAPLAY_CONTENT_BYTES - 30));
+        assert!(fits.len() <= MAX_KAPLAY_CONTENT_BYTES);
+        assert_eq!(kaplay_content_ok("kplay-arcade", &fits), Ok(()));
+        let too_big = format!(r#"{{"type":"arcade","pad":"{}"}}"#, "x".repeat(MAX_KAPLAY_CONTENT_BYTES));
+        assert!(kaplay_content_ok("kplay-arcade", &too_big).is_err());
+        // Every KaPlay room has its kinds; a chat room takes anything.
+        for room in KAPLAY_ROOMS {
+            assert!(kaplay_room_types(room).is_some(), "{room}");
+        }
+        assert_eq!(kaplay_content_ok("kaspa", "gm"), Ok(()));
+        assert_eq!(kaplay_content_ok("kaspa", &"x".repeat(100_000)), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod key_form_tests {
+    use super::*;
+
+    #[test]
+    fn the_three_forms_of_a_key_are_one_key() {
+        let x = [7u8; 32];
+        let c02 = [&[2u8][..], &x].concat();
+        let c03 = [&[3u8][..], &x].concat();
+        for pk in [&x[..], &c02[..], &c03[..]] {
+            let forms = key_forms(pk);
+            assert_eq!(forms.len(), 3);
+            assert!(forms.contains(&x.to_vec()) && forms.contains(&c02) && forms.contains(&c03));
+            assert_eq!(xonly_of(pk), &x[..]);
+            assert!(same_xonly(pk, &c03));
+            // The lock key is the same for every form, so two forms serialise.
+            assert_eq!(pair_lock_key(pk, b"poll"), pair_lock_key(&x, b"poll"));
+        }
+        assert!(!same_xonly(&c02, &[&[2u8][..], &[8u8; 32]].concat()));
+        assert_ne!(pair_lock_key(&x, b"poll-a"), pair_lock_key(&x, b"poll-b"));
+        // A malformed key only matches itself; an odd prefix byte keeps the key as given too.
+        assert_eq!(key_forms(&[1, 2, 3]), vec![vec![1, 2, 3]]);
+        let c04 = [&[4u8][..], &x].concat();
+        assert!(key_forms(&c04).contains(&c04));
+        // A relation target is what `substring(pk from 2)` stores.
+        assert_eq!(relation_target(&c02), &x[..]);
+        assert_eq!(relation_target(&[]), &[] as &[u8]);
+    }
+
+    #[test]
+    fn other_services_kinds_are_not_unknown() {
+        for kind in ["comm", "gcomm", "dm", "profile", "name", "pay", "self_stash", "gctl", "handshake"] {
+            assert!(OTHER_SERVICES_ACTIONS.contains(&kind), "{kind}");
+        }
+        // The processor's own kinds are never on the list.
+        for kind in ["post", "reply", "vote", "quote", "follow", "block", "broadcast", "tip", "poll", "pollvote"] {
+            assert!(!OTHER_SERVICES_ACTIONS.contains(&kind), "{kind}");
+        }
     }
 }

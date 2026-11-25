@@ -357,6 +357,17 @@ impl KDbClient {
             .await?;
             info!("One vote per key per post: index created, {} duplicate vote mention(s) removed", removed.rows_affected());
         }
+        // Moderation tombstones: every transaction whose post or room message the operator
+        // removed (the admin API writes a row as it deletes). The processor never stores one of
+        // these again, and a reindex treats it as done, so a restart's catch-up or a reindex
+        // does not bring removed content back.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kachat_removed_txs (\
+                transaction_id BYTEA PRIMARY KEY, \
+                removed_at BIGINT NOT NULL DEFAULT 0)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Every KaPosts signature, with the tx that first carried it. A K action signs only its
         // text, so the same signed action copied into a later tx would apply again: an old block
         // after an unblock, an old unblock after a block, a vote counted twice.

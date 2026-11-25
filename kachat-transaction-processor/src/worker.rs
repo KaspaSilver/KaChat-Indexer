@@ -2,6 +2,7 @@ use crate::config::AppConfig;
 use crate::database::{DbPool, Transaction, fetch_transaction};
 use crate::k_protocol::KProtocolProcessor;
 use anyhow::Result;
+use futures::FutureExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -36,7 +37,18 @@ impl Worker {
         while let Some(transaction_id) = self.receiver.recv().await {
             //info!("Worker {} received notification for transaction: {}", self.id, transaction_id);
 
-            self.process_transaction(transaction_id).await;
+            // A panic while processing one transaction (a fetch, a retry, the K processing) is
+            // caught, logged with the tx id and the transaction skipped: it must not take this
+            // worker down, and every transaction routed to it with it.
+            let work = std::panic::AssertUnwindSafe(self.process_transaction(transaction_id.clone()));
+            if let Err(panic) = work.catch_unwind().await {
+                error!(
+                    "Worker {} - Panic while processing transaction {}, skipped: {}",
+                    self.id,
+                    transaction_id,
+                    panic_message(panic.as_ref())
+                );
+            }
         }
 
         info!("Worker {} stopped", self.id);
@@ -45,59 +57,13 @@ impl Worker {
     async fn process_transaction(&self, transaction_id: String) {
         //info!("Worker {} processing transaction: {}", self.id, transaction_id);
 
+        // Taken first, whatever happens next (not found, an error, the retries): a row the
+        // startup catch-up re-queued stays quiet on the retry path too, and its entry never
+        // lingers in the set.
+        let catch_up = crate::reindex::take_catch_up(&transaction_id);
+
         match self.fetch_and_process_transaction(&transaction_id).await {
-            Ok(Some(transaction)) => {
-                // Process KaChat payloads only: canonical `kchat:1:` (posts + broadcasts) and the
-                // pre-rebrand KaChat broadcast prefix `ciph_msg:1:bcast:`. Legacy `k:1:` is the
-                // separate K-social network — not KaChat — so it is deliberately excluded.
-                if let Some(ref payload_hex) = transaction.payload {
-                    if let Ok(payload_bytes) = hex::decode(payload_hex) {
-                        if let Ok(payload_str) = std::str::from_utf8(&payload_bytes) {
-                            if payload_str.starts_with("kchat:1:")
-                                || payload_str.starts_with("ciph_msg:1:bcast:")
-                            {
-                                //info!("Worker {} - Processing K protocol / broadcast transaction: {}", self.id, transaction_id);
-                                // Pushes stay quiet only for re-queued rows: one a reindex
-                                // recovered (history) or one the startup catch-up re-queued
-                                // (it may have been pushed before the restart). A live
-                                // transaction always pushes, however far behind we are: an age
-                                // cut-off silenced every like while the processor lagged.
-                                let catch_up = crate::reindex::take_catch_up(&transaction_id);
-                                let quiet = transaction.recovered || catch_up;
-                                if quiet {
-                                    let age_s = transaction
-                                        .block_time
-                                        .map(|t| (crate::bcast_pending::now_ms() - t) / 1000)
-                                        .unwrap_or(-1);
-                                    info!(
-                                        "Worker {} - tx {} processed quiet (no pushes): {}, {}s old",
-                                        self.id,
-                                        transaction_id,
-                                        if transaction.recovered { "recovered by a reindex" } else { "startup catch-up" },
-                                        age_s
-                                    );
-                                }
-                                match crate::push_notify::QUIET
-                                    .scope(quiet, self.k_processor.process_k_transaction(&transaction))
-                                    .await
-                                {
-                                    Ok(()) => self.mark_recovered_consumed(&transaction_id).await,
-                                    Err(k_err) => error!(
-                                        "Worker {} - Error processing K protocol transaction {}: {}",
-                                        self.id, transaction_id, k_err
-                                    ),
-                                }
-                            } else {
-                                info!(
-                                    "Worker {} - Transaction {} does not contain K protocol data",
-                                    self.id, transaction_id
-                                );
-                                self.mark_recovered_consumed(&transaction_id).await;
-                            }
-                        }
-                    }
-                }
-            }
+            Ok(Some(transaction)) => self.process_fetched(&transaction, catch_up).await,
             Ok(None) => {
                 warn!(
                     "Worker {} - Transaction {} not found in database",
@@ -110,13 +76,74 @@ impl Worker {
                     self.id, transaction_id, e
                 );
 
-                if let Err(retry_err) = self.retry_transaction(&transaction_id).await {
+                if let Err(retry_err) = self.retry_transaction(&transaction_id, catch_up).await {
                     error!(
                         "Worker {} - Failed to retry transaction {}: {}",
                         self.id, transaction_id, retry_err
                     );
                 }
             }
+        }
+    }
+
+    /// One fetched transaction, first try or retry. KaChat payloads only: canonical `kchat:1:`
+    /// (posts + broadcasts) and the pre-rebrand KaChat broadcast prefix `ciph_msg:1:bcast:`.
+    /// Legacy `k:1:` is the separate K-social network, not KaChat, so it is deliberately
+    /// excluded.
+    async fn process_fetched(&self, transaction: &Transaction, catch_up: bool) {
+        let transaction_id = &transaction.transaction_id;
+        let Some(payload_str) = transaction
+            .payload
+            .as_deref()
+            .and_then(|payload_hex| hex::decode(payload_hex).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        else {
+            return;
+        };
+        if !payload_str.starts_with("kchat:1:") && !payload_str.starts_with("ciph_msg:1:bcast:") {
+            info!(
+                "Worker {} - Transaction {} does not contain K protocol data",
+                self.id, transaction_id
+            );
+            self.mark_recovered_consumed(transaction_id).await;
+            return;
+        }
+        //info!("Worker {} - Processing K protocol / broadcast transaction: {}", self.id, transaction_id);
+        // Pushes stay quiet for re-queued rows: one a reindex recovered (history) or one the
+        // startup catch-up re-queued (it may have been pushed before the restart). And for the
+        // ingester's backlog after an outage: a transaction more than
+        // `BACKLOG_PUSH_MAX_AGE_MS` old is stored but is not news. Within that, a live
+        // transaction pushes however far behind we are (a tighter cut-off silenced every like
+        // while the processor lagged).
+        let age_ms = transaction
+            .block_time
+            .map(|t| crate::bcast_pending::now_ms() - t);
+        let backlog = age_ms.is_some_and(|age| age > crate::push_notify::BACKLOG_PUSH_MAX_AGE_MS);
+        let quiet = transaction.recovered || catch_up || backlog;
+        if quiet {
+            info!(
+                "Worker {} - tx {} processed quiet (no pushes): {}, {}s old",
+                self.id,
+                transaction_id,
+                if transaction.recovered {
+                    "recovered by a reindex"
+                } else if catch_up {
+                    "startup catch-up"
+                } else {
+                    "backlog"
+                },
+                age_ms.map(|age| age / 1000).unwrap_or(-1)
+            );
+        }
+        match crate::push_notify::QUIET
+            .scope(quiet, self.k_processor.process_k_transaction(transaction))
+            .await
+        {
+            Ok(()) => self.mark_recovered_consumed(transaction_id).await,
+            Err(k_err) => error!(
+                "Worker {} - Error processing K protocol transaction {}: {}",
+                self.id, transaction_id, k_err
+            ),
         }
     }
 
@@ -171,7 +198,10 @@ impl Worker {
 
     }*/
 
-    async fn retry_transaction(&self, transaction_id: &str) -> Result<()> {
+    /// Fetch again after a fetch error, `retry_attempts` times. A row that comes back is
+    /// processed exactly like a first try (`process_fetched`): the same KaChat gate, the same
+    /// quiet rules (`catch_up` is what the first try took from the catch-up set), panics caught.
+    async fn retry_transaction(&self, transaction_id: &str, catch_up: bool) -> Result<()> {
         for attempt in 1..=self.config.processing.retry_attempts {
             warn!(
                 "Worker {} - Retry attempt {} for transaction {}",
@@ -189,27 +219,7 @@ impl Worker {
                         "Worker {} - Retry successful for transaction {}",
                         self.id, transaction_id
                     );
-                    // KaChat payloads only (see the same gate above): canonical `kchat:1:` and the
-                    // pre-rebrand KaChat broadcast prefix `ciph_msg:1:bcast:`. Legacy K-social
-                    // `k:1:` is not KaChat and is excluded.
-                    if let Some(ref payload_hex) = transaction.payload {
-                        if let Ok(payload_bytes) = hex::decode(payload_hex) {
-                            if let Ok(payload_str) = std::str::from_utf8(&payload_bytes) {
-                                if payload_str.starts_with("kchat:1:")
-                                    || payload_str.starts_with("ciph_msg:1:bcast:")
-                                {
-                                    //info!("Worker {} - Processing K protocol / broadcast transaction on retry: {}", self.id, transaction_id);
-                                    match self.k_processor.process_k_transaction(&transaction).await {
-                                        Ok(()) => self.mark_recovered_consumed(transaction_id).await,
-                                        Err(k_err) => error!(
-                                            "Worker {} - Error processing K protocol transaction on retry {}: {}",
-                                            self.id, transaction_id, k_err
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.process_fetched(&transaction, catch_up).await;
                     return Ok(());
                 }
                 Ok(None) => {
@@ -233,6 +243,15 @@ impl Worker {
         );
         Ok(())
     }
+}
+
+/// The text of a caught panic: what `panic!` was given, when it was a string.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a non-string panic".to_string())
 }
 
 pub struct WorkerPool {
@@ -273,5 +292,25 @@ impl WorkerPool {
         }
 
         info!("Worker pool stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn a_panicking_transaction_is_caught_and_named() {
+        let caught = std::panic::AssertUnwindSafe(async { panic!("bad payload {}", 7) })
+            .catch_unwind()
+            .await;
+        let panic = caught.expect_err("the panic is caught");
+        assert_eq!(super::panic_message(panic.as_ref()), "bad payload 7");
+        let caught = std::panic::AssertUnwindSafe(async { std::panic::panic_any(42u8) }).catch_unwind().await;
+        assert_eq!(super::panic_message(caught.unwrap_err().as_ref()), "a non-string panic");
+        // The task-local quiet flag is unwound with it: the next transaction is not quiet.
+        let quiet = crate::push_notify::QUIET.scope(true, async { panic!("inside quiet") });
+        assert!(std::panic::AssertUnwindSafe(quiet).catch_unwind().await.is_err());
+        assert!(crate::push_notify::QUIET.try_with(|q| *q).is_err());
     }
 }
