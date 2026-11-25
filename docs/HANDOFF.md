@@ -3,7 +3,9 @@
 Current state and next steps, so a fresh session (any device, from a clone) can continue
 without the chat history. Last updated 2026-10-02 after `a2438df` on `KaspaSilver/KaChat-Indexer`.
 
-> **Open from the K iOS app (2026-11-25):** `REPORT_BUGS_ROOM.md` (track the new default room
+> **Open from the K iOS app (2026-11-25):** `EXPLORER_STATS.md` (K Explorer: `last30d` on `/stats`,
+> `/stats/activity?period=` and `/network/fees?period=`; the app reads them as soon as they're served).
+> Also `REPORT_BUGS_ROOM.md` (track the new default room
 > `report-bugs`, which replaces `kachat-bugs` in K; add it to `broadcast_channels` in the panel now).
 
 > **Open from the K iOS app (2026-11-24):** `KPLAY_ARCADE_LEADERBOARD.md` (the arcade boards),
