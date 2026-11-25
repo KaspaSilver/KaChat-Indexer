@@ -9,12 +9,11 @@
 //! The rules are the engine's (`Registry::apply_profile_only`): v1 JSON ≤ 2 KB, a real
 //! self-send, newest wins by (accepting DAA, txid), reorgs roll back.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use kachat_names::follower::Follower;
-use kachat_names::ingest::Tx;
 use kaspa_addresses::Prefix;
 use kaspa_rpc_core::api::rpc::RpcApi;
 use kaspa_rpc_core::model::RpcHash;
@@ -74,66 +73,6 @@ impl Settings {
     }
 }
 
-const HOUR_MS: i64 = 3_600_000;
-
-/// One batch's fee totals per hour: (fees in sompi, transactions), for every accepted
-/// transaction with inputs and for K's alone, plus K's senders.
-#[derive(Default, Debug, PartialEq)]
-struct FeeTotals {
-    all: BTreeMap<i64, (i64, i64)>,
-    k: BTreeMap<i64, (i64, i64)>,
-    k_senders: BTreeSet<(i64, Vec<u8>)>,
-}
-
-impl FeeTotals {
-    fn of(accepted: &[Tx]) -> FeeTotals {
-        let mut totals = FeeTotals::default();
-        for t in accepted.iter().filter(|t| !t.inputs.is_empty()) {
-            let hour = t.block_time.div_euclid(HOUR_MS) * HOUR_MS;
-            let is_k = t.payload.starts_with(b"kchat:1:");
-            if let Some(fee) = t.fee() {
-                let all = totals.all.entry(hour).or_default();
-                all.0 += fee;
-                all.1 += 1;
-                if is_k {
-                    let k = totals.k.entry(hour).or_default();
-                    k.0 += fee;
-                    k.1 += 1;
-                }
-            }
-            if is_k && !t.inputs[0].spent_script.is_empty() {
-                totals.k_senders.insert((hour, t.inputs[0].spent_script.clone()));
-            }
-        }
-        totals
-    }
-
-    async fn write(&self, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
-        for (table, hours) in [("kachat_fee_hours", &self.all), ("kachat_k_hours", &self.k)] {
-            for (hour, (fees, count)) in hours {
-                sqlx::query(&format!(
-                    "INSERT INTO {table} (hour, fees_sompi, transactions) VALUES ($1, $2, $3) \
-                     ON CONFLICT (hour) DO UPDATE SET fees_sompi = {table}.fees_sompi + EXCLUDED.fees_sompi, \
-                     transactions = {table}.transactions + EXCLUDED.transactions"
-                ))
-                .bind(hour)
-                .bind(fees)
-                .bind(count)
-                .execute(&mut **tx)
-                .await?;
-            }
-        }
-        for (hour, sender) in &self.k_senders {
-            sqlx::query("INSERT INTO kachat_k_senders (hour, sender) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-                .bind(hour)
-                .bind(sender)
-                .execute(&mut **tx)
-                .await?;
-        }
-        Ok(())
-    }
-}
-
 /// Where the profiles follower stands (one row).
 #[derive(Debug, Default)]
 struct State {
@@ -164,27 +103,6 @@ async fn create_schema(pool: &PgPool) -> Result<()> {
             updated_at BIGINT NOT NULL
         )"#,
         "CREATE INDEX IF NOT EXISTS names_profiles_address ON names_profiles (address)",
-        // Hourly totals for the K Explorer (EXPLORER_STATS.md §2-§3), kept for good. `hour` = the
-        // hour's start, ms UTC, by the accepting chain block's time.
-        //   kachat_fee_hours: every accepted transaction with inputs (not coinbase): its fee
-        //     (inputs minus outputs) and how many.
-        //   kachat_k_hours / kachat_k_senders: the same for kchat:1: transactions, and their
-        //     distinct senders (input 0's script).
-        r#"CREATE TABLE IF NOT EXISTS kachat_fee_hours (
-            hour BIGINT PRIMARY KEY,
-            fees_sompi BIGINT NOT NULL DEFAULT 0,
-            transactions BIGINT NOT NULL DEFAULT 0
-        )"#,
-        r#"CREATE TABLE IF NOT EXISTS kachat_k_hours (
-            hour BIGINT PRIMARY KEY,
-            fees_sompi BIGINT NOT NULL DEFAULT 0,
-            transactions BIGINT NOT NULL DEFAULT 0
-        )"#,
-        r#"CREATE TABLE IF NOT EXISTS kachat_k_senders (
-            hour BIGINT NOT NULL,
-            sender BYTEA NOT NULL,
-            PRIMARY KEY (hour, sender)
-        )"#,
         // First accepted record's block time, kept across later saves ("new profiles").
         "ALTER TABLE names_profiles ADD COLUMN IF NOT EXISTS created_at BIGINT",
         "UPDATE names_profiles SET created_at = updated_at WHERE created_at IS NULL",
@@ -473,9 +391,6 @@ pub async fn run(args: &Args) -> Result<()> {
                 continue;
             }
         };
-        // Fees are counted from every accepted transaction, before profiles are filtered. A
-        // reorg that removes chain blocks (rare this far behind the tip) leaves theirs counted.
-        let fee_totals = FeeTotals::of(&batch.accepted);
         // Profiles switched off, or stamped to a blocked address: the follower never sees them,
         // so nothing is saved, and the chain is still followed.
         let mut batch = batch;
@@ -559,8 +474,6 @@ pub async fn run(args: &Args) -> Result<()> {
                 info!("[profiles] reorg: undid {} chain block(s)", batch.removed_blocks.len());
             }
         }
-        // With the checkpoint, in one commit: a batch is never counted twice.
-        fee_totals.write(&mut tx).await?;
         write_state(&mut tx, &state, scan_from).await?;
         tx.commit().await?;
 
@@ -588,45 +501,6 @@ pub async fn run(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fee_tx(payload: &[u8], ins: &[(u64, &[u8])], outs: &[u64], block_time: i64) -> kachat_names::ingest::Tx {
-        use kachat_names::ingest::{Tx, TxInput, TxOutput};
-        Tx {
-            id: [0; 32],
-            inputs: ins
-                .iter()
-                .map(|&(amount, script)| TxInput {
-                    previous_outpoint: ([0; 32], 0),
-                    signature_script: Vec::new(),
-                    spent_script: script.to_vec(),
-                    spent_amount: Some(amount),
-                })
-                .collect(),
-            outputs: outs.iter().map(|&value| TxOutput { script_public_key: Vec::new(), value, covenant: None }).collect(),
-            payload: payload.to_vec(),
-            accepting_block: [0; 32],
-            accepting_daa: 0,
-            block_time,
-        }
-    }
-
-    #[test]
-    fn fees_are_inputs_minus_outputs_per_hour_and_k_is_counted_apart() {
-        let h = 5 * HOUR_MS;
-        let mut unknown = fee_tx(b"", &[(10, b"a")], &[1], h);
-        unknown.inputs[0].spent_amount = None;
-        let txs = [
-            fee_tx(b"", &[(1000, b"a"), (500, b"a")], &[1400], h + 1),
-            fee_tx(b"kchat:1:comm:x", &[(2000, b"b")], &[1990], h + 2),
-            fee_tx(b"kchat:1:post:x", &[(100, b"b")], &[90], h + HOUR_MS),
-            fee_tx(b"", &[], &[500], h + 3), // coinbase
-            unknown,
-        ];
-        let t = FeeTotals::of(&txs);
-        assert_eq!(t.all, BTreeMap::from([(h, (110, 2)), (h + HOUR_MS, (10, 1))]));
-        assert_eq!(t.k, BTreeMap::from([(h, (10, 1)), (h + HOUR_MS, (10, 1))]));
-        assert_eq!(t.k_senders, BTreeSet::from([(h, b"b".to_vec()), (h + HOUR_MS, b"b".to_vec())]));
-    }
 
     const A: [u8; 32] = [1; 32];
     const P: [u8; 32] = [2; 32];

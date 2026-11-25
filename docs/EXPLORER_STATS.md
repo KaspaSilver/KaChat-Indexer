@@ -22,12 +22,16 @@ not yet committed there).
 > live blocks and the mempool (K's own node); price and market cap (CoinGecko, then Gate.io);
 > fees (Kaspalytics); kUSDT holdings (Trestly). From this indexer, only the K Activity counts.
 
-> **Indexer state (2026-11-25, pushed with the audit fixes):**
-> - `last30d` is gone. `/stats/activity` and `/network/fees` take `day|week|all`.
-> - Fees are counted by the profiles follower from the node's accepted transactions. No ingest
->   change; the ingest and Kaspa Quick Start's `run-ingest.sh` are back to the old flags.
-> - The trim above (dropping `/network/fees`, the hourly fee and sender tables, and
->   `activeAddresses` / `feesSompi` / `feesSince`) is not done yet.
+> **Indexer state (2026-11-25): trimmed as asked.**
+> - Served: `/stats` with `last24h`, `last7d` and `total`, plus the new `arcadeScores`, and
+>   `GET /stats/activity?period=day|week|all` with `categories`, `previous` and `series`.
+> - Gone:
+>   - `/network/fees`
+>   - the hourly fee and sender totals (no table is written)
+>   - `activeAddresses`, `feesSompi` and `feesSince`
+>   - `last30d`
+>   - `period=month` (it answers 400)
+> - The ingest and Kaspa Quick Start's `run-ingest.sh` are on the old flags.
 
 > **Status (2026-11-25): §1-§3 done in the indexer session** (not yet deployed; see the update
 > above: §2's address and fee totals and all of §3 can come out). Fees start the day

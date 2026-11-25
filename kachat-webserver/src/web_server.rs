@@ -744,9 +744,8 @@ impl WebServer {
                 .route("/chess/bots/leaderboard", get(handle_chess_bots_leaderboard))
                 // KaPlay Arcade: best checked Snake and 2048 scores (KPLAY_ARCADE_LEADERBOARD.md).
                 .route("/arcade/leaderboard", get(handle_arcade_leaderboard))
-                // K Explorer (EXPLORER_STATS.md §2-§3).
+                // K Explorer (EXPLORER_STATS.md §2).
                 .route("/stats/activity", get(handle_stats_activity))
-                .route("/network/fees", get(handle_network_fees))
                 .route("/translate", post(crate::translate::handle_translate))
                 .route(
                     "/translate/languages",
@@ -1458,30 +1457,6 @@ async fn handle_stats_activity(
     match value {
         Some(Some(value)) => Ok(Json(value)),
         _ => Err(explorer_unavailable("activity unavailable, try again shortly")),
-    }
-}
-
-/// GET /network/fees?period=day|week|month|all — every Kaspa transaction's fees, per bucket, and
-/// the average fee over the last 24 hours. 503 until the first fee is counted.
-async fn handle_network_fees(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(app_state): State<Arc<AppState>>,
-    Query(params): Query<ExplorerQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
-    check_rate_limit(&app_state, addr).await?;
-    let period = explorer_period(params.period.as_deref())?;
-    let pool = app_state.scheduled_pool.clone();
-    let value = explorer_cache("fees", period)
-        .get(STATS_TTL, "explorer fees", move |_| {
-            Box::pin(async move {
-                crate::explorer::network_fees(&pool, period, stats_now_ms()).await.map_err(|e| e.to_string())
-            })
-        })
-        .await;
-    match value {
-        Some(Some(value)) => Ok(Json(value)),
-        Some(None) => Err(explorer_unavailable("no fees counted yet")),
-        None => Err(explorer_unavailable("fees unavailable, try again shortly")),
     }
 }
 

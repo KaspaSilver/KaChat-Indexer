@@ -1,12 +1,11 @@
-//! K Explorer (EXPLORER_STATS.md §2-§3): `/stats/activity?period=` and `/network/fees?period=`.
+//! K Explorer (EXPLORER_STATS.md §2): `/stats/activity?period=`, the K Activity counts. Network
+//! fees are not served here: K reads them from Kaspalytics.
 //!
 //! Periods share one bucket layout: `day` = the last 24 hours, `week` = the last 7 UTC days, `all`
 //! = every calendar month with data (K stats show 24 hours, 7 days and all time). The last bucket
 //! is the one still filling.
 //! Counts come from the KaPosts and room tables, and from the chat indexer's hourly and monthly
-//! counts (`/stats/buckets`). Fees and senders come from the hourly totals the profiles follower
-//! keeps from the node's accepted transactions (`kachat_fee_hours`, `kachat_k_hours`,
-//! `kachat_k_senders`), so they start the day that follower first counted them.
+//! counts (`/stats/buckets`).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -216,34 +215,6 @@ pub async fn activity(
         }
     }
 
-    // Fees and senders: only once the profiles follower has created its tables. Before that,
-    // the period's counts are served without them.
-    let hour_from = layout.from.div_euclid(HOUR_MS) * HOUR_MS;
-    let fee_tables: bool = sqlx::query_scalar(
-        "SELECT to_regclass('kachat_k_hours') IS NOT NULL AND to_regclass('kachat_k_senders') IS NOT NULL",
-    )
-    .fetch_one(pool)
-    .await?;
-    let mut fees = None;
-    if fee_tables {
-        let active: i64 = sqlx::query_scalar(
-            "SELECT count(DISTINCT sender)::BIGINT FROM kachat_k_senders WHERE hour >= $1 AND hour < $2",
-        )
-        .bind(hour_from)
-        .bind(layout.to)
-        .fetch_one(pool)
-        .await?;
-        let k_fees = sqlx::query(
-            "SELECT COALESCE(sum(fees_sompi), 0)::BIGINT f, (SELECT min(hour) FROM kachat_k_hours) s \
-             FROM kachat_k_hours WHERE hour >= $1 AND hour < $2",
-        )
-        .bind(hour_from)
-        .bind(layout.to)
-        .fetch_one(pool)
-        .await?;
-        fees = Some((active, k_fees));
-    }
-
     let mut out = serde_json::json!({
         "period": period.name(),
         "from": layout.from,
@@ -254,57 +225,7 @@ pub async fn activity(
     if period != Period::All {
         out["previous"] = serde_json::json!(counts.previous);
     }
-    // Senders and fees exist from the first hour the profiles follower counted (`feesSince`).
-    if let Some((active, k_fees)) = fees
-        && let Ok(Some(since)) = k_fees.try_get::<Option<i64>, _>("s")
-    {
-        out["feesSompi"] = serde_json::json!(k_fees.get::<i64, _>("f"));
-        out["feesSince"] = serde_json::json!(since);
-        out["activeAddresses"] = serde_json::json!(active);
-    }
     Ok(out)
-}
-
-/// GET /network/fees body for one period. None until any fee has been counted; a database
-/// error is an error.
-pub async fn network_fees(pool: &sqlx::PgPool, period: Period, now: i64) -> Result<Option<serde_json::Value>, sqlx::Error> {
-    let exists: bool = sqlx::query_scalar("SELECT to_regclass('kachat_fee_hours') IS NOT NULL")
-        .fetch_one(pool)
-        .await?;
-    if !exists {
-        return Ok(None);
-    }
-    let rows = sqlx::query("SELECT hour, fees_sompi, transactions FROM kachat_fee_hours ORDER BY hour")
-        .fetch_all(pool)
-        .await?;
-    let hours: Vec<(i64, i64, i64)> =
-        rows.iter().map(|r| (r.get("hour"), r.get("fees_sompi"), r.get("transactions"))).collect();
-    let Some(since) = hours.first().map(|h| h.0) else {
-        return Ok(None);
-    };
-    let layout = Layout::new(period, now, Some(since));
-    let mut buckets: BTreeMap<i64, (i64, i64)> = layout.starts.iter().map(|&t| (t, (0, 0))).collect();
-    for &(hour, fees, txs) in &hours {
-        if let Some(b) = layout.bucket_of(hour).and_then(|t| buckets.get_mut(&t)) {
-            b.0 += fees;
-            b.1 += txs;
-        }
-    }
-    // The last 24 hourly buckets, the current one included.
-    let day_from = now.div_euclid(HOUR_MS) * HOUR_MS - 23 * HOUR_MS;
-    let (fees_24h, txs_24h) = hours
-        .iter()
-        .filter(|(hour, ..)| *hour >= day_from)
-        .fold((0i64, 0i64), |(f, t), &(_, fees, txs)| (f + fees, t + txs));
-    let mut out = serde_json::json!({
-        "period": period.name(),
-        "since": since,
-        "buckets": buckets.iter().map(|(t, (fees, txs))| serde_json::json!({ "t": t, "feesSompi": fees, "transactions": txs })).collect::<Vec<_>>(),
-    });
-    if txs_24h > 0 {
-        out["averageFeeSompi24h"] = serde_json::json!(fees_24h / txs_24h);
-    }
-    Ok(Some(out))
 }
 
 #[cfg(test)]
