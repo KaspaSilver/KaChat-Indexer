@@ -1588,7 +1588,7 @@ fn decode_bot_result(content: &str) -> Option<BotResultMessage> {
 }
 
 /// The game id is a lowercase UUID.
-fn is_game_id(g: &str) -> bool {
+pub(crate) fn is_game_id(g: &str) -> bool {
     g.len() == 36
         && g.char_indices().all(|(i, ch)| match i {
             8 | 13 | 18 | 23 => ch == '-',

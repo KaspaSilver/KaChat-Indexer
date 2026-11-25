@@ -70,9 +70,17 @@ pub fn set_broadcast_channels(list: Vec<String>) {
     }
 }
 
+/// The app's own hidden rooms, tracked whatever the room list says: KaPlay Arcade's score stamps
+/// (KPLAY_ARCADE_LEADERBOARD.md) are game records, not a chat room an operator lists. Never pruned.
+pub const APP_ROOMS: [&str; 1] = ["kplay-arcade"];
+
 /// Whether `channel` (already trimmed + lowercased by the caller) is in the effective tracked set.
 /// Not configured → the compile-time defaults; configured → exact membership (empty → nothing).
+/// `APP_ROOMS` are always in it.
 pub fn channel_is_tracked(channel: &str) -> bool {
+    if APP_ROOMS.contains(&channel) {
+        return true;
+    }
     match BROADCAST_CHANNELS_RUNTIME.read() {
         Ok(guard) => match &*guard {
             Some(list) => list.iter().any(|c| c == channel),
@@ -1374,8 +1382,7 @@ impl KProtocolProcessor {
                 && !crate::push_notify::is_edit_content(content)
                 && crate::push_notify::rings_as_media_part(&channel, &sender_address, content)
             {
-                let body = crate::push_notify::broadcast_preview(content);
-                crate::push_notify::notify_broadcast(&channel, &sender_address, body, transaction_id);
+                crate::push_notify::notify_broadcast(&channel, &sender_address, content, transaction_id);
             }
         }
         Ok(BcastOutcome::Done)
@@ -3790,6 +3797,7 @@ mod broadcast_channel_tests {
 
         // Configured empty -> index nothing (not the defaults).
         set_broadcast_channels(Vec::new());
+        assert!(channel_is_tracked("kplay-arcade"));
         assert!(!channel_is_tracked("kaspa"));
         assert!(!channel_is_tracked("my-new-room"));
 

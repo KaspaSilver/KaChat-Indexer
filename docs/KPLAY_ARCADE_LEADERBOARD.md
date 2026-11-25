@@ -4,7 +4,17 @@
 iOS session (`KaspaSilver/K-iPhone`, commit 518fdc8c; the app-side spec is K-iPhone `ARCADE.md`,
 copied below in full so this file stands on its own).
 
-> **Status:** open. Until `/arcade/leaderboard` is served, the app shows each player's own stamped
+> **Status (2026-11-24): done in the indexer session** (not yet deployed). The processor always
+> follows `#kplay-arcade`, whatever the panel's room list says, keeps its rows for good, and never
+> lists it in the public-chats stats. The webserver replays each stamp (`kachat-webserver/src/arcade.rs`;
+> the SplitMix64, Snake and 2048 test vectors all pass) and serves `/arcade/leaderboard` as in §5,
+> cached 30 s. Only the first stamp per (sender, game id) counts, in chain order, as for the chess
+> bot games. A stamp needs `type` "arcade", `v` 1, a lowercase UUID `g`, a 16-lowercase-hex
+> `seed`, a score above 0, and a replay that reaches it. Unused Snake turns after the game ends
+> are ignored. A 2048 move that changes no tile makes the stamp invalid. Kaspa Quick Start shows
+> the boards under Indexer > Arcade (KQS 4afd85a).
+>
+> Before this: until `/arcade/leaderboard` is served, the app shows each player's own stamped
 > scores only.
 
 ## What the indexer does

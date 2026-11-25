@@ -220,6 +220,8 @@ pub trait DatabaseInterface: Send + Sync {
 
     // Chess bot leaderboards: every chess-bots row (kept for good), in the same shape.
     async fn get_chess_bots_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>>;
+    // KaPlay Arcade boards: every kplay-arcade row (kept for good), in the same shape.
+    async fn get_arcade_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>>;
 
     // NEW: k_contents table - Get content by ID using unified content table
     async fn get_content_by_id(

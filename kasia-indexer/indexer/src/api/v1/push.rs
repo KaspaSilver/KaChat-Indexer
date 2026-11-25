@@ -427,6 +427,9 @@ pub struct InternalBroadcastPush {
     pub subtitle: String,
     pub body: String,
     pub tx_id: String,
+    // Room @mentions (ROOM_MENTION_PUSHES.md): the owners of the names the message @'s.
+    #[serde(default)]
+    pub mentioned_addresses: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -521,6 +524,7 @@ async fn internal_broadcast_push(
         subtitle: payload.subtitle,
         body: payload.body,
         tx_id: payload.tx_id,
+        mentioned_addresses: payload.mentioned_addresses,
     });
     (StatusCode::OK, "ok")
 }

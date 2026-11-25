@@ -53,16 +53,23 @@ fn quiet() -> bool {
 }
 
 fn post(path: &'static str, body: serde_json::Value) {
-    post_inner(path, body, None);
+    post_inner(path, body, None, Vec::new());
 }
 
 /// Like `post`, but the subtitle is the actor's .kachat name when they hold one (looked up in the
 /// spawned task, so indexing never waits), else their short address.
 fn post_with_actor(path: &'static str, body: serde_json::Value, actor_pubkey: &str) {
-    post_inner(path, body, Some(actor_pubkey.trim().to_string()));
+    post_inner(path, body, Some(actor_pubkey.trim().to_string()), Vec::new());
 }
 
-fn post_inner(path: &'static str, mut body: serde_json::Value, actor_pubkey: Option<String>) {
+/// `mention_names`: the `.kachat` names @'d in a room message; the spawned task resolves them to
+/// their owners' addresses (`mentioned_addresses`), so indexing never waits on the lookups.
+fn post_inner(
+    path: &'static str,
+    mut body: serde_json::Value,
+    actor_pubkey: Option<String>,
+    mention_names: Vec<String>,
+) {
     if !enabled() || quiet() {
         return;
     }
@@ -71,6 +78,19 @@ fn post_inner(path: &'static str, mut body: serde_json::Value, actor_pubkey: Opt
     tokio::spawn(async move {
         if let Some(actor) = actor_pubkey {
             body["subtitle"] = serde_json::Value::String(actor_display(&actor).await);
+        }
+        if !mention_names.is_empty() {
+            let sender = body["sender_address"].as_str().unwrap_or("").to_string();
+            let mut addresses: Vec<String> = Vec::new();
+            for name in &mention_names {
+                if let Some(owner) = name_owner(name).await
+                    && owner != sender
+                    && !addresses.contains(&owner)
+                {
+                    addresses.push(owner);
+                }
+            }
+            body["mentioned_addresses"] = json!(addresses);
         }
         // What the log line names: the target (kaposts) or author (new-post) by key suffix,
         // and the transaction.
@@ -278,18 +298,102 @@ pub fn rings_as_media_part(channel: &str, sender_address: &str, content: &str) -
         .first(key, std::time::Instant::now())
 }
 
-/// Notify the push service of a new broadcast in a tracked channel.
-pub fn notify_broadcast(channel: &str, sender_address: &str, body: String, tx_id: &str) {
-    post(
+/// Notify the push service of a new broadcast in a tracked channel. `content` is the message as
+/// sent: the push service also rings everyone it @'s by `.kachat` name, bell or not
+/// (docs/ROOM_MENTION_PUSHES.md), except in the hidden rooms.
+pub fn notify_broadcast(channel: &str, sender_address: &str, content: &str, tx_id: &str) {
+    let mention_names = if HIDDEN_ROOMS.contains(&channel) {
+        Vec::new()
+    } else {
+        room_mention_names(&room_message_text(content))
+    };
+    post_inner(
         "broadcast",
         json!({
             "channel": channel,
             "sender_address": sender_address,
             "subtitle": shorten_kaspa(sender_address),
-            "body": body,
+            "body": broadcast_preview(content),
             "tx_id": tx_id,
         }),
+        None,
+        mention_names,
     );
+}
+
+/// Rooms the app never lists: their messages are game records, not chat.
+const HIDDEN_ROOMS: &[&str] = &["chess-arena", "chess-bots", "kplay-arcade"];
+
+/// At most this many names @'d in one message are looked up and rung.
+const MAX_ROOM_MENTIONS: usize = 10;
+
+/// The text a room message shows: a reply's own text, nothing for a file or other envelope, else
+/// the message itself.
+fn room_message_text(content: &str) -> String {
+    let trimmed = content.trim();
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(o)) => {
+            o.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()
+        }
+        _ => content.to_string(),
+    }
+}
+
+/// The `.kachat` names @'d in a room message (ROOM_MENTION_PUSHES.md): `@alice` or
+/// `@alice.kachat`, any case, at the start or after whitespace or an opening bracket or quote; the
+/// name is the run of `a-z 0-9 -` after the `@` and must be a valid name (1-32, no hyphen at
+/// either end). Lowercased, deduped, in order, at most `MAX_ROOM_MENTIONS`.
+pub fn room_mention_names(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut names: Vec<String> = Vec::new();
+    for (i, c) in chars.iter().enumerate() {
+        if *c != '@' {
+            continue;
+        }
+        let after_boundary = i == 0
+            || chars[i - 1].is_whitespace()
+            || matches!(chars[i - 1], '(' | '[' | '{' | '<' | '"' | '\'');
+        if !after_boundary {
+            continue;
+        }
+        let name: String = chars[i + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == '-')
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let valid = (1..=32).contains(&name.len()) && !name.starts_with('-') && !name.ends_with('-');
+        if valid && !names.contains(&name) {
+            names.push(name);
+            if names.len() == MAX_ROOM_MENTIONS {
+                break;
+            }
+        }
+    }
+    names
+}
+
+/// The address a `.kachat` name resolves to (its owner, while active or in grace), from the names
+/// webserver (`KACHAT_IDENTITY_URL`). Short (2 s); any failure is no address.
+async fn name_owner(name: &str) -> Option<String> {
+    let base = identity_base_url()?;
+    let resp = CLIENT
+        .get(format!("{base}/names/{name}"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    name_owner_from(&resp.json::<serde_json::Value>().await.ok()?)
+}
+
+/// The owner of a `/names/{name}` answer while the name still resolves (active or grace).
+fn name_owner_from(answer: &serde_json::Value) -> Option<String> {
+    let resolves = answer.get("registered").and_then(|r| r.as_bool()) == Some(true)
+        && matches!(answer.get("status").and_then(|s| s.as_str()), Some("active" | "grace"));
+    let owner = answer.get("owner")?.as_str()?.trim();
+    (resolves && !owner.is_empty()).then(|| owner.to_string())
 }
 
 /// KaPosts push subtitle for an actor: their address (this network's prefix) shortened, else the
@@ -414,6 +518,39 @@ pub fn notify_kaposts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn room_mentions_follow_the_token_rules() {
+        use super::{room_mention_names, room_message_text};
+        assert_eq!(
+            room_mention_names("@Alice hi (@bob.kachat) and \"@carol-x\", [@dave] {@eve} <@frank> '@gina'"),
+            vec!["alice", "bob", "carol-x", "dave", "eve", "frank", "gina"]
+        );
+        // Not after a boundary, not a valid name, or repeated: plain text.
+        assert!(room_mention_names("mail me at a@alice.com").is_empty());
+        assert!(room_mention_names("@ @-bad @bad- @").is_empty());
+        assert!(room_mention_names(&format!("@{}", "a".repeat(33))).is_empty());
+        assert_eq!(room_mention_names(&format!("@{}", "a".repeat(32))), vec!["a".repeat(32)]);
+        assert_eq!(room_mention_names("@alice, @ALICE.kachat!"), vec!["alice"]);
+        assert_eq!(room_mention_names("hey\n@bob"), vec!["bob"]);
+        // At most ten names are rung.
+        let many: String = (0..12).map(|i| format!("@n{i} ")).collect();
+        assert_eq!(room_mention_names(&many).len(), 10);
+        // A reply's own text counts; a file's doesn't.
+        assert_eq!(room_message_text(r#"{"type":"reply","text":"@bob look","replyTo":"ab"}"#), "@bob look");
+        assert_eq!(room_message_text(r#"{"type":"file","mimeType":"image/png","content":"data:"}"#), "");
+        assert_eq!(room_message_text("@bob plain"), "@bob plain");
+    }
+
+    #[test]
+    fn a_name_rings_its_owner_while_it_resolves() {
+        use super::name_owner_from;
+        let answer = |status: &str| serde_json::json!({"registered": true, "status": status, "owner": "kaspa:qabc"});
+        assert_eq!(name_owner_from(&answer("active")).as_deref(), Some("kaspa:qabc"));
+        assert_eq!(name_owner_from(&answer("grace")).as_deref(), Some("kaspa:qabc"));
+        assert_eq!(name_owner_from(&answer("lapsed")), None);
+        assert_eq!(name_owner_from(&serde_json::json!({"registered": false, "gap": {}})), None);
+    }
+
     #[test]
     fn only_a_well_formed_media_part_has_a_note_key() {
         let part = |tag: &str, mime: &str| {

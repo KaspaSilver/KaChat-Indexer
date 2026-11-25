@@ -4,7 +4,16 @@
 (`KaspaSilver/K-iPhone`, commit 8cb4c88e, the notifications audit: every switch must hold in the
 app, in the push extension and on the server).
 
-> **Status:** open: two confirmations and one change.
+> **Status (2026-11-24): done in the indexer session** (not yet deployed).
+>
+> - **§1 confirmed:** `notify_sound` = false sends every APNs push to that device without
+>   `aps.sound`, `address_activity` and `name_event` included (`deliver()` applies it to all kinds).
+> - **§2 confirmed:** `kaposts_notify_mentions` = false skips the KaPost `mention` push (since
+>   2026-11-18, KAPOSTS_AUDIT_SERVER_SIDE.md §2).
+> - **§3 done:** `address_activity` pushes now carry `mutable-content: 1`, payload otherwise
+>   unchanged. `name_event` already had it.
+> - **§4 confirmed:** register refuses only when watched addresses, group ids, watch-only addresses
+>   and primary address are all empty.
 
 ## 1. Confirm: `notify_sound` (Settings > Notifications > Play sound)
 

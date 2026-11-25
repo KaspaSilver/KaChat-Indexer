@@ -4,7 +4,20 @@
 iOS session (`KaspaSilver/K-iPhone`, commits bdf29425 and 8cb4c88e; K-iPhone `MESSAGING.md`,
 "Mentions").
 
-> **Status:** open.
+> **Status (2026-11-24): done in the indexer session** (not yet deployed).
+>
+> - The processor finds the @tokens in a room message's text (a reply's own text; nothing in a
+>   file), by the rules below, at most 10 names per message. Not in `chess-arena`, `chess-bots` or
+>   `kplay-arcade`, and not for edits, reactions, late retries or a media part after the first.
+> - Each name is looked up on the names webserver (`/names/{name}`, owner while active or in
+>   grace); unregistered names and the sender's own address are dropped. The lookups run in the
+>   background push task, so indexing never waits.
+> - The push service rings every device whose `primary_address` is a mentioned owner, bell or not,
+>   with the room push plus `mention: true` and `sender` (APNs payload and FCM data). The sender's
+>   own devices are skipped.
+> - Hidden senders: a device that hid the sender in **any** room's list gets no mention push, so
+>   the list as K sends it today is enough.
+> - A device that would also get the ordinary room push gets only the mention one.
 
 ## Why
 

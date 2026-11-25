@@ -1035,6 +1035,42 @@ impl PushRegistry {
         Ok(tokens)
     }
 
+    /// Room @mentions (ROOM_MENTION_PUSHES.md): the devices registered under one of the
+    /// `addresses` (their primary address), whatever their bells, minus the sender's own and any
+    /// device that hid the sender in any room.
+    pub fn tokens_for_room_mention(
+        &self,
+        addresses: &[String],
+        sender_address: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rtx = self.tx_keyspace.read_tx();
+        let mut tokens = Vec::new();
+        for entry in self.device_partition.iter_values_rtx(&rtx) {
+            let value = entry?;
+            let Ok(reg) = serde_json::from_slice::<DeviceRegistration>(value.as_ref()) else {
+                continue;
+            };
+            let Some(primary) = reg.primary_address.as_deref() else {
+                continue;
+            };
+            if primary == sender_address || !addresses.iter().any(|a| a == primary) {
+                continue;
+            }
+            if reg
+                .hidden_broadcast_senders
+                .values()
+                .any(|hidden| hidden.iter().any(|a| a == sender_address))
+            {
+                continue;
+            }
+            tokens.push(reg.device_token);
+        }
+        Ok(tokens)
+    }
+
     /// KaChat fork: devices to push a KaPosts action to — those registered with `target_pubkey`,
     /// skipping any device registered as the actor (no self-pings).
     pub fn tokens_for_kaposts(
@@ -1704,6 +1740,11 @@ enum PushRegistryCommand {
         sender_address: String,
         response: RegistryResponse<Vec<String>>,
     },
+    MatchRoomMentionTokens {
+        addresses: Vec<String>,
+        sender_address: String,
+        response: RegistryResponse<Vec<String>>,
+    },
     MatchKaPostsTokens {
         target_pubkey: String,
         actor_pubkey: String,
@@ -1953,6 +1994,14 @@ impl PushRegistryActor {
                     response,
                 } => {
                     let result = self.registry.tokens_for_broadcast(&channel, &sender_address);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::MatchRoomMentionTokens {
+                    addresses,
+                    sender_address,
+                    response,
+                } => {
+                    let result = self.registry.tokens_for_room_mention(&addresses, &sender_address);
                     let _ = response.send(result);
                 }
                 PushRegistryCommand::MatchKaPostsTokens {
@@ -2240,6 +2289,19 @@ impl PushRegistryHandle {
     ) -> anyhow::Result<Vec<String>> {
         self.request(|response| PushRegistryCommand::MatchBroadcastTokens {
             channel,
+            sender_address,
+            response,
+        })
+        .await
+    }
+
+    pub async fn matching_tokens_for_room_mention(
+        &self,
+        addresses: Vec<String>,
+        sender_address: String,
+    ) -> anyhow::Result<Vec<String>> {
+        self.request(|response| PushRegistryCommand::MatchRoomMentionTokens {
+            addresses,
             sender_address,
             response,
         })
@@ -2747,47 +2809,33 @@ impl PushDispatcher {
                 subtitle,
                 body,
                 tx_id,
+                mentioned_addresses,
             } => {
                 let mut tokens = self
                     .registry
-                    .matching_tokens_for_broadcast(channel.clone(), sender_address)
+                    .matching_tokens_for_broadcast(channel.clone(), sender_address.clone())
                     .await?;
+                // Everyone @'d by name gets this push, bell or not (ROOM_MENTION_PUSHES.md), and
+                // a device that gets the mention one doesn't also get the ordinary one.
+                let mut mention_tokens = self
+                    .registry
+                    .matching_tokens_for_room_mention(mentioned_addresses, sender_address.clone())
+                    .await?;
+                mention_tokens.sort_unstable();
+                mention_tokens.dedup();
+                mention_tokens.truncate(MAX_PUSH_FANOUT);
                 tokens.sort_unstable();
                 tokens.dedup();
-                if tokens.is_empty() {
-                    return Ok(());
+                tokens.retain(|t| mention_tokens.binary_search(t).is_err());
+                tokens.truncate(MAX_PUSH_FANOUT);
+                for (tokens, mention) in [(tokens, false), (mention_tokens, true)] {
+                    if tokens.is_empty() {
+                        continue;
+                    }
+                    let (payload, data) =
+                        broadcast_push(&channel, &subtitle, &body, &tx_id, mention.then_some(sender_address.as_str()));
+                    self.deliver(tokens, &payload, &data, Some(&tx_id), true).await;
                 }
-                if tokens.len() > MAX_PUSH_FANOUT {
-                    tokens.truncate(MAX_PUSH_FANOUT);
-                }
-                let payload = ExtensionPayload {
-                    aps: ExtensionAps {
-                        alert: ExtensionAlert {
-                            title: format!("#{channel}"),
-                            subtitle: Some(subtitle.clone()),
-                            body: body.clone(),
-                        },
-                        sound: "default",
-                        thread_id: format!("broadcast:{channel}"),
-                        // Required: the app's notification-service extension only runs with
-                        // mutable-content:1, and it's what tidies the body (reply text, base64,
-                        // truncated envelopes). Without it the extension never fires.
-                        mutable_content: Some(1),
-                    },
-                    post_id: None,
-                    kaposts_kind: None,
-                    actor_pubkey: None,
-                };
-                // FCM data-only mirror (Android builds the notification from these fields).
-                let mut data = BTreeMap::new();
-                data.insert("type".to_string(), "broadcast".to_string());
-                data.insert("channel".to_string(), channel.clone());
-                data.insert("title".to_string(), format!("#{channel}"));
-                data.insert("subtitle".to_string(), subtitle);
-                data.insert("body".to_string(), body);
-                data.insert("thread_id".to_string(), format!("broadcast:{channel}"));
-                data.insert("tx_id".to_string(), tx_id.clone());
-                self.deliver(tokens, &payload, &data, Some(&tx_id), true).await;
                 Ok(())
             }
             ExtensionPushEvent::KaPosts {
@@ -2852,6 +2900,8 @@ impl PushDispatcher {
                     post_id: post_id.clone(),
                     kaposts_kind: kaposts_kind.clone(),
                     actor_pubkey: Some(actor_key.clone()),
+                    mention: None,
+                    sender: None,
                 };
                 let mut data = BTreeMap::new();
                 data.insert("type".to_string(), "kaposts".to_string());
@@ -2914,6 +2964,8 @@ impl PushDispatcher {
                     post_id: Some(post_id.clone()),
                     kaposts_kind: Some("post".to_string()),
                     actor_pubkey: Some(author_key.clone()),
+                    mention: None,
+                    sender: None,
                 };
                 let mut data = BTreeMap::new();
                 data.insert("type".to_string(), "kaposts".to_string());
@@ -3120,11 +3172,15 @@ impl PushDispatcher {
                     },
                     sound: "default",
                     thread_id: thread_id.clone(),
-                    mutable_content: None,
+                    // K's extension records the receive and applies the device's switches
+                    // (K_NOTIFICATION_SWITCHES.md §3).
+                    mutable_content: Some(1),
                 },
                 post_id: None,
                 kaposts_kind: None,
                 actor_pubkey: None,
+                mention: None,
+                sender: None,
             };
             let mut data = BTreeMap::new();
             data.insert("type".to_string(), "address_activity".to_string());
@@ -3770,6 +3826,12 @@ struct ExtensionPayload {
     // owner blocked (KAPOSTS_AUDIT_SERVER_SIDE.md §3b). Omitted for other pushes.
     #[serde(skip_serializing_if = "Option::is_none")]
     actor_pubkey: Option<String>,
+    // Room @mentions (ROOM_MENTION_PUSHES.md): `mention: true` and the sender's address, so K's
+    // extension lets the push through with the room's bell off. Omitted for other pushes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mention: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4802,6 +4864,51 @@ fn normalize_kaposts_blocked(
         }
     }
     out
+}
+
+/// A room push: the APNs payload and its FCM data mirror (Android builds the notification from
+/// these fields). `mention_sender`: a room @mention, which carries `mention: true` and the
+/// sender's address (ROOM_MENTION_PUSHES.md).
+fn broadcast_push(
+    channel: &str,
+    subtitle: &str,
+    body: &str,
+    tx_id: &str,
+    mention_sender: Option<&str>,
+) -> (ExtensionPayload, BTreeMap<String, String>) {
+    let payload = ExtensionPayload {
+        aps: ExtensionAps {
+            alert: ExtensionAlert {
+                title: format!("#{channel}"),
+                subtitle: Some(subtitle.to_string()),
+                body: body.to_string(),
+            },
+            sound: "default",
+            thread_id: format!("broadcast:{channel}"),
+            // Required: the app's notification-service extension only runs with
+            // mutable-content:1, and it's what tidies the body (reply text, base64,
+            // truncated envelopes). Without it the extension never fires.
+            mutable_content: Some(1),
+        },
+        post_id: None,
+        kaposts_kind: None,
+        actor_pubkey: None,
+        mention: mention_sender.map(|_| true),
+        sender: mention_sender.map(str::to_string),
+    };
+    let mut data = BTreeMap::new();
+    data.insert("type".to_string(), "broadcast".to_string());
+    data.insert("channel".to_string(), channel.to_string());
+    data.insert("title".to_string(), format!("#{channel}"));
+    data.insert("subtitle".to_string(), subtitle.to_string());
+    data.insert("body".to_string(), body.to_string());
+    data.insert("thread_id".to_string(), format!("broadcast:{channel}"));
+    data.insert("tx_id".to_string(), tx_id.to_string());
+    if let Some(sender) = mention_sender {
+        data.insert("mention".to_string(), "true".to_string());
+        data.insert("sender".to_string(), sender.to_string());
+    }
+    (payload, data)
 }
 
 /// An APNs payload without `aps.sound`, for a device with sound off.
@@ -5905,6 +6012,62 @@ mod kaposts_watch_tests {
 
         drop(handle);
         actor_thread.join().expect("actor exits cleanly");
+    }
+
+    #[test]
+    fn a_room_mention_rings_the_names_owner_whatever_the_bell() {
+        use super::broadcast_push;
+        let db_dir = tempfile::tempdir().expect("temporary database directory");
+        let tx_keyspace = fjall::Config::new(db_dir.path())
+            .open_transactional()
+            .expect("transactional keyspace");
+        let mut registry = PushRegistry::new(
+            tx_keyspace.clone(),
+            DeviceRegistrationPartition::new(&tx_keyspace).expect("device partition"),
+            WatchedAddressPartition::new(&tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(&tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(&tx_keyspace).expect("primary partition"),
+            create_shared_metrics(),
+        );
+        let addr = |b: u8| Address::new(Prefix::Mainnet, Version::PubKey, &[b; 32]).to_string();
+        let (bob, carol, sender) = (addr(1), addr(2), addr(3));
+        let mut register = |token: String, primary: &str, hidden: &[(&str, &str)]| {
+            let hidden = hidden
+                .iter()
+                .map(|(room, who)| (room.to_string(), vec![who.to_string()]))
+                .collect();
+            registry
+                .register(
+                    token, "ios".to_string(), vec![], vec![], vec![], Some(primary.to_string()),
+                    vec![], vec![], hidden, None, None, vec![], vec![], None, None, None, None,
+                    None, Default::default(), None, None,
+                )
+                .expect("registered");
+        };
+        // Bob's phone, bell off everywhere; Bob's tablet hid the sender in another room; Carol
+        // isn't @'d; the sender's own phone.
+        register("aa".repeat(32), &bob, &[]);
+        register("bb".repeat(32), &bob, &[("kaspa-english", sender.as_str())]);
+        register("cc".repeat(32), &carol, &[]);
+        register("dd".repeat(32), &sender, &[]);
+        let rung = registry.tokens_for_room_mention(&[bob.clone(), sender.clone()], &sender).unwrap();
+        assert_eq!(rung, vec!["aa".repeat(32)]);
+        assert!(registry.tokens_for_room_mention(&[], &sender).unwrap().is_empty());
+
+        let (payload, data) = broadcast_push("general", "kaspa:qq…xx", "@bob hi", "ab", Some(&sender));
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["mention"], true);
+        assert_eq!(json["sender"], sender.as_str());
+        assert_eq!(json["aps"]["thread-id"], "broadcast:general");
+        assert_eq!(json["aps"]["mutable-content"], 1);
+        assert_eq!(data["mention"], "true");
+        assert_eq!(data["sender"], sender);
+        assert_eq!(data["type"], "broadcast");
+        // The ordinary room push carries neither.
+        let (payload, data) = broadcast_push("general", "kaspa:qq…xx", "hi", "ab", None);
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json.get("mention").is_none() && json.get("sender").is_none());
+        assert!(!data.contains_key("mention"));
     }
 
     #[test]

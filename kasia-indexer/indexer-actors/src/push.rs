@@ -24,6 +24,8 @@ pub enum ExtensionPushEvent {
         body: String,
         /// Hex tx id — APNs collapse-id (retry dedupe).
         tx_id: String,
+        /// The owners of the `.kachat` names the message @'s: rung whatever their bells.
+        mentioned_addresses: Vec<String>,
     },
     KaPosts {
         /// Registered `kaposts_pubkey` whose content was acted on.

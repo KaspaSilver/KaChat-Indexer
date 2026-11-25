@@ -2814,6 +2814,10 @@ impl DatabaseInterface for PostgresDbManager {
         self.chess_channel_rows(crate::chess::BOTS_CHANNEL).await
     }
 
+    async fn get_arcade_rows(&self) -> DatabaseResult<Vec<(String, String, i64, String)>> {
+        self.chess_channel_rows(crate::arcade::ARCADE_CHANNEL).await
+    }
+
     async fn get_content_by_id(
         &self,
         content_id: &str,

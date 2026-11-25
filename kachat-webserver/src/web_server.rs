@@ -55,6 +55,8 @@ pub struct AppState {
     pub chess_cache: Arc<RwLock<ChessCache>>,
     /// Chess bot leaderboards: the chess-bots replay, cached the same way.
     pub chess_bots_cache: Arc<RwLock<ChessBotsCache>>,
+    /// KaPlay Arcade boards: the kplay-arcade replay, cached the same way.
+    pub arcade_cache: Arc<RwLock<ArcadeCache>>,
     /// §5.10: direct pool handle for the scheduled-posts store (raw SQL).
     pub scheduled_pool: sqlx::PgPool,
     /// .kachat names registry module (testnet). Off unless KACHAT_NAMES_MANIFEST is set.
@@ -98,6 +100,38 @@ impl ChessBotsSnapshot {
             _ => (self.bots, self.since, "all"),
         }
     }
+}
+
+/// Cached result of one kplay-arcade replay (arcade::compute), both games and periods.
+#[derive(Default)]
+pub struct ArcadeCache {
+    computed_at: Option<Instant>,
+    snapshot: crate::arcade::ArcadeSnapshot,
+}
+
+/// Serve the arcade boards from cache, replaying the kplay-arcade rows when stale.
+async fn arcade_snapshot(state: &AppState) -> crate::arcade::ArcadeSnapshot {
+    {
+        let cache = state.arcade_cache.read().await;
+        if cache.computed_at.is_some_and(|at| at.elapsed() < CHESS_CACHE_TTL) {
+            return cache.snapshot.clone();
+        }
+    }
+    let rows = state.db.get_arcade_rows().await.unwrap_or_default();
+    let rows: Vec<crate::chess::ArenaRow> = rows
+        .into_iter()
+        .map(|(tx_id, sender, block_time, content)| crate::chess::ArenaRow {
+            tx_id,
+            sender,
+            block_time,
+            content,
+        })
+        .collect();
+    let snapshot = crate::arcade::compute(rows, now_ms());
+    let mut cache = state.arcade_cache.write().await;
+    cache.computed_at = Some(Instant::now());
+    cache.snapshot = snapshot.clone();
+    snapshot
 }
 
 /// Serve the bot boards from cache, replaying the chess-bots rows when stale.
@@ -530,6 +564,7 @@ impl WebServer {
             translate_rate_limit_map,
             chess_cache: Arc::new(RwLock::new(ChessCache::default())),
             chess_bots_cache: Arc::new(RwLock::new(ChessBotsCache::default())),
+            arcade_cache: Arc::new(RwLock::new(ArcadeCache::default())),
             scheduled_pool,
             names: crate::names::NamesState::from_env(),
         });
@@ -684,6 +719,8 @@ impl WebServer {
                 .route("/chess/tournaments", get(handle_chess_tournaments))
                 // KaPlay bot games: fewest moves to beat each bot (CHESS_BOT_LEADERBOARD.md).
                 .route("/chess/bots/leaderboard", get(handle_chess_bots_leaderboard))
+                // KaPlay Arcade: best checked Snake and 2048 scores (KPLAY_ARCADE_LEADERBOARD.md).
+                .route("/arcade/leaderboard", get(handle_arcade_leaderboard))
                 .route("/translate", post(crate::translate::handle_translate))
                 .route(
                     "/translate/languages",
@@ -1256,7 +1293,7 @@ async fn build_kachat_stats(app_state: &Arc<AppState>) -> serde_json::Value {
 
     let public_chats = stats_count3(pool,
         "SELECT count(*) t, count(*) FILTER (WHERE block_time > $1) d1, count(*) FILTER (WHERE block_time > $2) d7 \
-         FROM kachat_broadcasts WHERE channel NOT IN ('chess-arena', 'chess-bots')", d1, d7).await;
+         FROM kachat_broadcasts WHERE channel NOT IN ('chess-arena', 'chess-bots', 'kplay-arcade')", d1, d7).await;
     let (k, v) = cat("publicChats", public_chats); categories.insert(k, v);
 
     let chess_moves = stats_count3(pool,
@@ -2328,6 +2365,43 @@ async fn handle_chess_bots_leaderboard(
         generated_at: now_ms(),
         bots,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ArcadeLeaderboardQuery {
+    game: Option<String>,
+    period: Option<String>,
+    limit: Option<u32>,
+}
+
+/// GET /arcade/leaderboard?game=snake|2048&period=month|all&limit=100 — each address's best
+/// checked score, highest first.
+async fn handle_arcade_leaderboard(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<ArcadeLeaderboardQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    check_rate_limit(&app_state, addr).await?;
+    let snapshot = arcade_snapshot(&app_state).await;
+    let Some((board, game, period)) = snapshot.board(params.game.as_deref().unwrap_or(""), params.period.as_deref())
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "game must be snake or 2048".to_string(),
+                code: "INVALID_GAME".to_string(),
+            }),
+        ));
+    };
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000) as usize;
+    let players: Vec<_> = board.players.into_iter().take(limit).collect();
+    Ok(Json(serde_json::json!({
+        "game": game,
+        "period": period,
+        "since": board.since,
+        "games": board.games,
+        "players": players,
+    })))
 }
 
 /// GET /chess/player?address=&period=month|all — one player's leaderboard row (zeroed if they

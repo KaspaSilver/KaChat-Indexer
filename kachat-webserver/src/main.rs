@@ -1,3 +1,4 @@
+mod arcade;
 mod chess;
 mod api_handlers;
 mod config;
