@@ -4,13 +4,33 @@
 K iOS session (`KaspaSilver/K-iPhone`, `KaChat/Views/Explorer/ExplorerAPI.swift`, `ExplorerKStats`;
 not yet committed there).
 
-> **Update (2026-11-25, owner):** K stats need only **24 hours, 7 days and all time**.
-> - `/stats` serves `last24h`, `last7d` and `total`; `last30d` is gone.
-> - `/stats/activity` and `/network/fees` take `period=day|week|all`. `month` now answers 400.
-> - **K must stop asking for `month`.** The app falls back to `/stats` for the session when any
->   period answers non-2xx, so drop the 30 Days option.
+> **Update (2026-11-25, later): K needs much less from this. Please trim before deploying.**
+> The owner's goal: the indexer tracks only what nobody else can serve, and K uses outside sources
+> for the rest. K now gets network fee history from Kaspalytics (kaspalytics.com's daily total and
+> average fee per transaction since 2023-10), so:
+> - **§3 `/network/fees` is not needed.** Drop the endpoint, the `kachat_fee_hours` table and its
+>   trigger, and the ingest changes that keep input and output amounts (back to the old ingest
+>   flags), including the change to Kaspa Quick Start's `kachat/run-ingest.sh`. K never reads it.
+> - **§2 without `activeAddresses`, `feesSompi` and `feesSince`.** Drop the hourly totals behind
+>   them. Keep `categories`, `previous` and `series` (counts from tables the indexer already has).
+> - **§1: no `last30d`** (the card is 24 Hours, 7 Days, All Time) and **no new categories to
+>   index**: leave out `paymentNotices`, `kusdtTransfers`, `kusdtSwaps` and `kachatNames`. Keep
+>   `arcadeScores` (it counts a room already followed). K still maps any of them if served.
 >
-> **Status (2026-11-25): §1-§3 done in the indexer session** (not yet deployed). Fees start the day
+> What the Explorer takes from elsewhere, so the indexer never needs to: blocks, transactions,
+> addresses, balances, hashrate, supply, block reward, the fee estimate (kaspa.stream's REST API);
+> live blocks and the mempool (K's own node); price and market cap (CoinGecko, then Gate.io);
+> fees (Kaspalytics); kUSDT holdings (Trestly). From this indexer, only the K Activity counts.
+
+> **Indexer state (2026-11-25, pushed with the audit fixes):**
+> - `last30d` is gone. `/stats/activity` and `/network/fees` take `day|week|all`.
+> - Fees are counted by the profiles follower from the node's accepted transactions. No ingest
+>   change; the ingest and Kaspa Quick Start's `run-ingest.sh` are back to the old flags.
+> - The trim above (dropping `/network/fees`, the hourly fee and sender tables, and
+>   `activeAddresses` / `feesSompi` / `feesSince`) is not done yet.
+
+> **Status (2026-11-25): §1-§3 done in the indexer session** (not yet deployed; see the update
+> above: §2's address and fee totals and all of §3 can come out). Fees start the day
 > the new ingest settings go live: there is no fee history before that.
 > - §1: every `/stats` category has `last30d`, and a new category `arcadeScores` counts
 >   `#kplay-arcade` stamps. Not served:
@@ -25,38 +45,32 @@ not yet committed there).
 >     (ms), the first hour they cover.
 > - §3: `GET /network/fees?period=` as specified, plus `since`. It answers 503 until the first
 >   fee is counted.
->   - The profiles follower, which already reads every accepted transaction from the node with
->     each input's spent amount, adds each fee (inputs minus outputs) to `kachat_fee_hours`.
->     It also adds K's fees and senders to `kachat_k_hours` / `kachat_k_senders`. All three are
->     kept for good.
->   - The hourly totals are written in the same commit as the follower's checkpoint, so a batch
->     is never counted twice.
->   - Coinbase and transactions with an unknown input amount are left out. Only accepted
->     transactions count.
->   - A reorg that removes already-counted chain blocks leaves their fees counted (rare: the
->     follower waits for confirmations).
->   - No ingest change is needed. A first version used the ingest's input amounts, which its
->     block path never fills; that was reverted.
+>   - The ingest now keeps input amounts (resolved by simply-kaspa) and output amounts. Rows
+>     still last one hour.
+>   - The `transactions` insert trigger adds each transaction's fee (inputs minus outputs) to
+>     `kachat_fee_hours`, kept for good.
+>   - Coinbase (no inputs) and transactions with an unresolved input are left out.
+>   - Acceptance isn't tracked, so a rare rejected double-spend still counts.
+>   - **Kaspa Quick Start mounts its own `kachat/run-ingest.sh`**, which needs the same two flag
+>     changes before fees are counted.
 
 ## Why
 
 K now has its own block explorer (Kaspa Hub > Explorer). Its data comes from kaspa.stream's REST
 API and K's own node, except two things neither has, which come from this indexer:
 
-1. **K Activity**: how many transactions K's protocols made in the last 24 hours, 7 days, 30 days
-   and all time, by protocol, with the window before for a "+8.9%" change, a bar per hour / day /
+1. **K Activity**: how many transactions K's protocols made in the last 24 hours, 7 days and all
+   time (owner, 2026-11-25: no 30 days), by protocol, with the window before for a "+8.9%" change, a bar per hour / day /
    month, the addresses that sent them and the fees they paid.
-2. **Network fees**: the average fee one Kaspa transaction paid over the last 24 hours, and total
-   fees per hour, day or month.
+2. ~~**Network fees**~~: since dropped, K reads them from Kaspalytics.
 
 The app already reads `/stats` (24h, 7d, all time) and shows what's there. Everything below is
 read the moment it's served: **no app update needed**. Until then the card leaves the missing
-parts off (no 30 Days, no bars, no change line, no footer) and the fee tile says "demo".
+parts off (no bars, no change line).
 
-## 1. `/stats`: add `last30d`
+## 1. `/stats`: new categories
 
-Each category gains `last30d`, like `last24h` and `last7d`. With it the card offers 30 Days even
-before section 2 exists.
+`last24h`, `last7d` and `total` are all the card needs (no `last30d`).
 
 New categories the card maps (send them when you can count them):
 
@@ -72,9 +86,9 @@ Already mapped: `messages` + `groupMessages` (KaChat Messages), `handshakes`, `p
 `kaposts` + `kapostActions` (KaPosts), `publicChats`, `chessMoves`. `selfStash` and `groupUpdates`
 are left off the card on purpose (machinery).
 
-## 2. `GET /stats/activity?period=day|week|month|all`
+## 2. `GET /stats/activity?period=day|week|all`
 
-One period, complete. The app asks for all four; if any answers non-2xx it falls back to `/stats`
+One period, complete. The app asks for all three; if any answers non-2xx it falls back to `/stats`
 for the session.
 
 ```json
@@ -84,21 +98,18 @@ for the session.
   "to": 1795615628000,
   "categories": { "messages": 3038, "groupMessages": 53, "kaposts": 59, "publicChats": 169 },
   "previous":   { "messages": 2911, "groupMessages": 61, "kaposts": 48, "publicChats": 140 },
-  "series": [ { "t": 1795532400000, "count": 131 } ],
-  "activeAddresses": 812,
-  "feesSompi": 2418000000
+  "series": [ { "t": 1795532400000, "count": 131 } ]
 }
 ```
 
 - `categories`: the same keys as `/stats`, counts inside `[from, to)`.
 - `previous`: the same counts for the window just before (`[from - length, from)`). Omit for `all`.
-- `series`: oldest first. `day`: 24 hourly buckets. `week`: 7 daily. `month`: 30 daily. `all`: one
-  per calendar month since `indexedSince`. `t` is the bucket's start (ms, UTC); the last bucket is
+- `series`: oldest first. `day`: 24 hourly buckets. `week`: 7 daily. `all`: one per calendar month
+  since `indexedSince`. `t` is the bucket's start (ms, UTC); the last bucket is
   the one still filling.
-- `activeAddresses`: distinct sender addresses of the counted transactions in the window.
-- `feesSompi`: total network fees those transactions paid in the window.
+- ~~`activeAddresses`~~ and ~~`feesSompi`~~: not needed (see the update at the top).
 
-## 3. `GET /network/fees?period=day|week|month|all`
+## 3. `GET /network/fees?period=day|week|month|all` (not needed: see the update at the top)
 
 Every accepted Kaspa transaction, not just K's, coinbase excluded. The fee is inputs minus
 outputs; the indexer database this runs beside already has both.
@@ -113,8 +124,8 @@ outputs; the indexer database this runs beside already has both.
 
 - `averageFeeSompi24h`: total fees over the last 24 hours divided by the transactions in them. The
   app reads it from the `day` answer (it may be in every answer).
-- `buckets`: oldest first, the same layout as `series` above (hourly for `day`, daily for `week` and
-  `month`, monthly for `all`).
+- `buckets`: oldest first: hourly for `day`, daily for `week` and `month` (the fees chart keeps 30
+  days), monthly for `all`.
 - Keeping hourly buckets for 30 days and a monthly rollup forever is enough.
 
 Add a Status note here with the commit when done.

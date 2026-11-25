@@ -5,8 +5,10 @@ without the chat history. Last updated 2026-10-02 after `a2438df` on `KaspaSilve
 
 > **Open from the K iOS app (2026-11-25):** `RECEIVED_PUSH_COINBASE.md` (a miner gets one
 > `address_activity` push per merging block's coinbase for one block found: push coinbase on
-> acceptance only). Also `EXPLORER_STATS.md` (K Explorer: `last30d` on `/stats`,
-> `/stats/activity?period=` and `/network/fees?period=`; the app reads them as soon as they're served).
+> acceptance only). Also `EXPLORER_STATS.md` (K Explorer: only the K Activity counts,
+> `/stats` and `/stats/activity?period=` with `categories`, `previous`, `series`. Trim before
+> deploying: K gets fees from Kaspalytics, so `/network/fees`, the fee ingest changes, `last30d`,
+> `activeAddresses` and `feesSompi` aren't needed).
 > Also `REPORT_BUGS_ROOM.md` (track the new default room
 > `report-bugs`, which replaces `kachat-bugs` in K; add it to `broadcast_channels` in the panel now).
 
