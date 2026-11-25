@@ -132,10 +132,15 @@ async fn get_payments_by_sender(
         state
             .payment_by_sender_partition
             .get_by_sender_from_block_time(&rtx, &sender, cursor)
-            .process_results(|iter| iter.filter(|payment| seen_tx_ids.insert(payment.tx_id)).take(limit).map(|key| {
+            .process_results(|iter| iter.filter(|payment| seen_tx_ids.insert(payment.tx_id)).map(|key| -> anyhow::Result<Option<PaymentResponse>> {
+                // A row whose payload is gone is skipped, not a 500 for the whole page. Skipped
+                // before take(limit), so the page still fills.
                 let payment_data = match state.tx_id_to_payment_partition.get_rtx(&rtx, &key.tx_id) {
                     Ok(Some(data)) => data,
-                    Ok(None) => bail!("Payment data inconsistency: tx_id {} found in payment_by_sender but not in tx_id_to_payment", faster_hex::hex_string(&key.tx_id)),
+                    Ok(None) => {
+                        tracing::debug!(tx_id = %faster_hex::hex_string(&key.tx_id), "payments by-sender: skipping a row whose payload is missing");
+                        return Ok(None);
+                    }
                     Err(e) => bail!("Failed to get payment data: {}", e),
                 };
 
@@ -158,7 +163,7 @@ async fn get_payments_by_sender(
                     Err(e) => bail!("Failed to convert receiver address: {}", e),
                 };
 
-                Ok(PaymentResponse {
+                Ok(Some(PaymentResponse {
                     tx_id: faster_hex::hex_string(&key.tx_id),
                     sender: Some(address_clone.clone()),
                     receiver: receiver_address,
@@ -167,8 +172,8 @@ async fn get_payments_by_sender(
                     message: sealed_message(payment_data.sealed_hex()),
                     accepting_block,
                     accepting_daa_score,
-                })
-            }).collect::<Result<Vec<_>, _>>()
+                }))
+            }).filter_map(Result::transpose).take(limit).collect::<Result<Vec<_>, _>>()
         ).flatten()
     }).await;
     metrics.increment_db_read_ops_total(1);
@@ -246,11 +251,15 @@ async fn get_payments_by_receiver(
         state
             .payment_by_receiver_partition
             .get_by_receiver_from_block_time(&rtx, &receiver, cursor)
-            .process_results(|iter| iter.filter(|payment| seen_tx_ids.insert(payment.0.tx_id)).take(limit).map(|(key, sender_payload)| {
-
+            .process_results(|iter| iter.filter(|payment| seen_tx_ids.insert(payment.0.tx_id)).map(|(key, sender_payload)| -> anyhow::Result<Option<PaymentResponse>> {
+                // A row whose payload is gone is skipped, not a 500 for the whole page. Skipped
+                // before take(limit), so the page still fills.
                 let payment_data = match state.tx_id_to_payment_partition.get_rtx(&rtx, &key.tx_id) {
                     Ok(Some(data)) => data,
-                    Ok(None) => bail!("Payment data inconsistency: tx_id {} found in payment_by_receiver but not in tx_id_to_payment", faster_hex::hex_string(&key.tx_id)),
+                    Ok(None) => {
+                        tracing::debug!(tx_id = %faster_hex::hex_string(&key.tx_id), "payments by-receiver: skipping a row whose payload is missing");
+                        return Ok(None);
+                    }
                     Err(e) => bail!("Failed to get payment data: {}", e),
                 };
 
@@ -278,7 +287,7 @@ async fn get_payments_by_receiver(
                     Err(e) => bail!("Failed to convert receiver address: {}", e),
                 };
 
-                Ok(PaymentResponse {
+                Ok(Some(PaymentResponse {
                     tx_id: faster_hex::hex_string(&key.tx_id),
                     sender: sender_address,
                     receiver: receiver_address,
@@ -287,8 +296,8 @@ async fn get_payments_by_receiver(
                     message: sealed_message(payment_data.sealed_hex()),
                     accepting_block,
                     accepting_daa_score,
-                })
-            }).collect::<Result<Vec<_>, _>>()
+                }))
+            }).filter_map(Result::transpose).take(limit).collect::<Result<Vec<_>, _>>()
         ).flatten()
     }).await;
     metrics.increment_db_read_ops_total(1);

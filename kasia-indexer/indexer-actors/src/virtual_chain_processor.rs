@@ -30,12 +30,15 @@ use indexer_db::messages::self_stash::{
 };
 use indexer_db::metadata::{Cursor as DbCursor, MetadataPartition};
 use indexer_db::processing::accepting_block_to_txs::AcceptingBlockToTxIDPartition;
+use indexer_db::processing::alt_receiver::TxAltReceiverPartition;
+use indexer_db::processing::output0_owner::TxOutput0OwnerPartition;
 use indexer_db::processing::pending_senders::{
     PendingResolutionKey, PendingSenderResolutionPartition,
 };
 use indexer_db::processing::tx_id_to_acceptance::{
     AcceptanceKey, Action, LookupOutput, TxIDToAcceptancePartition,
 };
+use indexer_db::processing::watched_outpoints::{WatchedOutpointKey, WatchedOutpointPartition};
 use indexer_db::{AddressPayload, IntoBytes, PartitionId, TryFromBytes};
 use kaspa_consensus_core::BlueWorkType;
 use kaspa_rpc_core::{
@@ -44,7 +47,8 @@ use kaspa_rpc_core::{
 };
 pub use message::*;
 use protocol::operation::{SealedOperation, deserializer::parse_sealed_operation};
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 use tracing::{debug, error, info, info_span, trace, warn};
 use workflow_core::channel::Sender;
@@ -87,10 +91,20 @@ pub struct VirtualProcessor {
     group_control_by_recipient_partition: GroupControlByRecipientPartition,
     tx_id_to_group_control_partition: TxIdToGroupControlPartition,
 
+    /// Where a record filed under its own sender (change at output 0) moves on resolution.
+    tx_alt_receiver_partition: TxAltReceiverPartition,
+    tx_output0_owner_partition: TxOutput0OwnerPartition,
+    /// Watched outputs of accepted coinbases (the block processor holds them until then).
+    watched_outpoint_partition: WatchedOutpointPartition,
+
     runtime: tokio::runtime::Handle,
     push_tx: Option<flume::Sender<PushEvent>>,
     /// "Received" pushes for coinbases held by the block processor until accepted.
     push_funds_tx: Option<flume::Sender<FundsPushEvent>>,
+    /// Coinbases taken from the held set by the write transaction being built. Kept until it
+    /// commits: a conflict retries the transaction, which must find them again.
+    #[builder(default)]
+    taken_coinbase: RefCell<HashMap<[u8; 32], crate::HeldCoinbase>>,
 }
 
 struct State {
@@ -577,6 +591,7 @@ impl VirtualProcessor {
                 warn!("conflict detected, retry handling realtime vcc")
             }
         };
+        self.send_coinbase_pushes();
         Ok(resp)
     }
     fn handle_vc_resp(
@@ -609,6 +624,7 @@ impl VirtualProcessor {
                 warn!("conflict detected, retry handling sync vc")
             }
         };
+        self.send_coinbase_pushes();
         Ok(resp)
     }
 
@@ -662,11 +678,17 @@ impl VirtualProcessor {
         let block_hash = block.accepting_block_hash.as_bytes();
         let daa = state.processed_blocks.get(&block_hash).unwrap().0;
         for tx in &block.accepted_transaction_ids {
-            if let Some(event) = crate::take_coinbase_credit(&tx.as_bytes())
-                && let Some(funds_tx) = &self.push_funds_tx
-                && funds_tx.try_send(event).is_err()
-            {
-                warn!("Dropping funds push event; queue is full");
+            if let Some(held) = self.held_coinbase(&tx.as_bytes()) {
+                for (index, address) in &held.outpoints {
+                    self.watched_outpoint_partition.insert_wtx(
+                        wtx,
+                        &WatchedOutpointKey {
+                            tx_id: tx.as_bytes(),
+                            index: (*index).into(),
+                        },
+                        address,
+                    );
+                }
             }
             let Some(key) = self
                 .tx_id_to_acceptance_partition
@@ -704,6 +726,30 @@ impl VirtualProcessor {
             .insert_wtx(wtx, &block_hash, &tracked_tx_ids);
 
         Ok(())
+    }
+
+    /// What the block processor held for this accepted coinbase, if anything. Taken from the
+    /// held set once; a retried write transaction finds it in `taken_coinbase`.
+    fn held_coinbase(&self, tx_id: &[u8; 32]) -> Option<crate::HeldCoinbase> {
+        let mut taken = self.taken_coinbase.borrow_mut();
+        if let Some(held) = taken.get(tx_id) {
+            return Some(held.clone());
+        }
+        let held = crate::take_coinbase_credit(tx_id)?;
+        taken.insert(*tx_id, held.clone());
+        Some(held)
+    }
+
+    /// The "Received" pushes of the coinbases accepted by the transaction just committed.
+    fn send_coinbase_pushes(&self) {
+        for (_, held) in self.taken_coinbase.borrow_mut().drain() {
+            if let Some(event) = held.event
+                && let Some(funds_tx) = &self.push_funds_tx
+                && funds_tx.try_send(event).is_err()
+            {
+                warn!("Dropping funds push event; queue is full");
+            }
+        }
     }
 
     fn handle_processed_block(
@@ -845,7 +891,10 @@ impl VirtualProcessor {
             for payload in &payloads {
                 wtx.remove(payload.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?, tx_id);
             }
+            self.tx_alt_receiver_partition.remove_wtx(&mut wtx, &tx_id);
             if wtx.commit()?.is_ok() {
+                // Another block can carry the same tx, with its sender unknown then.
+                crate::remember_blocked_tx(tx_id);
                 debug!(tx_id = %tx_id.to_hex_64(), "Dropped a blocked sender's record");
                 return Ok(());
             }
@@ -879,6 +928,13 @@ impl VirtualProcessor {
                     tx_id,
                 },
             );
+            // Indexed with the sender unknown, the receiver was the first standard output. If
+            // that is the sender (its change, ordered [change, recipient]), the records move to
+            // the output the block processor would have picked with the sender known.
+            let alt = self.tx_alt_receiver_partition.get_wtx(&mut wtx, &tx_id)?;
+            self.tx_alt_receiver_partition.remove_wtx(&mut wtx, &tx_id);
+            let rekey = alt.filter(|alt| key.receiver == sender && alt.receiver != sender);
+            let new_receiver = rekey.map(|alt| alt.receiver);
             self.tx_id_to_acceptance_partition.resolve_entries_wtx(
                 &mut wtx,
                 &key,
@@ -904,8 +960,13 @@ impl VirtualProcessor {
                         if !matches!(entry.action, Action::UpdateValueSender) {
                             panic!("Unexpected action")
                         }
-                        let key = HandshakeKeyByReceiver::try_ref_from_bytes(entry.key)
+                        let mut key = HandshakeKeyByReceiver::try_read_from_bytes(entry.key)
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
+                        if let Some(receiver) = new_receiver {
+                            self.handshake_by_receiver_partition.remove_wtx(wtx, &key);
+                            key.receiver = receiver;
+                        }
+                        let key = &key;
                         let payload = self
                             .tx_id_to_handshake_partition
                             .get_rtx(&rtx, &key.tx_id)
@@ -941,6 +1002,9 @@ impl VirtualProcessor {
                         let mut key = HandshakeKeyBySender::try_read_from_bytes(entry.key)
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
                         key.sender = sender;
+                        if let Some(receiver) = new_receiver {
+                            key.receiver = receiver;
+                        }
                         self.handshake_by_sender_partition.insert_wtx(wtx, &key);
                         Ok(())
                     }
@@ -951,6 +1015,9 @@ impl VirtualProcessor {
                         let mut key = ContextualMessageBySenderKey::try_read_from_bytes(entry.key)
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
                         key.sender = sender;
+                        if let Some(receiver) = new_receiver {
+                            key.receiver = receiver;
+                        }
                         self.contextual_message_by_sender_partition
                             .insert(wtx, &key);
                         let payload = self
@@ -1022,14 +1089,29 @@ impl VirtualProcessor {
                         if !matches!(entry.action, Action::UpdateValueSender) {
                             panic!("Unexpected action")
                         }
-                        let key = PaymentKeyByReceiver::try_ref_from_bytes(entry.key)
+                        let mut key = PaymentKeyByReceiver::try_read_from_bytes(entry.key)
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
                         let payment = self
                             .tx_id_to_payment_partition
                             .get_rtx(&rtx, &key.tx_id)
                             .ok()
                             .flatten();
-                        let amount = payment.as_ref().map(|data| data.amount());
+                        let mut amount = payment.as_ref().map(|data| data.amount());
+                        if let Some(alt) = rekey {
+                            self.payment_by_receiver_partition.remove_wtx(wtx, &key);
+                            key.receiver = alt.receiver;
+                            // The amount stored is what the receiver's output pays.
+                            if let Some(data) = &payment {
+                                self.tx_id_to_payment_partition.insert_wtx(
+                                    wtx,
+                                    &key.tx_id,
+                                    alt.amount.get(),
+                                    data.sealed_hex(),
+                                )?;
+                                amount = Some(alt.amount.get());
+                            }
+                        }
+                        let key = &key;
                         let payload = payment
                             .as_ref()
                             .map(|data| String::from_utf8_lossy(data.sealed_hex()).to_string());
@@ -1067,6 +1149,9 @@ impl VirtualProcessor {
                         let mut key = PaymentKeyBySender::try_read_from_bytes(entry.key)
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
                         key.sender = sender;
+                        if let Some(receiver) = new_receiver {
+                            key.receiver = receiver;
+                        }
                         self.payment_by_sender_partition.insert_wtx(wtx, &key);
                         Ok(())
                     }
@@ -1108,10 +1193,18 @@ impl VirtualProcessor {
                         }
                         let key = GroupMessageKeyByBlindedGroupId::try_ref_from_bytes(entry.key)
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
-                        let payload = self
+                        // The payload can be gone (POST /personal/purge-all, purge-sender): drop
+                        // the row like an unparsable one instead of failing the resolution, which
+                        // stopped this processor on every start.
+                        let Some(payload) = self
                             .tx_id_to_group_message_partition
                             .get_rtx(&rtx, &key.tx_id)?
-                            .ok_or_else(|| anyhow::anyhow!("Missing group message payload"))?;
+                        else {
+                            debug!(tx_id = %key.tx_id.to_hex_64(), "Group message payload is gone; dropping its row");
+                            self.group_message_by_blinded_group_id_partition
+                                .remove_wtx(wtx, key);
+                            return Ok(());
+                        };
                         let wire_payload = format!(
                             "ciph_msg:1:gcomm:{}",
                             String::from_utf8_lossy(payload.as_ref())
@@ -1203,6 +1296,21 @@ impl VirtualProcessor {
                     }
                 },
             )?;
+            if let Some(receiver) = new_receiver {
+                // No owner record means output 0 paid the old receiver, which is the sender. A
+                // tx spending it must still take the sender, not the new receiver.
+                if self
+                    .tx_output0_owner_partition
+                    .get_wtx(&mut wtx, &tx_id)?
+                    .is_none()
+                {
+                    self.tx_output0_owner_partition
+                        .insert_wtx(&mut wtx, &tx_id, &key.receiver);
+                }
+                self.tx_id_to_acceptance_partition
+                    .rekey_receiver_wtx(&mut wtx, &key, receiver)?;
+                debug!(tx_id = %tx_id.to_hex_64(), "Moved a record from its sender's change to its receiver");
+            }
 
             if wtx.commit()?.is_ok() {
                 if let Some(push_tx) = &self.push_tx {
@@ -1357,5 +1465,343 @@ mod tests {
         print_size::<GroupMessageKeyByBlindedGroupId>();
         print_size::<GroupControlKeyByRecipient>();
         print_size::<GroupControlKeyBySender>();
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+    use indexer_db::FromBytes;
+    use indexer_db::processing::alt_receiver::AltReceiver;
+    use indexer_db::processing::tx_id_to_acceptance::InsertionEntry;
+    use smallvec::SmallVec;
+
+    fn addr(byte: u8) -> AddressPayload {
+        AddressPayload::from_xonly_pubkey([byte; 32])
+    }
+
+    fn rpc_addr(byte: u8) -> RpcAddress {
+        RpcAddress::new(
+            kaspa_addresses::Prefix::Mainnet,
+            kaspa_addresses::Version::PubKey,
+            &[byte; 32],
+        )
+    }
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        _runtime: tokio::runtime::Runtime,
+        ks: TxKeyspace,
+        processor: VirtualProcessor,
+        _commands: workflow_core::channel::Receiver<Command>,
+        _channels: (
+            flume::Sender<CompactHeader>,
+            flume::Sender<RealTimeVccNotification>,
+        ),
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("temporary database directory");
+            let ks = fjall::Config::new(dir.path())
+                .open_transactional()
+                .expect("keyspace");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            let (processed_tx, processed_rx) = flume::bounded(1);
+            let (vcc_tx, vcc_rx) = flume::bounded(1);
+            let (syncer_tx, syncer_rx) = flume::bounded(1);
+            let (command_tx, commands) = workflow_core::channel::bounded(64);
+            let processor = VirtualProcessor::builder()
+                .synced_capacity(16)
+                .processed_block_tx(processed_rx)
+                .realtime_vcc_tx(vcc_rx)
+                .syncer_rx(syncer_rx)
+                .syncer_tx(syncer_tx)
+                .command_tx(command_tx)
+                .tx_keyspace(ks.clone())
+                .metadata_partition(MetadataPartition::new(&ks).unwrap())
+                .tx_id_to_acceptance_partition(TxIDToAcceptancePartition::new(&ks).unwrap())
+                .accepting_block_to_tx_id_partition(AcceptingBlockToTxIDPartition::new(&ks).unwrap())
+                .pending_sender_resolution_partition(
+                    PendingSenderResolutionPartition::new(&ks).unwrap(),
+                )
+                .handshake_by_receiver_partition(HandshakeByReceiverPartition::new(&ks).unwrap())
+                .handshake_by_sender_partition(HandshakeBySenderPartition::new(&ks).unwrap())
+                .contextual_message_by_sender_partition(
+                    ContextualMessageBySenderPartition::new(&ks).unwrap(),
+                )
+                .contextual_message_by_inbox_partition(
+                    ContextualMessageByInboxPartition::new(&ks).unwrap(),
+                )
+                .self_stash_by_owner_partition(SelfStashByOwnerPartition::new(&ks).unwrap())
+                .payment_by_receiver_partition(PaymentByReceiverPartition::new(&ks).unwrap())
+                .payment_by_sender_partition(PaymentBySenderPartition::new(&ks).unwrap())
+                .tx_id_to_payment_partition(TxIdToPaymentPartition::new(&ks).unwrap())
+                .tx_id_to_handshake_partition(TxIdToHandshakePartition::new(&ks).unwrap())
+                .tx_id_to_contextual_message_partition(
+                    TxIdToContextualMessagePartition::new(&ks).unwrap(),
+                )
+                .tx_id_to_self_stash_partition(TxIdToSelfStashPartition::new(&ks).unwrap())
+                .group_message_by_blinded_group_id_partition(
+                    GroupMessageByBlindedGroupIdPartition::new(&ks).unwrap(),
+                )
+                .tx_id_to_group_message_partition(TxIdToGroupMessagePartition::new(&ks).unwrap())
+                .group_sender_binding_partition(GroupSenderBindingPartition::new(&ks).unwrap())
+                .group_control_by_sender_partition(GroupControlBySenderPartition::new(&ks).unwrap())
+                .group_control_by_recipient_partition(
+                    GroupControlByRecipientPartition::new(&ks).unwrap(),
+                )
+                .tx_id_to_group_control_partition(TxIdToGroupControlPartition::new(&ks).unwrap())
+                .tx_alt_receiver_partition(TxAltReceiverPartition::new(&ks).unwrap())
+                .tx_output0_owner_partition(TxOutput0OwnerPartition::new(&ks).unwrap())
+                .watched_outpoint_partition(WatchedOutpointPartition::new(&ks).unwrap())
+                .runtime(runtime.handle().clone())
+                .build();
+            Self {
+                _dir: dir,
+                _runtime: runtime,
+                ks,
+                processor,
+                _commands: commands,
+                _channels: (processed_tx, vcc_tx),
+            }
+        }
+
+        fn keys(&self, partition: &str) -> Vec<Vec<u8>> {
+            let part = self
+                .ks
+                .open_partition(partition, PartitionCreateOptions::default())
+                .unwrap();
+            self.ks
+                .read_tx()
+                .keys(&part)
+                .map(|k| k.unwrap().to_vec())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_payment_filed_under_its_senders_change_moves_to_the_recipient() {
+        let h = Harness::new();
+        let p = &h.processor;
+        let (sender, recipient) = (1, 2);
+        let tx_id = [0x80; 32];
+        // Indexed with the sender unknown and outputs [change 100, recipient 5000]: the
+        // receiver is output 0, the sender's own change.
+        let by_receiver = PaymentKeyByReceiver {
+            receiver: addr(sender),
+            block_time: 1_000.into(),
+            block_hash: [0xb1; 32],
+            version: 0,
+            tx_id,
+        };
+        let by_sender = PaymentKeyBySender {
+            sender: AddressPayload::default(),
+            block_time: by_receiver.block_time,
+            block_hash: by_receiver.block_hash,
+            receiver: addr(sender),
+            version: 0,
+            tx_id,
+        };
+        let key = AcceptanceKey {
+            tx_id,
+            receiver: addr(sender),
+        };
+        let mut wtx = h.ks.write_tx().unwrap();
+        p.tx_id_to_payment_partition
+            .insert_wtx(&mut wtx, &tx_id, 100, b"abcd")
+            .unwrap();
+        p.payment_by_receiver_partition
+            .insert_wtx(&mut wtx, &by_receiver, None)
+            .unwrap();
+        p.tx_id_to_acceptance_partition
+            .insert_wtx(
+                &mut wtx,
+                &key,
+                &[
+                    InsertionEntry {
+                        partition_id: PartitionId::PaymentByReceiver,
+                        action: Action::UpdateValueSender,
+                        partition_key: SmallVec::from_slice(by_receiver.as_bytes()),
+                    },
+                    InsertionEntry {
+                        partition_id: PartitionId::PaymentBySender,
+                        action: Action::InsertByKeySender,
+                        partition_key: SmallVec::from_slice(by_sender.as_bytes()),
+                    },
+                ],
+            )
+            .unwrap();
+        p.tx_id_to_acceptance_partition
+            .update_acceptance_wtx(&mut wtx, &key, [0xa1; 32], 77)
+            .unwrap();
+        p.tx_alt_receiver_partition.insert_wtx(
+            &mut wtx,
+            &tx_id,
+            &AltReceiver {
+                receiver: addr(recipient),
+                amount: 5_000.into(),
+            },
+        );
+        p.pending_sender_resolution_partition.insert_wtx(
+            &mut wtx,
+            &PendingResolutionKey {
+                accepting_daa_score: 77.into(),
+                tx_id,
+            },
+        );
+        wtx.commit().unwrap().unwrap();
+
+        p.handle_sender_address(rpc_addr(sender), tx_id, 77).unwrap();
+
+        // The receiver-side row moved to the recipient, with the resolved sender as its value.
+        let moved = PaymentKeyByReceiver {
+            receiver: addr(recipient),
+            ..by_receiver
+        };
+        assert_eq!(h.keys("payment_by_receiver"), vec![moved.as_bytes().to_vec()]);
+        let rtx = h.ks.read_tx();
+        let receiver_part = h
+            .ks
+            .open_partition("payment_by_receiver", PartitionCreateOptions::default())
+            .unwrap();
+        let value = rtx.get(&receiver_part, moved.as_bytes()).unwrap().unwrap();
+        assert_eq!(value.as_ref(), addr(sender).as_bytes());
+        let filed = PaymentKeyBySender {
+            sender: addr(sender),
+            receiver: addr(recipient),
+            ..by_sender
+        };
+        assert_eq!(h.keys("payment_by_sender"), vec![filed.as_bytes().to_vec()]);
+        // The amount is what the recipient's output pays.
+        let payment = p
+            .tx_id_to_payment_partition
+            .get_rtx(&rtx, &tx_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!((payment.amount(), payment.sealed_hex()), (5_000, &b"abcd"[..]));
+        // One acceptance record, under the recipient, still accepted; output 0 stays the
+        // sender's for a tx spending it.
+        let record = p.tx_id_to_acceptance_partition.key_by_tx_id(&tx_id).unwrap().unwrap();
+        assert_eq!(record.receiver, addr(recipient));
+        assert_eq!(h.keys("tx_id_to_acceptance").len(), 1);
+        assert!(
+            p.tx_id_to_acceptance_partition
+                .acceptance_by_tx_id_rtx(&rtx, &tx_id)
+                .unwrap()
+                .is_some()
+        );
+        drop(rtx);
+        let mut wtx = h.ks.write_tx().unwrap();
+        assert_eq!(
+            p.tx_output0_owner_partition.get_wtx(&mut wtx, &tx_id).unwrap(),
+            Some(addr(sender))
+        );
+        drop(wtx);
+        assert!(h.keys("tx_alt_receiver").is_empty());
+        assert!(h.keys("pending_sender_resolution").is_empty());
+    }
+
+    #[test]
+    fn a_payment_to_someone_else_stays_where_it_is() {
+        let h = Harness::new();
+        let p = &h.processor;
+        let tx_id = [0x81; 32];
+        // Outputs [recipient, change]: the receiver was right; the noted alternative is unused.
+        let by_receiver = PaymentKeyByReceiver {
+            receiver: addr(2),
+            block_time: 1_000.into(),
+            block_hash: [0xb1; 32],
+            version: 0,
+            tx_id,
+        };
+        let key = AcceptanceKey {
+            tx_id,
+            receiver: addr(2),
+        };
+        let mut wtx = h.ks.write_tx().unwrap();
+        p.tx_id_to_payment_partition
+            .insert_wtx(&mut wtx, &tx_id, 5_000, b"abcd")
+            .unwrap();
+        p.payment_by_receiver_partition
+            .insert_wtx(&mut wtx, &by_receiver, None)
+            .unwrap();
+        p.tx_id_to_acceptance_partition
+            .insert_wtx(
+                &mut wtx,
+                &key,
+                &[InsertionEntry {
+                    partition_id: PartitionId::PaymentByReceiver,
+                    action: Action::UpdateValueSender,
+                    partition_key: SmallVec::from_slice(by_receiver.as_bytes()),
+                }],
+            )
+            .unwrap();
+        p.tx_alt_receiver_partition.insert_wtx(
+            &mut wtx,
+            &tx_id,
+            &AltReceiver {
+                receiver: addr(1),
+                amount: 100.into(),
+            },
+        );
+        wtx.commit().unwrap().unwrap();
+
+        p.handle_sender_address(rpc_addr(1), tx_id, 77).unwrap();
+
+        assert_eq!(h.keys("payment_by_receiver"), vec![by_receiver.as_bytes().to_vec()]);
+        let record = p.tx_id_to_acceptance_partition.key_by_tx_id(&tx_id).unwrap().unwrap();
+        assert_eq!(record.receiver, addr(2));
+        let rtx = h.ks.read_tx();
+        assert_eq!(
+            p.tx_id_to_payment_partition.get_rtx(&rtx, &tx_id).unwrap().unwrap().amount(),
+            5_000
+        );
+        drop(rtx);
+        assert!(h.keys("tx_alt_receiver").is_empty());
+        assert!(h.keys("tx_output0_owner").is_empty());
+    }
+
+    #[test]
+    fn a_group_message_whose_payload_is_gone_is_dropped_not_fatal() {
+        let h = Harness::new();
+        let p = &h.processor;
+        let tx_id = [0x82; 32];
+        let row = GroupMessageKeyByBlindedGroupId {
+            blinded_group_id: [3; 32],
+            block_time: 1_000.into(),
+            block_hash: [0xb1; 32],
+            version: 1,
+            tx_id,
+        };
+        let key = AcceptanceKey {
+            tx_id,
+            receiver: addr(1),
+        };
+        // As after POST /personal/purge-all: the row and its entry are there, the payload isn't.
+        let mut wtx = h.ks.write_tx().unwrap();
+        p.group_message_by_blinded_group_id_partition
+            .insert_wtx(&mut wtx, &row, None)
+            .unwrap();
+        p.tx_id_to_acceptance_partition
+            .insert_wtx(
+                &mut wtx,
+                &key,
+                &[InsertionEntry {
+                    partition_id: PartitionId::GroupMessageByBlindedGroupId,
+                    action: Action::UpdateValueSender,
+                    partition_key: SmallVec::from_slice(row.as_bytes()),
+                }],
+            )
+            .unwrap();
+        wtx.commit().unwrap().unwrap();
+
+        p.handle_sender_address(rpc_addr(1), tx_id, 77)
+            .expect("a missing payload no longer stops the processor");
+        assert!(h.keys("group_message_by_blinded_group_id").is_empty());
+        assert_eq!(p.tx_id_to_acceptance_partition.keys_with_entries().count(), 0);
+        let _ = AcceptanceKey::read_from_bytes(&h.keys("tx_id_to_acceptance")[0]).unwrap();
     }
 }

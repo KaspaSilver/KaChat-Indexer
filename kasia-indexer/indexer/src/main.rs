@@ -37,6 +37,7 @@ use indexer_db::metadata::MetadataPartition;
 use indexer_db::migration::apply_migrations;
 use indexer_db::processing::accepting_block_to_txs::AcceptingBlockToTxIDPartition;
 use indexer_db::processing::pending_senders::PendingSenderResolutionPartition;
+use indexer_db::processing::alt_receiver::TxAltReceiverPartition;
 use indexer_db::processing::output0_owner::TxOutput0OwnerPartition;
 use indexer_db::processing::tx_id_to_acceptance::TxIDToAcceptancePartition;
 use indexer_db::processing::watched_outpoints::{
@@ -279,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
     let tx_id_to_group_control_partition = TxIdToGroupControlPartition::new(&tx_keyspace)?;
     let tx_id_to_acceptance_partition = TxIDToAcceptancePartition::new(&tx_keyspace)?;
     let tx_output0_owner_partition = TxOutput0OwnerPartition::new(&tx_keyspace)?;
+    let tx_alt_receiver_partition = TxAltReceiverPartition::new(&tx_keyspace)?;
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
     let acceptance_to_tx_id_partition = AcceptingBlockToTxIDPartition::new(&tx_keyspace)?;
     let pending_sender_resolution_partition = PendingSenderResolutionPartition::new(&tx_keyspace)?;
@@ -424,7 +426,9 @@ async fn main() -> anyhow::Result<()> {
         .group_control_by_recipient_partition(group_control_by_recipient_partition.clone())
         .tx_id_to_group_control_partition(tx_id_to_group_control_partition.clone())
         .tx_id_to_acceptance_partition(tx_id_to_acceptance_partition.clone())
-        .tx_output0_owner_partition(tx_output0_owner_partition)
+        .tx_output0_owner_partition(tx_output0_owner_partition.clone())
+        .tx_alt_receiver_partition(tx_alt_receiver_partition.clone())
+        .pending_sender_resolution_partition(pending_sender_resolution_partition.clone())
         .shared_metrics(metrics.clone())
         .push_tx(push_tx.clone())
         .push_funds_tx(funds_push_tx.clone())
@@ -462,6 +466,9 @@ async fn main() -> anyhow::Result<()> {
         .group_control_by_sender_partition(group_control_by_sender_partition.clone())
         .group_control_by_recipient_partition(group_control_by_recipient_partition.clone())
         .tx_id_to_group_control_partition(tx_id_to_group_control_partition.clone())
+        .tx_alt_receiver_partition(tx_alt_receiver_partition)
+        .tx_output0_owner_partition(tx_output0_owner_partition)
+        .watched_outpoint_partition(watched_outpoint_partition.clone())
         .runtime(tokio::runtime::Handle::current())
         .push_tx(push_tx.clone())
         .push_funds_tx(funds_push_tx.clone())
@@ -514,10 +521,18 @@ async fn main() -> anyhow::Result<()> {
         })
         .take(3_000_000)
         .collect::<Result<Vec<_>, _>>()?;
-    let block_processor_handle = std::thread::spawn(move || block_processor.process());
-    let virtual_processor_handle =
-        std::thread::spawn(move || virtual_processor.process(processed_blocks, false));
-    let periodic_processor_handle = std::thread::spawn(move || periodic_processor.process());
+    // Watchdog: a processor thread that ends while the indexer runs (an error, a panic) used to
+    // go unnoticed until shutdown, leaving the process up and indexing nothing.
+    let (thread_exit_tx, mut thread_exit_rx) = tokio::sync::mpsc::unbounded_channel();
+    let block_processor_handle = spawn_watched("block-processor", &thread_exit_tx, move || {
+        block_processor.process()
+    })?;
+    let virtual_processor_handle = spawn_watched("virtual-processor", &thread_exit_tx, move || {
+        virtual_processor.process(processed_blocks, false)
+    })?;
+    let periodic_processor_handle = spawn_watched("periodic-processor", &thread_exit_tx, move || {
+        periodic_processor.process()
+    })?;
     let data_source_handle = tokio::spawn(async move { data_source.task().await });
     let ticker_handle = tokio::spawn(async move { ticker.process().await });
 
@@ -584,47 +599,101 @@ async fn main() -> anyhow::Result<()> {
         data_source: shutdown_data_source_tx,
         ticker: shutdown_ticker_tx,
     };
+    // Anything but a termination signal ending the indexer is a failure: exit non-zero, so
+    // supervisord restarts it.
+    let mut unexpected_stop: Option<&str> = None;
     tokio::select! {
         _ = signals::wait_for_signal_impl() => {
             info!("Termination signal received. Shutting down...");
             shutdown.shutdown(None).await
         },
+        Some(thread) = thread_exit_rx.recv() => {
+            error!("The {thread} thread stopped while the indexer was running; shutting down to restart");
+            unexpected_stop = Some(thread);
+            shutdown.shutdown(None).await;
+        },
         r = api_handle => {
            _ = r.inspect(|_| info!("api has stopped"))
                 .inspect_err(|err| error!("api has stopped with error: {}", err));
+            unexpected_stop = Some("api");
             shutdown.shutdown(Some(Exclude::Api)).await;
         },
         r = data_source_handle => {
            _ = r.inspect(|_| info!("data source has stopped")).inspect_err(|err| error!("data_source finished with err: {}", err));
+            unexpected_stop = Some("data source");
              shutdown.shutdown(Some(Exclude::DataSource)).await;
         },
         r = ticker_handle => {
             _ = r.inspect(|_| info!("ticker has stopped")).inspect_err(|err| error!("ticker processing error: {}", err));
+            unexpected_stop = Some("ticker");
              shutdown.shutdown(Some(Exclude::Ticker)).await;
         },
     }
+    if unexpected_stop.is_some() {
+        // A half-stopped indexer may never finish its graceful shutdown: don't wait forever.
+        std::thread::spawn(|| {
+            std::thread::sleep(UNEXPECTED_STOP_GRACE);
+            eprintln!("Graceful shutdown after an unexpected stop timed out; exiting");
+            std::process::exit(1);
+        });
+    }
 
     info!("waiting for virtual processor finish");
-    _ = virtual_processor_handle
-        .join()
-        .expect("failed to join virtual_processor thread")
-        .inspect_err(|err| error!("virtual_processor stopped error: {}", err));
+    join_processor("virtual_processor", virtual_processor_handle);
 
     info!("waiting for block processor finish");
-    _ = block_processor_handle
-        .join()
-        .expect("failed to join block_processor thread")
-        .inspect_err(|err| error!("block_processor stopped error: {}", err));
+    join_processor("block_processor", block_processor_handle);
 
     info!("waiting for periodic processor finish");
-    _ = periodic_processor_handle
-        .join()
-        .expect("failed to join periodic_processor thread")
-        .inspect_err(|err| error!("periodic_processor stopped error: {}", err));
+    join_processor("periodic_processor", periodic_processor_handle);
 
+    if let Some(stopped) = unexpected_stop {
+        anyhow::bail!("{stopped} stopped while the indexer was running");
+    }
     info!("All tasks shut down.");
 
     Ok(())
+}
+
+/// How long the shutdown after an unexpected stop may take before the process exits anyway.
+const UNEXPECTED_STOP_GRACE: Duration = Duration::from_secs(60);
+
+/// Sends the thread's name to main when the thread ends, however it ends (a panic included).
+struct ThreadExitNotice {
+    name: &'static str,
+    exits: tokio::sync::mpsc::UnboundedSender<&'static str>,
+}
+
+impl Drop for ThreadExitNotice {
+    fn drop(&mut self) {
+        _ = self.exits.send(self.name);
+    }
+}
+
+/// Spawn a processor thread whose end main hears about (see the watchdog in `main`).
+fn spawn_watched<T: Send + 'static>(
+    name: &'static str,
+    exits: &tokio::sync::mpsc::UnboundedSender<&'static str>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<T>> {
+    let notice = ThreadExitNotice {
+        name,
+        exits: exits.clone(),
+    };
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _notice = notice;
+            f()
+        })
+}
+
+fn join_processor(name: &str, handle: std::thread::JoinHandle<anyhow::Result<()>>) {
+    match handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => error!("{name} stopped error: {err}"),
+        Err(_) => error!("{name} thread panicked"),
+    }
 }
 
 pub fn init_logs(context: &IndexerContext) -> anyhow::Result<(WorkerGuard, WorkerGuard)> {
@@ -767,5 +836,28 @@ mod inbox_tag_tests {
             compute_inbox_tag("kaspatest:qrABC"),
             compute_inbox_tag("kaspatest:qrabc")
         );
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::spawn_watched;
+
+    #[test]
+    fn main_hears_when_a_processor_thread_ends_or_panics() {
+        let (exits, mut exited) = tokio::sync::mpsc::unbounded_channel();
+        let failed = spawn_watched("failing", &exits, || -> anyhow::Result<()> {
+            anyhow::bail!("stopped")
+        })
+        .expect("spawn");
+        assert!(failed.join().expect("no panic").is_err());
+        assert_eq!(exited.try_recv(), Ok("failing"));
+
+        let panicked = spawn_watched("panicking", &exits, || -> anyhow::Result<()> {
+            panic!("processor bug")
+        })
+        .expect("spawn");
+        assert!(panicked.join().is_err());
+        assert_eq!(exited.try_recv(), Ok("panicking"));
     }
 }

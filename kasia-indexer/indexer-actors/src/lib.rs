@@ -102,24 +102,55 @@ pub fn is_blocked_xonly(pubkey: &[u8; 32]) -> bool {
 /// accepted (RECEIVED_PUSH_COINBASE.md). A block found is merged by many blocks, each with its own
 /// coinbase paying the miner, and only the chain block's is accepted: pushing at sighting rang the
 /// miner once per merging block. Coinbases never accepted age out.
-static PENDING_COINBASE: LazyLock<std::sync::Mutex<std::collections::HashMap<[u8; 32], (std::time::Instant, crate::push::FundsPushEvent)>>> =
+static PENDING_COINBASE: LazyLock<std::sync::Mutex<PendingCoinbase>> =
     LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+type PendingCoinbase = std::collections::HashMap<[u8; 32], (std::time::Instant, HeldCoinbase)>;
 
 /// How long a coinbase credit waits for its acceptance.
 const PENDING_COINBASE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Hold a coinbase's credit until the coinbase is accepted.
-pub fn hold_coinbase_credit(event: crate::push::FundsPushEvent) {
+/// What a coinbase paying a watched or self-send address leaves to do once it is accepted.
+#[derive(Debug, Clone, Default)]
+pub struct HeldCoinbase {
+    /// The "Received" push, when it credits a watched address.
+    pub event: Option<crate::push::FundsPushEvent>,
+    /// (output index, address) of each output paying a watched or self-send address. Their
+    /// watched outpoint rows are written on acceptance, not at sighting: the coinbase of every
+    /// merging block pays the miner, and only the accepted one can ever be spent.
+    pub outpoints: Vec<(u32, AddressPayload)>,
+}
+
+/// Hold a coinbase's credit and watched outputs until the coinbase is accepted.
+pub fn hold_coinbase_credit(tx_id: [u8; 32], held: HeldCoinbase) {
     if let Ok(mut pending) = PENDING_COINBASE.lock() {
         let now = std::time::Instant::now();
         pending.retain(|_, (at, _)| now.duration_since(*at) < PENDING_COINBASE_TTL);
-        pending.insert(event.tx_id, (now, event));
+        pending.insert(tx_id, (now, held));
     }
 }
 
-/// The credit held for this coinbase, now that it is accepted.
-pub fn take_coinbase_credit(tx_id: &[u8; 32]) -> Option<crate::push::FundsPushEvent> {
-    PENDING_COINBASE.lock().ok()?.remove(tx_id).map(|(_, event)| event)
+/// What was held for this coinbase, now that it is accepted.
+pub fn take_coinbase_credit(tx_id: &[u8; 32]) -> Option<HeldCoinbase> {
+    PENDING_COINBASE.lock().ok()?.remove(tx_id).map(|(_, held)| held)
+}
+
+/// Txs whose records were dropped because their sender is blocked (oldest forgotten first). The
+/// same tx can arrive again in another block, with its sender unknown at that time: it is not
+/// stored again. Not persisted; after a restart such a tx is caught when its sender resolves.
+static BLOCKED_TXS: LazyLock<std::sync::Mutex<fifo_set::FifoSet<[u8; 32]>>> =
+    LazyLock::new(|| std::sync::Mutex::new(fifo_set::FifoSet::new(BLOCKED_TXS_CAPACITY)));
+const BLOCKED_TXS_CAPACITY: usize = 50_000;
+
+/// Remember that `tx_id` was sent by a blocked address.
+pub fn remember_blocked_tx(tx_id: [u8; 32]) {
+    if let Ok(mut txs) = BLOCKED_TXS.lock() {
+        txs.insert(tx_id);
+    }
+}
+
+/// Was `tx_id` already found to be sent by a blocked address?
+pub fn is_blocked_tx(tx_id: &[u8; 32]) -> bool {
+    BLOCKED_TXS.lock().map(|txs| txs.contains(tx_id)).unwrap_or(false)
 }
 
 /// Union of every device's registered `watch_only_addresses` (Address Activity push). The push
@@ -360,9 +391,26 @@ mod blocklist_tests {
             daa_score: 0,
             chat_tx: false,
         };
-        hold_coinbase_credit(event);
+        let outpoints = vec![(0, AddressPayload::from_xonly_pubkey([7; 32]))];
+        hold_coinbase_credit(
+            [9; 32],
+            HeldCoinbase {
+                event: Some(event),
+                outpoints: outpoints.clone(),
+            },
+        );
         assert!(take_coinbase_credit(&[8; 32]).is_none());
-        assert!(take_coinbase_credit(&[9; 32]).is_some());
+        let held = take_coinbase_credit(&[9; 32]).expect("held");
+        assert!(held.event.is_some());
+        assert_eq!(held.outpoints, outpoints);
         assert!(take_coinbase_credit(&[9; 32]).is_none());
+    }
+
+    #[test]
+    fn a_tx_dropped_for_a_blocked_sender_is_remembered() {
+        assert!(!is_blocked_tx(&[3; 32]));
+        remember_blocked_tx([3; 32]);
+        assert!(is_blocked_tx(&[3; 32]));
+        assert!(!is_blocked_tx(&[4; 32]));
     }
 }

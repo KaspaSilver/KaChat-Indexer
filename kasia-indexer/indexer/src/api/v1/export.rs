@@ -150,68 +150,172 @@ pub async fn export_all(State(state): State<ExportApi>) -> impl IntoResponse {
 }
 
 /// POST /import-file — restore records from an exported dump. Body is the raw file.
+/// A row is skipped when it is malformed (see `valid_row`: a wrong-length key panicked the
+/// processor later) or was sent by a blocked address, with its payload. Answers
+/// `{"imported", "skipped", "invalid", "blocked"}`; skipped = invalid + blocked.
 pub async fn import_file(State(state): State<ExportApi>, body: Bytes) -> impl IntoResponse {
     let data = body.to_vec();
-    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, usize)> {
-        let mut parts = std::collections::HashMap::new();
-        for name in EXPORT_PARTITIONS {
-            parts.insert(
-                *name,
-                state
-                    .tx_keyspace
-                    .open_partition(name, PartitionCreateOptions::default())?,
-            );
-        }
-        let mut wtx = state.tx_keyspace.write_tx()?;
-        let mut imported = 0usize;
-        let mut skipped = 0usize;
-        for line in data.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            // Strip only a trailing CR (tolerate CRLF files) — NOT spaces, because key-only
-            // partitions store an empty value, so those lines legitimately end with a space
-            // (name key ""), which must still split into three fields.
-            let line = match std::str::from_utf8(line) {
-                Ok(l) => l.strip_suffix('\r').unwrap_or(l),
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-            let mut it = line.split(' ');
-            let (Some(name), Some(k_hex), Some(v_hex), None) =
-                (it.next(), it.next(), it.next(), it.next())
-            else {
-                skipped += 1;
-                continue;
-            };
-            let Some(part) = parts.get(name) else {
-                skipped += 1;
-                continue;
-            };
-            let (Ok(k), Ok(v)) = (decode_hex(k_hex), decode_hex(v_hex)) else {
-                skipped += 1;
-                continue;
-            };
-            wtx.insert(part, k, v);
-            imported += 1;
-        }
-        if wtx.commit()?.is_err() {
-            anyhow::bail!("commit conflict");
-        }
-        Ok((imported, skipped))
+    let res = tokio::task::spawn_blocking(move || {
+        import_rows(&state.tx_keyspace, &data, indexer_actors::is_blocked_address)
     })
     .await;
 
     match res {
-        Ok(Ok((imported, skipped))) => (
+        Ok(Ok(counts)) => (
             StatusCode::OK,
-            format!("{{\"imported\":{imported},\"skipped\":{skipped}}}"),
+            format!(
+                "{{\"imported\":{},\"skipped\":{},\"invalid\":{},\"blocked\":{}}}",
+                counts.imported,
+                counts.invalid + counts.blocked,
+                counts.invalid,
+                counts.blocked
+            ),
         )
             .into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"import failed\"}").into_response(),
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImportCounts {
+    imported: usize,
+    /// Unparsable lines, unknown partitions, wrong-length keys or values.
+    invalid: usize,
+    /// Rows a blocked address sent, and their payloads.
+    blocked: usize,
+}
+
+fn import_rows(
+    ks: &TxKeyspace,
+    data: &[u8],
+    is_blocked: impl Fn(&indexer_db::AddressPayload) -> bool,
+) -> anyhow::Result<ImportCounts> {
+    let mut parts = std::collections::HashMap::new();
+    for name in EXPORT_PARTITIONS {
+        parts.insert(*name, ks.open_partition(name, PartitionCreateOptions::default())?);
+    }
+    let mut counts = ImportCounts::default();
+    // First pass: parse and validate every row, and note the txs of blocked senders, so their
+    // payloads are skipped too wherever they sit in the file.
+    let mut rows: Vec<(&'static str, Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut blocked_txs = std::collections::HashSet::new();
+    for line in data.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        // Strip only a trailing CR (tolerate CRLF files) — NOT spaces, because key-only
+        // partitions store an empty value, so those lines legitimately end with a space
+        // (name key ""), which must still split into three fields.
+        let line = match std::str::from_utf8(line) {
+            Ok(l) => l.strip_suffix('\r').unwrap_or(l),
+            Err(_) => {
+                counts.invalid += 1;
+                continue;
+            }
+        };
+        let mut it = line.split(' ');
+        let (Some(name), Some(k_hex), Some(v_hex), None) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
+            counts.invalid += 1;
+            continue;
+        };
+        let Some((name, _)) = parts.get_key_value(name) else {
+            counts.invalid += 1;
+            continue;
+        };
+        let (Ok(k), Ok(v)) = (decode_hex(k_hex), decode_hex(v_hex)) else {
+            counts.invalid += 1;
+            continue;
+        };
+        if !valid_row(name, &k, &v) {
+            counts.invalid += 1;
+            continue;
+        }
+        if let Some(tx_id) = blocked_sender_tx(name, &k, &v, &is_blocked) {
+            blocked_txs.insert(tx_id);
+            counts.blocked += 1;
+            continue;
+        }
+        rows.push((name, k, v));
+    }
+    let mut wtx = ks.write_tx()?;
+    for (name, k, v) in rows {
+        let payload_of_blocked = SENDER_INDEXES
+            .iter()
+            .any(|index| index.payload == name)
+            && blocked_txs.contains(k.as_slice());
+        if payload_of_blocked {
+            counts.blocked += 1;
+            continue;
+        }
+        wtx.insert(&parts[name], k, v);
+        counts.imported += 1;
+    }
+    if wtx.commit()?.is_err() {
+        anyhow::bail!("commit conflict");
+    }
+    Ok(counts)
+}
+
+/// Whether a row has the shape its partition is read with: the fixed-size key structs, the
+/// 34-byte sender value of the value-indexed partitions (read with an unwrap), the 8-byte amount
+/// in front of a payment. Push registrations are keyed by device token, of any length.
+fn valid_row(name: &str, key: &[u8], value: &[u8]) -> bool {
+    use indexer_db::messages::contextual_message::{
+        ContextualMessageByInboxKey, ContextualMessageBySenderKey,
+    };
+    use indexer_db::messages::group_control::{GroupControlKeyByRecipient, GroupControlKeyBySender};
+    use indexer_db::messages::group_message::{
+        BLINDED_GROUP_ID_LEN, GroupMessageKeyByBlindedGroupId,
+    };
+    use indexer_db::messages::handshake::{HandshakeKeyByReceiver, HandshakeKeyBySender};
+    use indexer_db::messages::payment::{PaymentKeyByReceiver, PaymentKeyBySender};
+    use indexer_db::messages::self_stash::SelfStashKeyByOwner;
+    use std::mem::size_of;
+    const SENDER: usize = size_of::<indexer_db::AddressPayload>();
+    // (key length, value length when fixed)
+    let (key_len, value_len) = match name {
+        "handshake_by_sender" => (size_of::<HandshakeKeyBySender>(), None),
+        "handshake_by_receiver" => (size_of::<HandshakeKeyByReceiver>(), Some(SENDER)),
+        "contextual_message_by_sender" => (size_of::<ContextualMessageBySenderKey>(), None),
+        "contextual_message_by_inbox" => (size_of::<ContextualMessageByInboxKey>(), Some(SENDER)),
+        "payment_by_sender" => (size_of::<PaymentKeyBySender>(), None),
+        "payment_by_receiver" => (size_of::<PaymentKeyByReceiver>(), Some(SENDER)),
+        "self_stash_by_owner" => (size_of::<SelfStashKeyByOwner>(), None),
+        "group_message_by_blinded_group_id" => {
+            (size_of::<GroupMessageKeyByBlindedGroupId>(), Some(SENDER))
+        }
+        "group_sender_binding" => (BLINDED_GROUP_ID_LEN, Some(32)),
+        "group_control_by_sender" => (size_of::<GroupControlKeyBySender>(), None),
+        "group_control_by_recipient" => (size_of::<GroupControlKeyByRecipient>(), Some(SENDER)),
+        "tx_id_to_payment" => return key.len() == 32 && value.len() >= 8,
+        "tx-id-to-handshake"
+        | "tx-id-to-contextual-message"
+        | "tx-id-to-self-stash"
+        | "tx-id-to-group-message"
+        | "tx-id-to-group-control" => (32, None),
+        _ => return !key.is_empty(),
+    };
+    key.len() == key_len && value_len.is_none_or(|len| value.len() == len)
+}
+
+/// The tx id of an index row sent by a blocked address: the sender is the key's prefix in the
+/// by-sender partitions, and the value in the value-indexed ones. Expects a `valid_row`.
+fn blocked_sender_tx(
+    name: &str,
+    key: &[u8],
+    value: &[u8],
+    is_blocked: impl Fn(&indexer_db::AddressPayload) -> bool,
+) -> Option<Vec<u8>> {
+    use indexer_db::FromBytes;
+    let index = SENDER_INDEXES.iter().find(|index| index.partition == name)?;
+    let sender_bytes = if index.sender_prefixed { key.get(..34)? } else { value };
+    let sender = indexer_db::AddressPayload::read_from_bytes(sender_bytes).ok()?;
+    if !is_blocked(&sender) {
+        return None;
+    }
+    tx_id_of(index, key).map(<[u8]>::to_vec)
 }
 
 /// POST /personal/purge-all — wipe every stored chat record from all message partitions.
@@ -219,6 +323,7 @@ pub async fn import_file(State(state): State<ExportApi>, body: Bytes) -> impl In
 /// personal mode re-accumulate only the operator's own data (and backfill via import-by-address).
 pub async fn purge_all(State(state): State<ExportApi>) -> impl IntoResponse {
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        clear_pending_senders(&state.tx_keyspace)?;
         let mut removed = 0usize;
         for name in EXPORT_PARTITIONS {
             let part = state
@@ -250,6 +355,48 @@ pub async fn purge_all(State(state): State<ExportApi>) -> impl IntoResponse {
         )
             .into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"purge failed\"}").into_response(),
+    }
+}
+
+/// Drop what still waits on a sender: the entries of every acceptance record (cut back to its
+/// header, as a resolution does), the pending lookups, and the alternative receivers. Run before
+/// purge-all: a resolution would otherwise write back rows whose payload is gone, and a group
+/// message's missing payload stopped the virtual chain processor on every start.
+fn clear_pending_senders(ks: &TxKeyspace) -> anyhow::Result<()> {
+    use indexer_db::processing::pending_senders::PendingSenderResolutionPartition;
+    use indexer_db::processing::tx_id_to_acceptance::TxIDToAcceptancePartition;
+    let acceptance = TxIDToAcceptancePartition::new(ks)?;
+    let pending = PendingSenderResolutionPartition::new(ks)?;
+    let alt = ks.open_partition("tx_alt_receiver", PartitionCreateOptions::default())?;
+    loop {
+        let with_entries = acceptance.keys_with_entries().collect::<anyhow::Result<Vec<_>>>()?;
+        let pending_keys = pending
+            .get_all_pending()
+            .map(|key| key.map(|key| *key))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let alt_keys: Vec<Vec<u8>> = {
+            let rtx = ks.read_tx();
+            rtx.keys(&alt).map(|k| k.map(|k| k.to_vec())).collect::<Result<_, _>>()?
+        };
+        let mut wtx = ks.write_tx()?;
+        for key in &with_entries {
+            acceptance.take_entries_wtx(&mut wtx, key)?;
+        }
+        for key in &pending_keys {
+            pending.remove_wtx(&mut wtx, key);
+        }
+        for key in alt_keys {
+            wtx.remove(&alt, key);
+        }
+        if wtx.commit()?.is_ok() {
+            tracing::info!(
+                "purge-all: dropped {} record(s) waiting on a sender, {} pending lookup(s)",
+                with_entries.len(),
+                pending_keys.len()
+            );
+            return Ok(());
+        }
+        tracing::warn!("purge-all: commit conflict while clearing pending senders, retrying");
     }
 }
 
@@ -375,8 +522,18 @@ pub async fn purge_sender(State(state): State<ExportApi>, Json(req): Json<PurgeS
     }
 }
 
+/// Where the tx id sits in a row of `index`.
+fn tx_id_of<'a>(index: &SenderIndex, key: &'a [u8]) -> Option<&'a [u8]> {
+    let start = key.len().checked_sub(index.tx_id_from_end)?;
+    key.get(start..start + 32)
+}
+
 /// Snapshot every index entry of the sender, then remove them and their payloads in one write
 /// transaction (retried on a conflict with the live indexer). Returns (chat, group) tx counts.
+///
+/// A tx can have more rows than the sender's own: another block carrying it writes a receiver
+/// side row with a zero (unknown) sender. Every row of a purged tx goes, whatever its value, or
+/// it would point at a payload that is gone.
 fn purge_sender_records(ks: &TxKeyspace, sender: &indexer_db::AddressPayload) -> anyhow::Result<(usize, usize)> {
     use indexer_db::IntoBytes;
     let sender = sender.as_bytes();
@@ -390,11 +547,10 @@ fn purge_sender_records(ks: &TxKeyspace, sender: &indexer_db::AddressPayload) ->
                 let part = ks.open_partition(index.partition, PartitionCreateOptions::default())?;
                 let payload = ks.open_partition(index.payload, PartitionCreateOptions::default())?;
                 let mut take = |key: &[u8]| {
-                    if key.len() < index.tx_id_from_end {
+                    let Some(tx_id) = tx_id_of(index, key) else {
                         return;
-                    }
-                    let start = key.len() - index.tx_id_from_end;
-                    let tx_id = key[start..start + 32].to_vec();
+                    };
+                    let tx_id = tx_id.to_vec();
                     removals.push((part.clone(), key.to_vec()));
                     removals.push((payload.clone(), tx_id.clone()));
                     if index.group { group_txs.insert(tx_id) } else { chat_txs.insert(tx_id) };
@@ -408,6 +564,19 @@ fn purge_sender_records(ks: &TxKeyspace, sender: &indexer_db::AddressPayload) ->
                         let (k, v) = kv?;
                         if v.as_ref() == sender {
                             take(&k);
+                        }
+                    }
+                }
+            }
+            if !chat_txs.is_empty() || !group_txs.is_empty() {
+                for index in &SENDER_INDEXES {
+                    let part = ks.open_partition(index.partition, PartitionCreateOptions::default())?;
+                    for k in rtx.keys(&part) {
+                        let k = k?;
+                        if let Some(tx_id) = tx_id_of(index, &k)
+                            && (chat_txs.contains(tx_id) || group_txs.contains(tx_id))
+                        {
+                            removals.push((part.clone(), k.to_vec()));
                         }
                     }
                 }
@@ -483,5 +652,147 @@ mod purge_sender_tests {
         // Nothing left: a second purge finds nothing.
         drop(rtx);
         assert_eq!(purge_sender_records(&ks, &blocked).expect("purge"), (0, 0));
+    }
+
+    #[test]
+    fn rows_of_a_purged_tx_from_other_blocks_go_too() {
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let ks = fjall::Config::new(dir.path()).open_transactional().expect("keyspace");
+        let open = |name: &str| ks.open_partition(name, PartitionCreateOptions::default()).expect("partition");
+        let blocked = AddressPayload::from_xonly_pubkey([1; 32]);
+        let other = AddressPayload::from_xonly_pubkey([2; 32]);
+        let mut in_block_b = key(other.as_bytes(), 5, 0);
+        in_block_b[40] = 0xbb; // another block hash
+        let mut wtx = ks.write_tx().expect("write");
+        // Tx 5 in two blocks: the copy resolved to the blocked sender, and one still unknown.
+        wtx.insert(&open("handshake_by_receiver"), key(other.as_bytes(), 5, 0), blocked.as_bytes());
+        wtx.insert(&open("handshake_by_receiver"), in_block_b, AddressPayload::default().as_bytes());
+        wtx.insert(&open("tx-id-to-handshake"), [5u8; 32], b"h5");
+        // Someone else's handshake (tx 6) to the same receiver stays.
+        wtx.insert(&open("handshake_by_receiver"), key(other.as_bytes(), 6, 0), AddressPayload::default().as_bytes());
+        wtx.insert(&open("tx-id-to-handshake"), [6u8; 32], b"h6");
+        assert!(wtx.commit().expect("commit").is_ok());
+
+        assert_eq!(purge_sender_records(&ks, &blocked).expect("purge"), (1, 0));
+        let rtx = ks.read_tx();
+        let left: Vec<_> = rtx
+            .keys(&open("handshake_by_receiver"))
+            .map(|k| k.expect("key")[34 + 41])
+            .collect();
+        assert_eq!(left, vec![6]);
+        assert!(rtx.get(&open("tx-id-to-handshake"), [6u8; 32]).expect("read").is_some());
+    }
+
+    fn line(name: &str, key: &[u8], value: &[u8]) -> String {
+        format!("{name} {} {}\n", faster_hex::hex_string(key), faster_hex::hex_string(value))
+    }
+
+    #[test]
+    fn an_import_skips_malformed_rows_and_blocked_senders() {
+        use indexer_db::messages::handshake::{HandshakeKeyByReceiver, HandshakeKeyBySender};
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let ks = fjall::Config::new(dir.path()).open_transactional().expect("keyspace");
+        let blocked = AddressPayload::from_xonly_pubkey([1; 32]);
+        let other = AddressPayload::from_xonly_pubkey([2; 32]);
+        let by_sender = |sender, tx| HandshakeKeyBySender {
+            sender,
+            block_time: 1.into(),
+            block_hash: [0; 32],
+            receiver: other,
+            version: 0,
+            tx_id: [tx; 32],
+        };
+        let by_receiver = |tx| HandshakeKeyByReceiver {
+            receiver: other,
+            block_time: 1.into(),
+            block_hash: [0; 32],
+            version: 0,
+            tx_id: [tx; 32],
+        };
+        let mut file = String::new();
+        // Blocked: by the key's sender (tx 1), by the value (tx 2), and both payloads, one listed
+        // before its index row.
+        file += &line("tx-id-to-handshake", &[2; 32], b"h2");
+        file += &line("handshake_by_sender", by_sender(blocked, 1).as_bytes(), b"");
+        file += &line("tx-id-to-handshake", &[1; 32], b"h1");
+        file += &line("handshake_by_receiver", by_receiver(2).as_bytes(), blocked.as_bytes());
+        // Kept: someone else's handshake (tx 3) and a push registration keyed by token.
+        file += &line("handshake_by_sender", by_sender(other, 3).as_bytes(), b"");
+        file += &line("handshake_by_receiver", by_receiver(3).as_bytes(), other.as_bytes());
+        file += &line("tx-id-to-handshake", &[3; 32], b"h3");
+        file += &line("device_registration", b"token", b"{}");
+        // Malformed: a short key, a short sender value, an unknown partition, bad hex.
+        file += &line("payment_by_receiver", &[0; 10], other.as_bytes());
+        file += &line("handshake_by_receiver", by_receiver(4).as_bytes(), &[1; 3]);
+        file += &line("no_such_partition", &[0; 32], b"");
+        file += "tx-id-to-handshake zz 00\n";
+
+        let counts = import_rows(&ks, file.as_bytes(), |a| *a == blocked).expect("import");
+        assert_eq!(
+            counts,
+            ImportCounts {
+                imported: 4,
+                invalid: 4,
+                blocked: 4,
+            }
+        );
+        let rtx = ks.read_tx();
+        let open = |name: &str| ks.open_partition(name, PartitionCreateOptions::default()).expect("partition");
+        let payloads: Vec<_> = rtx
+            .keys(&open("tx-id-to-handshake"))
+            .map(|k| k.expect("key")[0])
+            .collect();
+        assert_eq!(payloads, vec![3]);
+        assert_eq!(rtx.keys(&open("handshake_by_sender")).count(), 1);
+        assert_eq!(rtx.keys(&open("handshake_by_receiver")).count(), 1);
+    }
+
+    #[test]
+    fn purge_all_first_drops_what_waits_on_a_sender() {
+        use indexer_db::processing::pending_senders::{
+            PendingResolutionKey, PendingSenderResolutionPartition,
+        };
+        use indexer_db::processing::tx_id_to_acceptance::{
+            AcceptanceKey, Action, InsertionEntry, TxIDToAcceptancePartition,
+        };
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let ks = fjall::Config::new(dir.path()).open_transactional().expect("keyspace");
+        let acceptance = TxIDToAcceptancePartition::new(&ks).expect("acceptance");
+        let pending = PendingSenderResolutionPartition::new(&ks).expect("pending");
+        let alt = ks.open_partition("tx_alt_receiver", PartitionCreateOptions::default()).expect("alt");
+        let key = AcceptanceKey {
+            tx_id: [7; 32],
+            receiver: AddressPayload::from_xonly_pubkey([2; 32]),
+        };
+        let mut wtx = ks.write_tx().expect("write");
+        acceptance
+            .insert_wtx(
+                &mut wtx,
+                &key,
+                &[InsertionEntry {
+                    partition_id: indexer_db::PartitionId::GroupMessageByBlindedGroupId,
+                    action: Action::UpdateValueSender,
+                    partition_key: [0u8; 105].into_iter().collect(),
+                }],
+            )
+            .expect("insert");
+        acceptance.update_acceptance_wtx(&mut wtx, &key, [9; 32], 77).expect("accept");
+        pending.insert_wtx(
+            &mut wtx,
+            &PendingResolutionKey {
+                accepting_daa_score: 77.into(),
+                tx_id: [7; 32],
+            },
+        );
+        wtx.insert(&alt, [7u8; 32], [0u8; 42]);
+        assert!(wtx.commit().expect("commit").is_ok());
+
+        clear_pending_senders(&ks).expect("clear");
+        assert_eq!(acceptance.keys_with_entries().count(), 0);
+        assert!(pending.is_empty().expect("pending"));
+        assert_eq!(ks.read_tx().keys(&alt).count(), 0);
+        // The record itself stays, still accepted.
+        let rtx = ks.read_tx();
+        assert!(acceptance.acceptance_by_tx_id_rtx(&rtx, &[7; 32]).expect("read").is_some());
     }
 }

@@ -185,8 +185,10 @@ async fn get_group_messages_by_blinded_group_id(
                         .is_none_or(|cursor| key.as_bytes() > cursor.as_bytes())
                         && seen_tx_ids.insert(key.tx_id)
                 })
-                .take(limit)
-                .map(|(key, sender_payload)| {
+                // A row whose payload is gone (a purge removed it, or another block's copy of the
+                // tx was left behind) is skipped, not a 500 for the whole page. Skipped before
+                // take(limit), so the page still fills.
+                .map(|(key, sender_payload)| -> anyhow::Result<Option<GroupMessageResponse>> {
                     let block_time = key.block_time.get();
                     let sender = to_rpc_address(&sender_payload, state.context.network_type)
                         .context("Sender address conversion error")?
@@ -208,13 +210,16 @@ async fn get_group_messages_by_blinded_group_id(
                             (None, None)
                         };
 
-                    let sealed_hex = state
+                    let Some(sealed_hex) = state
                         .tx_id_to_group_message_partition
                         .get_rtx(&rtx, &key.tx_id)?
-                        .context("Missing group message payload")?;
+                    else {
+                        tracing::debug!(tx_id = %faster_hex::hex_string(&key.tx_id), "group messages: skipping a row whose payload is missing");
+                        return Ok(None);
+                    };
                     let message_payload = faster_hex::hex_string(sealed_hex.as_ref());
 
-                    Ok(GroupMessageResponse {
+                    Ok(Some(GroupMessageResponse {
                         tx_id: faster_hex::hex_string(&key.tx_id),
                         sender,
                         blinded_group_id: params.blinded_group_id.clone(),
@@ -223,8 +228,10 @@ async fn get_group_messages_by_blinded_group_id(
                         accepting_block,
                         accepting_daa_score,
                         message_payload,
-                    })
+                    }))
                 })
+                .filter_map(Result::transpose)
+                .take(limit)
                 .collect::<Result<Vec<_>, _>>()
             })
             .flatten()
@@ -275,13 +282,14 @@ fn decode_blinded_group_id(hex: &str) -> Result<[u8; BLINDED_GROUP_ID_LEN], Stri
 }
 
 /// Build one response row (shared by the batched + since reads; identical shape to the GET).
+/// None when the payload is gone: the row is skipped (before the caller's take(limit)).
 fn build_message_row(
     state: &GroupMessageApi,
     rtx: &fjall::ReadTransaction,
     key: &GroupMessageKeyByBlindedGroupId,
     sender_payload: &AddressPayload,
     id_hex: &str,
-) -> anyhow::Result<GroupMessageResponse> {
+) -> anyhow::Result<Option<GroupMessageResponse>> {
     let sender = to_rpc_address(sender_payload, state.context.network_type)
         .context("Sender address conversion error")?
         .map(|addr| addr.to_string());
@@ -296,11 +304,14 @@ fn build_message_row(
     } else {
         (None, None)
     };
-    let sealed_hex = state
+    let Some(sealed_hex) = state
         .tx_id_to_group_message_partition
         .get_rtx(rtx, &key.tx_id)?
-        .context("Missing group message payload")?;
-    Ok(GroupMessageResponse {
+    else {
+        tracing::debug!(tx_id = %faster_hex::hex_string(&key.tx_id), "group messages: skipping a row whose payload is missing");
+        return Ok(None);
+    };
+    Ok(Some(GroupMessageResponse {
         tx_id: faster_hex::hex_string(&key.tx_id),
         sender,
         blinded_group_id: id_hex.to_string(),
@@ -309,7 +320,7 @@ fn build_message_row(
         accepting_block,
         accepting_daa_score,
         message_payload: faster_hex::hex_string(sealed_hex.as_ref()),
-    })
+    }))
 }
 
 // ------------------------------------------------------------------- batched ---
@@ -434,10 +445,11 @@ async fn post_group_messages_by_blinded_group_ids(
                             .is_none_or(|cursor| key.as_bytes() > cursor.as_bytes())
                             && seen_tx_ids.insert(key.tx_id)
                     })
-                    .take(lane.limit)
                     .map(|(key, sender_payload)| {
                         build_message_row(&state, &rtx, &key, &sender_payload, &lane.id_hex)
                     })
+                    .filter_map(Result::transpose)
+                    .take(lane.limit)
                     .collect::<Result<Vec<_>, _>>()
                 })
                 .flatten()?;
@@ -531,10 +543,11 @@ async fn post_group_messages_since(
                     iter.filter(|(key, _sender)| {
                         key.block_time.get() > since && seen_tx_ids.insert(key.tx_id)
                     })
-                    .take(limit)
                     .map(|(key, sender_payload)| {
                         build_message_row(&state, &rtx, &key, &sender_payload, id_hex)
                     })
+                    .filter_map(Result::transpose)
+                    .take(limit)
                     .collect::<Result<Vec<_>, _>>()
                 })
                 .flatten()?;

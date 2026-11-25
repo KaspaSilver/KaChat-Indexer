@@ -187,8 +187,9 @@ async fn get_group_control_by_sender(
                         .is_none_or(|cursor| message.as_bytes() > cursor.as_bytes())
                         && seen_tx_ids.insert(message.tx_id)
                 })
-                .take(limit)
-                .map(|message_key| {
+                // A row whose payload is gone is skipped, not a 500 for the whole page. Skipped
+                // before take(limit), so the page still fills.
+                .map(|message_key| -> anyhow::Result<Option<GroupControlResponse>> {
                     let block_time = message_key.block_time.into();
 
                     let sender_str =
@@ -216,13 +217,16 @@ async fn get_group_control_by_sender(
                         } else {
                             (None, None)
                         };
-                    let sealed_hex = state
+                    let Some(sealed_hex) = state
                         .tx_id_to_group_control_partition
                         .get_rtx(&rtx, &message_key.tx_id)?
-                        .ok_or_else(|| anyhow::anyhow!("Group control payload not found"))?;
+                    else {
+                        tracing::debug!(tx_id = %faster_hex::hex_string(&message_key.tx_id), "group control: skipping a row whose payload is missing");
+                        return Ok(None);
+                    };
                     let message_payload = faster_hex::hex_string(sealed_hex.as_ref());
 
-                    Ok(GroupControlResponse {
+                    Ok(Some(GroupControlResponse {
                         tx_id: faster_hex::hex_string(&message_key.tx_id),
                         sender: sender_str,
                         recipient,
@@ -231,8 +235,10 @@ async fn get_group_control_by_sender(
                         accepting_block,
                         accepting_daa_score,
                         message_payload,
-                    })
+                    }))
                 })
+                .filter_map(Result::transpose)
+                .take(limit)
                 .collect::<Result<Vec<_>, _>>()
             })
             .flatten()
@@ -354,8 +360,9 @@ async fn get_group_control_by_recipient(
                         .is_none_or(|cursor| message.as_bytes() > cursor.as_bytes())
                         && seen_tx_ids.insert(message.tx_id)
                 })
-                .take(limit)
-                .map(|(message_key, sender_payload)| {
+                // A row whose payload is gone is skipped, not a 500 for the whole page. Skipped
+                // before take(limit), so the page still fills.
+                .map(|(message_key, sender_payload)| -> anyhow::Result<Option<GroupControlResponse>> {
                     let sender = to_rpc_address(&sender_payload, state.context.network_type)?
                         .map(|address| address.to_string())
                         .unwrap_or_default();
@@ -375,12 +382,15 @@ async fn get_group_control_by_recipient(
                             )
                         })
                         .unwrap_or((None, None));
-                    let payload = state
+                    let Some(payload) = state
                         .tx_id_to_group_control_partition
                         .get_rtx(&rtx, &message_key.tx_id)?
-                        .ok_or_else(|| anyhow::anyhow!("Group control payload not found"))?;
+                    else {
+                        tracing::debug!(tx_id = %faster_hex::hex_string(&message_key.tx_id), "group control: skipping a row whose payload is missing");
+                        return Ok(None);
+                    };
 
-                    Ok(GroupControlResponse {
+                    Ok(Some(GroupControlResponse {
                         tx_id: faster_hex::hex_string(&message_key.tx_id),
                         sender,
                         recipient,
@@ -389,8 +399,10 @@ async fn get_group_control_by_recipient(
                         accepting_block,
                         accepting_daa_score,
                         message_payload: faster_hex::hex_string(payload.as_ref()),
-                    })
+                    }))
                 })
+                .filter_map(Result::transpose)
+                .take(limit)
                 .collect::<Result<Vec<_>, anyhow::Error>>()
             })
             .flatten()
@@ -496,8 +508,7 @@ async fn post_group_control_since(
                     iter.filter(|message| {
                         message.block_time.get() > since && seen_tx_ids.insert(message.tx_id)
                     })
-                    .take(limit)
-                    .map(|message_key| {
+                    .map(|message_key| -> anyhow::Result<Option<GroupControlResponse>> {
                         let sender_str =
                             match to_rpc_address(&message_key.sender, state.context.network_type) {
                                 Ok(Some(addr)) => addr.to_string(),
@@ -518,11 +529,14 @@ async fn post_group_control_since(
                                 )
                             })
                             .unwrap_or((None, None));
-                        let sealed_hex = state
+                        let Some(sealed_hex) = state
                             .tx_id_to_group_control_partition
                             .get_rtx(&rtx, &message_key.tx_id)?
-                            .ok_or_else(|| anyhow::anyhow!("Group control payload not found"))?;
-                        Ok(GroupControlResponse {
+                        else {
+                            tracing::debug!(tx_id = %faster_hex::hex_string(&message_key.tx_id), "group control: skipping a row whose payload is missing");
+                            return Ok(None);
+                        };
+                        Ok(Some(GroupControlResponse {
                             tx_id: faster_hex::hex_string(&message_key.tx_id),
                             sender: sender_str,
                             recipient,
@@ -531,8 +545,10 @@ async fn post_group_control_since(
                             accepting_block,
                             accepting_daa_score,
                             message_payload: faster_hex::hex_string(sealed_hex.as_ref()),
-                        })
+                        }))
                     })
+                    .filter_map(Result::transpose)
+                    .take(limit)
                     .collect::<Result<Vec<_>, anyhow::Error>>()
                 })
                 .flatten()?;
@@ -548,8 +564,7 @@ async fn post_group_control_since(
                     iter.filter(|(message, _sender)| {
                         message.block_time.get() > since && seen_tx_ids.insert(message.tx_id)
                     })
-                    .take(limit)
-                    .map(|(message_key, sender_payload)| {
+                    .map(|(message_key, sender_payload)| -> anyhow::Result<Option<GroupControlResponse>> {
                         let sender = to_rpc_address(&sender_payload, state.context.network_type)?
                             .map(|address| address.to_string())
                             .unwrap_or_default();
@@ -567,11 +582,14 @@ async fn post_group_control_since(
                                 )
                             })
                             .unwrap_or((None, None));
-                        let payload = state
+                        let Some(payload) = state
                             .tx_id_to_group_control_partition
                             .get_rtx(&rtx, &message_key.tx_id)?
-                            .ok_or_else(|| anyhow::anyhow!("Group control payload not found"))?;
-                        Ok(GroupControlResponse {
+                        else {
+                            tracing::debug!(tx_id = %faster_hex::hex_string(&message_key.tx_id), "group control: skipping a row whose payload is missing");
+                            return Ok(None);
+                        };
+                        Ok(Some(GroupControlResponse {
                             tx_id: faster_hex::hex_string(&message_key.tx_id),
                             sender,
                             recipient,
@@ -580,8 +598,10 @@ async fn post_group_control_since(
                             accepting_block,
                             accepting_daa_score,
                             message_payload: faster_hex::hex_string(payload.as_ref()),
-                        })
+                        }))
                     })
+                    .filter_map(Result::transpose)
+                    .take(limit)
                     .collect::<Result<Vec<_>, anyhow::Error>>()
                 })
                 .flatten()?;

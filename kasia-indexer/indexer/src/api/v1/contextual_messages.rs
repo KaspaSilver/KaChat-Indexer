@@ -275,8 +275,10 @@ async fn get_contextual_messages_by_sender(
             .get_by_sender_alias_from_block_time(&rtx, &sender, &alias_bytes, cursor)
             .process_results(|iter| {
                 iter.filter(|message| seen_tx_ids.insert(message.tx_id))
-                    .take(limit)
-                    .map(|message_key| {
+                    // A row whose payload is gone (a purge removed it, or another block's copy of
+                    // the tx was left behind) is skipped, not a 500 for the whole page. Skipped
+                    // before take(limit), so the page still fills.
+                    .map(|message_key| -> anyhow::Result<Option<ContextualMessageResponse>> {
                         let block_time = message_key.block_time.into();
 
                         let sender_str =
@@ -301,13 +303,16 @@ async fn get_contextual_messages_by_sender(
                             } else {
                                 (None, None)
                             };
-                        let sealed_hex = state
+                        let Some(sealed_hex) = state
                             .tx_id_to_contextual_message_partition
                             .get_rtx(&rtx, &message_key.tx_id)?
-                            .expect("Message not found");
+                        else {
+                            tracing::debug!(tx_id = %faster_hex::hex_string(&message_key.tx_id), "contextual messages by-sender: skipping a row whose payload is missing");
+                            return Ok(None);
+                        };
                         let message_payload = faster_hex::hex_string(sealed_hex.as_ref());
 
-                        Ok(ContextualMessageResponse {
+                        Ok(Some(ContextualMessageResponse {
                             tx_id: faster_hex::hex_string(&message_key.tx_id),
                             sender: sender_str,
                             alias: alias.clone(), // todo use byteview
@@ -315,8 +320,10 @@ async fn get_contextual_messages_by_sender(
                             accepting_block,
                             accepting_daa_score,
                             message_payload,
-                        })
+                        }))
                     })
+                    .filter_map(Result::transpose)
+                    .take(limit)
                     .collect::<Result<Vec<_>, _>>()
             })
             .flatten()
@@ -403,8 +410,10 @@ async fn get_contextual_messages_by_inbox(
             .iter_by_tag_from_block_time(&rtx, &tag, cursor)
             .process_results(|iter| {
                 iter.filter(|(key, _sender)| seen_tx_ids.insert(key.tx_id))
-                    .take(limit)
-                    .map(|(key, sender_payload)| {
+                    // A row whose payload is gone (a purge removed it, or another block's copy of
+                    // the tx was left behind) is skipped, not a 500 for the whole page. Skipped
+                    // before take(limit), so the page still fills.
+                    .map(|(key, sender_payload)| -> anyhow::Result<Option<ContextualMessageResponse>> {
                         let block_time = key.block_time.into();
 
                         let sender_str =
@@ -429,13 +438,16 @@ async fn get_contextual_messages_by_inbox(
                                 (None, None)
                             };
 
-                        let message_payload = state
+                        let Some(message_payload) = state
                             .tx_id_to_contextual_message_partition
                             .get_rtx(&rtx, &key.tx_id)?
                             .map(|sealed| faster_hex::hex_string(sealed.as_ref()))
-                            .unwrap_or_default();
+                        else {
+                            tracing::debug!(tx_id = %faster_hex::hex_string(&key.tx_id), "contextual messages by-inbox: skipping a row whose payload is missing");
+                            return Ok(None);
+                        };
 
-                        Ok(ContextualMessageResponse {
+                        Ok(Some(ContextualMessageResponse {
                             tx_id: faster_hex::hex_string(&key.tx_id),
                             sender: sender_str,
                             // Not stored in the inbox index; the client derives it from the sender.
@@ -444,8 +456,10 @@ async fn get_contextual_messages_by_inbox(
                             accepting_block,
                             accepting_daa_score,
                             message_payload,
-                        })
+                        }))
                     })
+                    .filter_map(Result::transpose)
+                    .take(limit)
                     .collect::<Result<Vec<_>, _>>()
             })
             .flatten()

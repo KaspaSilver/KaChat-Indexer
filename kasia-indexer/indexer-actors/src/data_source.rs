@@ -1,4 +1,5 @@
 use crate::block_processor::BlockNotification;
+use crate::util::ToHex64;
 use crate::virtual_chain_processor::RealTimeVccNotification;
 use anyhow::Context;
 use futures_util::future::FutureExt;
@@ -17,11 +18,13 @@ use kaspa_wrpc_client::client::ConnectOptions;
 use kaspa_wrpc_client::prelude::{
     BlockAddedScope, ListenerId, Scope, VirtualChainChangedScope, VirtualDaaScoreChangedScope,
 };
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use workflow_core::channel::Channel;
 use workflow_serializer::prelude::Serializable;
@@ -48,6 +51,8 @@ pub struct DataSource {
     virtual_daa: Arc<AtomicU64>,
     command_rx: workflow_core::channel::Channel<Command>,
     requests_queue: VecDeque<Request>,
+    /// Sender lookups that failed with anything but a disconnect, waiting for their next try.
+    sender_retries: SenderRetryQueue,
 }
 
 impl DataSource {
@@ -75,6 +80,7 @@ impl DataSource {
             virtual_daa,
             command_rx,
             requests_queue: VecDeque::new(),
+            sender_retries: SenderRetryQueue::default(),
         }
     }
     pub async fn task(&mut self) -> anyhow::Result<()> {
@@ -132,6 +138,16 @@ impl DataSource {
                             )
                             .await
                             .inspect_err(|err| error!("Error while handling notification: {err}"));
+                },
+                // The future is built even while the branch is disabled, hence the far default.
+                _ = tokio::time::sleep_until(
+                    self.sender_retries
+                        .next_due()
+                        .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)),
+                ), if self.sender_retries.next_due().is_some() => {
+                    for retry in self.sender_retries.pop_due(Instant::now()) {
+                        self.retry_sender(retry).await;
+                    }
                 },
             }
         }
@@ -347,6 +363,73 @@ impl DataSource {
         Ok(())
     }
 
+    /// A sender lookup that failed earlier is due again.
+    async fn retry_sender(&mut self, retry: SenderRetry) {
+        if self.shutting_down {
+            return;
+        }
+        if !self.connected {
+            // Queued like any request while disconnected; its count of tries starts over.
+            self.requests_queue.push_back(Request::RequestSender {
+                daa_score: retry.daa_score,
+                tx_id: retry.tx_id,
+            });
+            return;
+        }
+        self.request_sender(retry.daa_score, retry.tx_id, retry.failed_tries)
+            .await;
+    }
+
+    /// Ask the node who sent `tx_id` and hand the answer to the virtual chain processor.
+    /// `failed_tries` is how many lookups of it already failed. A failure other than a disconnect
+    /// (often "Transaction not found at given accepting daa score") is tried again later, see
+    /// SENDER_RETRY_DELAYS. Past the last try the pending key stays in the database, so the next
+    /// start asks again.
+    async fn request_sender(&mut self, daa_score: u64, tx_id: [u8; 32], failed_tries: usize) {
+        match self
+            .rpc_client
+            .rpc_client()
+            .call(
+                RpcApiOps::GetUtxoReturnAddress,
+                Serializable(GetUtxoReturnAddressRequest::new(
+                    TransactionId::from_bytes(tx_id),
+                    daa_score,
+                )),
+            )
+            .await
+        {
+            Ok(res) => {
+                let res: Serializable<GetUtxoReturnAddressResponse> = res;
+                let address = res.0.return_address;
+                debug!("get sender");
+                _ = self
+                    .vcc_sender
+                    .send_async(RealTimeVccNotification::SenderResolution {
+                        sender: address,
+                        tx_id,
+                        daa: daa_score,
+                    })
+                    .await
+                    .inspect_err(|_err| error!("sending sender result err"));
+            }
+            Err(workflow_rpc::client::error::Error::Disconnect) => {
+                self.requests_queue
+                    .push_front(Request::RequestSender { daa_score, tx_id });
+            }
+            Err(e) => {
+                let tx = tx_id.to_hex_64();
+                if self
+                    .sender_retries
+                    .schedule(Instant::now(), failed_tries, daa_score, tx_id)
+                {
+                    info!(%tx, daa_score, failed_tries = failed_tries + 1, "Error getting sender address, will retry: {e}");
+                } else {
+                    warn!(%tx, daa_score, failed_tries = failed_tries + 1, "Error getting sender address, giving up until the next restart: {e}");
+                }
+            }
+        }
+    }
+
     // todo rewrite rpc client so it doesnt block notifications when waits for response
     async fn handle_command(&mut self, command: Command) -> anyhow::Result<Continue> {
         match command {
@@ -455,40 +538,7 @@ impl DataSource {
                         }
                     }
                     Request::RequestSender { daa_score, tx_id } => {
-                        match self
-                            .rpc_client
-                            .rpc_client()
-                            .call(
-                                RpcApiOps::GetUtxoReturnAddress,
-                                Serializable(GetUtxoReturnAddressRequest::new(
-                                    TransactionId::from_bytes(tx_id),
-                                    daa_score,
-                                )),
-                            )
-                            .await
-                        {
-                            Ok(res) => {
-                                let res: Serializable<GetUtxoReturnAddressResponse> = res;
-                                let address = res.0.return_address;
-                                debug!("get sender");
-                                _ = self
-                                    .vcc_sender
-                                    .send_async(RealTimeVccNotification::SenderResolution {
-                                        sender: address,
-                                        tx_id,
-                                        daa: daa_score,
-                                    })
-                                    .await
-                                    .inspect_err(|_err| error!("sending sender result err"));
-                            }
-                            Err(workflow_rpc::client::error::Error::Disconnect) => {
-                                self.requests_queue
-                                    .push_front(Request::RequestSender { daa_score, tx_id });
-                            }
-                            Err(e) => {
-                                warn!("Error getting sender address: {e}");
-                            }
-                        }
+                        self.request_sender(daa_score, tx_id, 0).await;
                     }
                     Request::RequestVirtualChain {
                         vc_from,
@@ -536,6 +586,61 @@ impl DataSource {
 
 type Continue = bool;
 
+/// How long to wait before each new try of a sender lookup that failed with anything but a
+/// disconnect. After the last one it is dropped until the next start.
+const SENDER_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SenderRetry {
+    due: Instant,
+    failed_tries: usize,
+    daa_score: u64,
+    tx_id: [u8; 32],
+}
+
+/// Failed sender lookups ordered by when they are due, so a retry never blocks other requests.
+#[derive(Default)]
+struct SenderRetryQueue(BinaryHeap<Reverse<SenderRetry>>);
+
+impl SenderRetryQueue {
+    /// Schedule the next try after `failed_tries` failed lookups (counting the one that just
+    /// failed as failed_tries + 1). Returns false when no tries are left.
+    fn schedule(&mut self, now: Instant, failed_tries: usize, daa_score: u64, tx_id: [u8; 32]) -> bool {
+        let Some(delay) = SENDER_RETRY_DELAYS.get(failed_tries) else {
+            return false;
+        };
+        self.0.push(Reverse(SenderRetry {
+            due: now + *delay,
+            failed_tries: failed_tries + 1,
+            daa_score,
+            tx_id,
+        }));
+        true
+    }
+
+    fn next_due(&self) -> Option<Instant> {
+        self.0.peek().map(|Reverse(retry)| retry.due)
+    }
+
+    /// Every retry due at `now`, earliest first.
+    fn pop_due(&mut self, now: Instant) -> Vec<SenderRetry> {
+        let mut due = Vec::new();
+        while let Some(Reverse(retry)) = self.0.peek()
+            && retry.due <= now
+        {
+            due.push(*retry);
+            self.0.pop();
+        }
+        due
+    }
+}
+
 #[derive(Debug)]
 pub enum Command {
     Request(Request),
@@ -566,4 +671,40 @@ pub enum RequestError {
     ShuttingDown,
     #[error("RPC error: {0}")]
     RpcError(#[from] workflow_rpc::client::error::Error),
+}
+
+#[cfg(test)]
+mod sender_retry_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_sender_lookup_is_retried_with_backoff_then_dropped() {
+        let start = Instant::now();
+        let mut queue = SenderRetryQueue::default();
+        // Two lookups fail at once: the one with fewer failures is due first.
+        assert!(queue.schedule(start, 3, 7, [2; 32]));
+        assert!(queue.schedule(start, 0, 5, [1; 32]));
+        assert_eq!(queue.next_due(), Some(start + Duration::from_secs(2)));
+        assert!(queue.pop_due(start + Duration::from_secs(1)).is_empty());
+        let due = queue.pop_due(start + Duration::from_secs(2));
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].tx_id, due[0].daa_score, due[0].failed_tries), ([1; 32], 5, 1));
+        assert_eq!(queue.next_due(), Some(start + Duration::from_secs(60)));
+
+        // Each failure waits longer: 2 s, 5 s, 15 s, 60 s, 5 min, then the lookup is dropped.
+        let mut queue = SenderRetryQueue::default();
+        let mut now = start;
+        let mut failed_tries = 0;
+        let mut waits = Vec::new();
+        while queue.schedule(now, failed_tries, 5, [1; 32]) {
+            let next = queue.next_due().expect("scheduled");
+            waits.push((next - now).as_secs());
+            let retry = queue.pop_due(next).pop().expect("due");
+            now = next;
+            failed_tries = retry.failed_tries;
+        }
+        assert_eq!(waits, vec![2, 5, 15, 60, 300]);
+        assert_eq!(failed_tries, 5);
+        assert!(queue.next_due().is_none());
+    }
 }
