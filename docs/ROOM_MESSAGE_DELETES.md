@@ -26,35 +26,40 @@ A room message whose content is exactly this JSON is a **delete for everyone**:
 
 On ingest of a room message whose content parses as above:
 
-1. **Only from the same sender.**
+1. **Never in the machinery rooms.**
+   - `chess-arena`, `chess-bots` and `kplay-arcade` (and any room the panel marks as machinery)
+     take no deletes: a move, a result or a stamped score can't be taken back.
+   - K ignores deletes there too.
+2. **Only from the same sender.**
    - Look up `targetTxId` in that room. If it exists and its `sender_address` equals the delete's
      sender, remove the message.
    - Also remove the reactions and edits that target it.
    - Anything else is ignored: a different sender, another room, or an unknown target.
-2. **A delete that arrives before its target.**
+3. **A delete that arrives before its target.**
    - This happens with out-of-order blocks or a backfill.
    - Keep the delete (txid, target, sender) and apply it when the target is ingested.
-3. **The delete row itself.**
+4. **The delete row itself.**
    - Keep it in the history the room read serves, so other clients that cached the message drop
      it too. K drops it either way.
    - It is never shown as a message: K filters it like edits and reactions.
-4. **No push for a delete:** skip `notify_broadcast` for it, as for edits and reactions. K's push
+5. **No push for a delete:** skip `notify_broadcast` for it, as for edits and reactions. K's push
    extension also silences one if it comes, but a skipped push saves the device a wake-up.
-5. **Moderation is unchanged:** the admin delete (`kachat-admin`) still removes any message. This
+6. **Moderation is unchanged:** the admin delete (`kachat-admin`) still removes any message. This
    adds the sender's own delete.
 
 ## What K does meanwhile
 
-- **On the sender's phone:** the message goes at once. If the delete transaction never leaves the
-  phone, the message comes back.
+- **On the sender's phone:** the message goes once the delete is sent; nothing changes if it isn't.
 - **On every K:**
   - a delete seen in a page, a sweep or the block stream removes the cached message, but only from
     the same sender;
   - it is remembered, so a page that still carries the message (before this change is deployed)
     can't bring it back.
 - **Once the indexer removes the message**, K's absence check also drops it everywhere: a cached
-  message missing from a page that covers its time is deleted (`dropRowsTheIndexerNoLongerHas`).
-  That also covers clients that never saw the delete row.
+  message missing from two pages that cover its time is deleted (`dropRowsTheIndexerNoLongerHas`).
+  That also covers clients that never saw the delete row. The check refuses to delete more than a
+  handful at once (over 3, and over a fifth of what a page covers), so a rebuilt or partial index
+  leaves K's caches alone; keep the 30-day history whole when you can.
 
 So this works in K today, without the indexer change, for anyone who sees the delete. The indexer
 change makes it complete:
