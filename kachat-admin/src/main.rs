@@ -7,6 +7,7 @@
 //   - GET  /api/stats               row counts per table, ingest rate, DB size
 //   - GET  /api/moderation/recent   newest indexed content (for picking removal targets)
 //   - POST /api/moderation/remove   dry-run preview or atomic remove-all-by-pubkey
+//   - GET  /api/broadcasts          stored room messages, newest first, paged (channel, limit, offset)
 //
 // It intentionally does NOT talk to Docker or the Kaspa node: container status/logs stay in
 // Portainer, and pipeline freshness is derived purely from the database.
@@ -662,13 +663,16 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
 }
 
 // ---------------------------------------------------------------------------
-// /api/broadcasts  (recent KaChat broadcasts, optionally filtered by channel)
+// /api/broadcasts  (stored KaChat broadcasts, newest first, optionally filtered by channel)
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct BroadcastQuery {
     channel: Option<String>,
     limit: Option<i64>,
+    /// Zero-based offset for numbered-page navigation (page N = offset (N-1)*limit), as in
+    /// /api/moderation/recent.
+    offset: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -680,34 +684,45 @@ struct BroadcastItem {
     timestamp: i64,
 }
 
+/// A page of broadcasts plus the total matching the channel filter (every stored row without
+/// one), so the panel can page through a room's whole history. Every room is readable, the
+/// hidden KaPlay rooms and rooms no longer followed included, so anything stored can be deleted.
+#[derive(Serialize)]
+struct BroadcastPage {
+    total: i64,
+    items: Vec<BroadcastItem>,
+}
+
 async fn get_broadcasts(
     State(state): State<AppState>,
     Query(params): Query<BroadcastQuery>,
-) -> Result<Json<Vec<BroadcastItem>>, ApiError> {
+) -> Result<Json<BroadcastPage>, ApiError> {
     let limit = params.limit.unwrap_or(25).clamp(1, 200);
+    let offset = params.offset.unwrap_or(0).max(0);
     let channel = params
         .channel
         .map(|c| c.trim().to_lowercase())
         .filter(|c| !c.is_empty());
 
-    let sql_base = "SELECT encode(transaction_id,'hex') AS tx, channel, sender_address, \
-                    content, block_time FROM kachat_broadcasts";
-    let rows = if let Some(ch) = &channel {
-        sqlx::query(&format!(
-            "{sql_base} WHERE channel = $1 ORDER BY block_time DESC, id DESC LIMIT $2"
-        ))
-        .bind(ch)
-        .bind(limit)
-        .fetch_all(&state.pool)
-        .await
-    } else {
-        sqlx::query(&format!(
-            "{sql_base} ORDER BY block_time DESC, id DESC LIMIT $1"
-        ))
-        .bind(limit)
-        .fetch_all(&state.pool)
-        .await
-    }
+    // `$1 IS NULL` = every room.
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kachat_broadcasts WHERE $1::TEXT IS NULL OR channel = $1",
+    )
+    .bind(&channel)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+
+    let rows = sqlx::query(
+        "SELECT encode(transaction_id,'hex') AS tx, channel, sender_address, content, block_time \
+         FROM kachat_broadcasts WHERE $1::TEXT IS NULL OR channel = $1 \
+         ORDER BY block_time DESC, id DESC LIMIT $2 OFFSET $3",
+    )
+    .bind(&channel)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
     .map_err(ApiError::db)?;
 
     let items = rows
@@ -725,7 +740,7 @@ async fn get_broadcasts(
             }
         })
         .collect();
-    Ok(Json(items))
+    Ok(Json(BroadcastPage { total, items }))
 }
 
 // ---------------------------------------------------------------------------
