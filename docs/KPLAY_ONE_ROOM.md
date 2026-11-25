@@ -3,8 +3,9 @@
 **For:** the K iOS session (`KaspaSilver/K-iPhone`, which carries KaPlay now), and K Android if
 it plays chess. **From:** the indexer session, at the owner's request.
 
-**Status:** proposal. Nothing is changed in the apps or the indexer yet. The indexer side (§4)
-is small and lands when K is ready to send there.
+**Status:** approved by the owner (2026-11-25). **Indexer side (§4): done**, commit f922600
+(webserver). The indexer reads `#kplay-arcade` for every KaPlay kind now, so K can start sending
+there whenever it ships. The app side (§2) is for the K app sessions. §5 is still open.
 
 ## Why
 
@@ -69,7 +70,7 @@ The sender stays the player's chatting address, as now.
 - Duels or tournaments already running when a player updates can finish in either room, because
   of §2.3.
 
-## 4. What the indexer does (when K is ready)
+## 4. What the indexer does (done: f922600)
 
 - **Chess boards:**
   - `/chess/*` reads `chess_t` rows from `#chess-arena` and `#kplay-arcade`, merged in chain
@@ -78,6 +79,9 @@ The sender stays the player's chatting address, as now.
   - The arcade boards already read only `type: "arcade"`, so chess rows in the room do not
     disturb them.
   - Each engine skips the other kinds.
+  - The K stats' `chessMoves` count duel moves in both rooms.
+  - Checked on a copy of the live rooms: the boards match live, and stay the same after half the
+    duel and bot rows are moved into `#kplay-arcade`.
 - **Storage:**
   - `#kplay-arcade` is kept for good, so every duel move posted there is kept too. That is a few
     dozen rows a day today.
@@ -85,7 +89,7 @@ The sender stays the player's chatting address, as now.
     whatever the operator's room list says, and are never counted as public chats.
 - **Status:** a Status note goes at the top of this file with the commit.
 
-## 5. Open question for the owner
+## 5. Open question for the owner (not decided)
 
 Older KaPlay builds (the KaPlay-iPhone and KaPlay-Android apps being retired) will keep posting
 to `#chess-arena` and `#chess-bots`.

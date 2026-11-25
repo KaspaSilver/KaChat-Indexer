@@ -62,7 +62,7 @@ about 50, KaPlay iPhone about 35.
 | KaChat | `kchat:1:comm`, `kchat:1:dm` (tagged first contact, no handshake), `kchat:1:handshake` (old builds and Kasia only), `kchat:1:pay`, group `gcomm`/`gctl`, `kchat:1:self_stash` | `kasia-indexer` |
 | KaPost | KaPosts `kchat:1:post` and friends, Public Chats rooms `kchat:1:bcast:<channel>` | `kachat-transaction-processor` → Postgres |
 | KaPay | plain payments; `.kachat` covenant transactions; the account profile (`kchat:1:profile`) | names follower (`kachat-names-follower`) and its profiles follower; payments through `address_activity` pushes |
-| KaPlay | tournaments on `kchat:1:bcast:chess-arena`, one bot-game result per game on `kchat:1:bcast:chess-bots` (`CHESS_BOT_LEADERBOARD.md`) | `kachat-transaction-processor` |
+| KaPlay | tournaments on `kchat:1:bcast:chess-arena`, one bot-game result per game on `kchat:1:bcast:chess-bots` (`CHESS_BOT_LEADERBOARD.md`); all three kinds may also go to `kchat:1:bcast:kplay-arcade`, the one KaPlay room (`KPLAY_ONE_ROOM.md`) | `kachat-transaction-processor` |
 
 ## Rules of thumb for indexer work
 
