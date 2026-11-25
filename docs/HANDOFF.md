@@ -3,7 +3,9 @@
 Current state and next steps, so a fresh session (any device, from a clone) can continue
 without the chat history. Last updated 2026-10-02 after `a2438df` on `KaspaSilver/KaChat-Indexer`.
 
-> **Open from the K iOS app (2026-11-25):** `RECEIVED_PUSH_COINBASE.md` (a miner gets one
+> **Open from the K iOS app (2026-11-25):** `ROOM_MESSAGE_DELETES.md` (a room message's sender
+> deletes it for everyone: `{"type":"delete","targetTxId":...}` from the same sender removes the
+> message, its reactions and edits; no push for the delete). `RECEIVED_PUSH_COINBASE.md` (a miner gets one
 > `address_activity` push per merging block's coinbase for one block found: push coinbase on
 > acceptance only). Also `EXPLORER_STATS.md` (K Explorer: only the K Activity counts,
 > `/stats` and `/stats/activity?period=` with `categories`, `previous`, `series`. Trim before
