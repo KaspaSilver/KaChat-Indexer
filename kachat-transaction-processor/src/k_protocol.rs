@@ -70,15 +70,16 @@ pub fn set_broadcast_channels(list: Vec<String>) {
     }
 }
 
-/// The app's own hidden rooms, tracked whatever the room list says: KaPlay Arcade's score stamps
-/// (KPLAY_ARCADE_LEADERBOARD.md) are game records, not a chat room an operator lists. Never pruned.
-pub const APP_ROOMS: [&str; 1] = ["kplay-arcade"];
+/// KaPlay's rooms, tracked whatever the room list says and switched by `feature_kaplay`, not
+/// `feature_broadcasts`: arcade score stamps (KPLAY_ARCADE_LEADERBOARD.md) and chess games are
+/// game records, not chat rooms an operator lists.
+pub const KAPLAY_ROOMS: [&str; 3] = ["kplay-arcade", "chess-arena", "chess-bots"];
 
 /// Whether `channel` (already trimmed + lowercased by the caller) is in the effective tracked set.
 /// Not configured → the compile-time defaults; configured → exact membership (empty → nothing).
-/// `APP_ROOMS` are always in it.
+/// `KAPLAY_ROOMS` are always in it.
 pub fn channel_is_tracked(channel: &str) -> bool {
-    if APP_ROOMS.contains(&channel) {
+    if KAPLAY_ROOMS.contains(&channel) {
         return true;
     }
     match BROADCAST_CHANNELS_RUNTIME.read() {
@@ -98,6 +99,15 @@ pub fn channel_is_tracked(channel: &str) -> bool {
 pub static FEATURE_KAPOSTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 pub static FEATURE_BROADCASTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
+/// `feature_kaplay`: KaPlay's rooms (`KAPLAY_ROOMS`), apart from the public chats.
+pub static FEATURE_KAPLAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether new messages in `channel` are stored: KaPlay's rooms follow the KaPlay switch, every
+/// other room the public-chat one.
+fn room_switched_on(channel: &str) -> bool {
+    let switch = if KAPLAY_ROOMS.contains(&channel) { &FEATURE_KAPLAY } else { &FEATURE_BROADCASTS };
+    switch.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// KaPosts personal-mode block/mute denylist: lowercase-hex author pubkeys the operator has
 /// blocked or muted. Refreshed from `kachat_kaposts_denylist` by the flag task in main.rs.
@@ -1096,9 +1106,7 @@ impl KProtocolProcessor {
             .strip_prefix("kchat:1:bcast:")
             .or_else(|| payload_str.strip_prefix("ciph_msg:1:bcast:"))
         {
-            if !FEATURE_BROADCASTS.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(()); // broadcast indexing disabled in settings
-            }
+            // The public-chat and KaPlay switches are checked once the room is known.
             return self.process_broadcast(transaction, rest).await;
         }
 
@@ -1233,9 +1241,6 @@ impl KProtocolProcessor {
         else {
             return Ok(BcastOutcome::Done);
         };
-        if !FEATURE_BROADCASTS.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(BcastOutcome::Done);
-        }
         self.process_broadcast_mode(transaction, rest, BcastMode::Retry(block_hash)).await
     }
 
@@ -1262,6 +1267,9 @@ impl KProtocolProcessor {
         // Normalize + allowlist: only the tracked channels are indexed (runtime-configurable via
         // the admin dashboard; falls back to DEFAULT_BROADCAST_CHANNELS when not configured).
         let channel = channel_raw.trim().to_lowercase();
+        if !room_switched_on(&channel) {
+            return Ok(BcastOutcome::Done); // switched off in settings
+        }
         if !channel_is_tracked(&channel) {
             info!(
                 "Broadcast {} on non-tracked channel '{}', skipping",
@@ -3845,6 +3853,18 @@ mod broadcast_channel_tests {
 
         // Reset to not-configured so other tests / real runs are unaffected.
         set_broadcast_channels_reset_to_default_for_test();
+    }
+
+    #[test]
+    fn kaplay_and_public_chats_switch_apart() {
+        use std::sync::atomic::Ordering::Relaxed;
+        FEATURE_BROADCASTS.store(false, Relaxed);
+        assert!(room_switched_on("chess-arena") && room_switched_on("kplay-arcade"));
+        assert!(!room_switched_on("kaspa"));
+        FEATURE_BROADCASTS.store(true, Relaxed);
+        FEATURE_KAPLAY.store(false, Relaxed);
+        assert!(!room_switched_on("chess-bots") && room_switched_on("kaspa"));
+        FEATURE_KAPLAY.store(true, Relaxed);
     }
 
     // Helper: put the runtime set back to None (not configured). Only the test needs this — the

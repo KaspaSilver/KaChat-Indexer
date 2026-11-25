@@ -227,14 +227,14 @@ async fn main() -> Result<()> {
     });
 
     // Feature-flag refresher: honor the admin dashboard's indexing toggles. Reads the
-    // `feature_kaposts` / `feature_broadcasts` keys from k_vars every 15s and flips the runtime
-    // switches the processor consults per transaction. Absent key = default ON.
+    // `feature_kaposts` / `feature_broadcasts` / `feature_kaplay` keys from k_vars every 15s and
+    // flips the runtime switches the processor consults per transaction. Absent key = default ON.
     let flags_pool = database.pool().clone();
     let _flags_handle = tokio::spawn(async move {
         use sqlx::Row;
         loop {
             if let Ok(rows) = sqlx::query(
-                "SELECT key, value FROM k_vars WHERE key IN ('feature_kaposts', 'feature_broadcasts', 'kaposts_operator_addresses', 'broadcast_channels')",
+                "SELECT key, value FROM k_vars WHERE key IN ('feature_kaposts', 'feature_broadcasts', 'feature_kaplay', 'kaposts_operator_addresses', 'broadcast_channels')",
             )
             .fetch_all(&flags_pool)
             .await
@@ -244,6 +244,10 @@ async fn main() -> Result<()> {
                     let value: String = row.get("value");
                     match key.as_str() {
                         "feature_kaposts" => k_protocol::FEATURE_KAPOSTS.store(
+                            value.trim().to_lowercase() != "off",
+                            std::sync::atomic::Ordering::Relaxed,
+                        ),
+                        "feature_kaplay" => k_protocol::FEATURE_KAPLAY.store(
                             value.trim().to_lowercase() != "off",
                             std::sync::atomic::Ordering::Relaxed,
                         ),

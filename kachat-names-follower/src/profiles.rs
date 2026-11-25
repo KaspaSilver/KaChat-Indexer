@@ -23,31 +23,53 @@ use tracing::{error, info, warn};
 use crate::node::Node;
 use crate::{Args, Prefetched, Window, spk_address};
 
-/// How often the address blocklist is reread.
-const BLOCKLIST_REFRESH: Duration = Duration::from_secs(15);
+/// How often the operator's settings are reread.
+const SETTINGS_REFRESH: Duration = Duration::from_secs(15);
 
-/// The address blocklist (`kachat_address_blocklist`, kept by the admin API): no profile is
-/// stored for these addresses. Reread every `BLOCKLIST_REFRESH`; a missing table is an empty list.
-#[derive(Default)]
-struct Blocklist {
-    addresses: HashSet<String>,
+/// What the operator lets this follower store, reread every `SETTINGS_REFRESH`:
+/// `k_vars['feature_profiles']` (`off` stops saving new profiles; default on) and the address
+/// blocklist (`kachat_address_blocklist`, kept by the admin API; no profile is saved for these).
+/// A read that fails keeps what was read last.
+struct Settings {
+    profiles_on: bool,
+    blocked: HashSet<String>,
     read_at: Option<Instant>,
 }
 
-impl Blocklist {
+impl Default for Settings {
+    fn default() -> Self {
+        Self { profiles_on: true, blocked: HashSet::new(), read_at: None }
+    }
+}
+
+impl Settings {
     async fn refresh(&mut self, pool: &PgPool) {
-        if self.read_at.is_some_and(|at| at.elapsed() < BLOCKLIST_REFRESH) {
+        if self.read_at.is_some_and(|at| at.elapsed() < SETTINGS_REFRESH) {
             return;
         }
         self.read_at = Some(Instant::now());
+        match sqlx::query_scalar::<_, String>("SELECT value FROM k_vars WHERE key = 'feature_profiles'")
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(value) => {
+                let on = value.is_none_or(|v| v.trim().to_lowercase() != "off");
+                if on != self.profiles_on {
+                    info!("[profiles] saving new profiles is now {}", if on { "on" } else { "off" });
+                }
+                self.profiles_on = on;
+            }
+            Err(e) => warn!("[profiles] could not read feature_profiles ({e})"),
+        }
         match sqlx::query_scalar::<_, String>("SELECT address FROM kachat_address_blocklist").fetch_all(pool).await {
-            Ok(rows) => self.addresses = rows.into_iter().map(|a| a.trim().to_ascii_lowercase()).collect(),
+            Ok(rows) => self.blocked = rows.into_iter().map(|a| a.trim().to_ascii_lowercase()).collect(),
             Err(e) => warn!("[profiles] could not read the address blocklist ({e})"),
         }
     }
 
-    fn blocks(&self, address: &str) -> bool {
-        self.addresses.contains(&address.to_ascii_lowercase())
+    /// Whether a profile stamped to `address` is saved.
+    fn takes(&self, address: Option<&str>) -> bool {
+        self.profiles_on && address.is_some_and(|a| !self.blocked.contains(&a.to_ascii_lowercase()))
     }
 }
 
@@ -319,9 +341,9 @@ pub async fn run(args: &Args) -> Result<()> {
     let mut window = Window::default();
     let mut last_heartbeat = Instant::now() - Duration::from_secs(60);
     let mut pruned_streak = 0u32;
-    let mut blocklist = Blocklist::default();
+    let mut settings = Settings::default();
     loop {
-        blocklist.refresh(&pool).await;
+        settings.refresh(&pool).await;
         let from = follower.checkpoint.ok_or_else(|| anyhow!("lost the checkpoint"))?;
         let (batch, last_daa) = match node.next_batch(from, args.min_confirmations, window.0).await {
             Ok(b) => {
@@ -369,6 +391,13 @@ pub async fn run(args: &Args) -> Result<()> {
                 continue;
             }
         };
+        // Profiles switched off, or stamped to a blocked address: the follower never sees them,
+        // so nothing is saved, and the chain is still followed.
+        let mut batch = batch;
+        batch.accepted.retain(|t| {
+            !t.payload.starts_with(b"kchat:1:profile:")
+                || settings.takes(t.outputs.first().and_then(|o| spk_address(prefix, &o.script_public_key)).as_deref())
+        });
         let fetched_blocks = batch.tip.is_some();
         let has_profile_tx = batch.accepted.iter().any(|t| t.payload.starts_with(b"kchat:1:profile:"));
         let touches = !batch.removed_blocks.is_empty() || has_profile_tx;
@@ -394,10 +423,6 @@ pub async fn run(args: &Args) -> Result<()> {
             for t in batch.accepted.iter().filter(|t| applied_set.contains(&t.id)) {
                 let spk = &t.outputs[0].script_public_key;
                 let Some(address) = spk_address(prefix, spk) else { continue };
-                if blocklist.blocks(&address) {
-                    info!("[profiles] not saved: {address} is blocked (tx {})", hex::encode(t.id));
-                    continue;
-                }
                 sqlx::query(
                     r#"INSERT INTO profile_saves (tx_id, spk, address, block, daa, block_time, profile)
                        VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (tx_id) DO NOTHING"#,
@@ -422,9 +447,6 @@ pub async fn run(args: &Args) -> Result<()> {
                 match follower.registry.profiles.get(spk) {
                     Some((json, (daa, txid))) => {
                         let Some(address) = spk_address(prefix, spk) else { continue };
-                        if blocklist.blocks(&address) {
-                            continue;
-                        }
                         // updated_at = the record's own block time (also right after a reorg
                         // restores an older record); created_at only on the first insert.
                         sqlx::query(

@@ -1478,6 +1478,10 @@ struct SettingsResponse {
     network: String,
     feature_kaposts: bool,
     feature_broadcasts: bool,
+    /// KaPlay's rooms (chess, bots, arcade), apart from the public chats.
+    feature_kaplay: bool,
+    /// New profile saves (the profiles follower).
+    feature_profiles: bool,
     chat_indexer: bool,
     personal_addresses: String,
     personal_mode: bool,
@@ -1521,6 +1525,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         network: kv_get(&state.pool, "network").await.unwrap_or_else(|| "mainnet".to_string()),
         feature_kaposts: on(kv_get(&state.pool, "feature_kaposts").await),
         feature_broadcasts: on(kv_get(&state.pool, "feature_broadcasts").await),
+        feature_kaplay: on(kv_get(&state.pool, "feature_kaplay").await),
+        feature_profiles: on(kv_get(&state.pool, "feature_profiles").await),
         chat_indexer: chat_indexer_running(),
         personal_mode: !personal.is_empty(),
         personal_addresses: personal,
@@ -1540,6 +1546,8 @@ struct SettingsUpdate {
     instance_url: Option<String>,
     feature_kaposts: Option<bool>,
     feature_broadcasts: Option<bool>,
+    feature_kaplay: Option<bool>,
+    feature_profiles: Option<bool>,
     chat_indexer: Option<bool>,
     /// Newline/comma/space separated kaspa: addresses. Empty string turns personal mode off.
     personal_addresses: Option<String>,
@@ -1573,6 +1581,12 @@ async fn post_settings(
     }
     if let Some(b) = req.feature_broadcasts {
         kv_set(&state.pool, "feature_broadcasts", if b { "on" } else { "off" }).await.map_err(ApiError::db)?;
+    }
+    if let Some(b) = req.feature_kaplay {
+        kv_set(&state.pool, "feature_kaplay", if b { "on" } else { "off" }).await.map_err(ApiError::db)?;
+    }
+    if let Some(b) = req.feature_profiles {
+        kv_set(&state.pool, "feature_profiles", if b { "on" } else { "off" }).await.map_err(ApiError::db)?;
     }
     // Personal-mode allowlist files the chat indexer reads on startup. Writing either one means we
     // must restart the chat process so it reloads — but only ONCE, even if both are saved together.
