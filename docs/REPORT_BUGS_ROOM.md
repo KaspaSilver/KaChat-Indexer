@@ -6,6 +6,7 @@ and `retiredChannels`; not yet committed there).
 
 > **Status (2026-11-25): §2-§5 done in the indexer session** (not yet deployed).
 > - §2: `report-bugs` is in the three `DEFAULT_BROADCAST_CHANNELS`; `kachat-bugs` stays (§3).
+> - Update below: `kachat-bugs` stays for good. Nothing to change; it was never dropped.
 > - §4: room pushes need nothing new.
 > - §5: `/stats` already counts every room but KaPlay's as public chats.
 > - **§1 is the owner's:** the live server has a saved room list, so add `report-bugs` under
@@ -30,9 +31,7 @@ shows only what the phone catches live.
 2. **Defaults:** add `"report-bugs"` to the three copies of `DEFAULT_BROADCAST_CHANNELS`
    (`kachat-transaction-processor/src/k_protocol.rs`, `kachat-webserver/src/database_postgres_impl.rs`,
    `kachat-admin/src/main.rs`), so fresh installs track it.
-3. **Keep `kachat-bugs` tracked for now.** Android, desktop and older iPhone builds still post
-   there until they're updated. Drop it from the defaults once they've moved (the owner's call);
-   its stored history can then age out with the 30-day retention.
+3. **Keep `kachat-bugs` tracked.** (Was "for now"; the update below makes it for good.)
 4. **Push:** `report-bugs` in `watched_broadcast_channels` gets room pushes exactly as
    `kachat-bugs` did (`broadcast:report-bugs` thread, same payload). Nothing new in the format.
 5. **Stats:** if `/stats` names rooms anywhere, count `report-bugs` with the public chats.

@@ -12,7 +12,8 @@ without the chat history. Last updated 2026-10-02 after `a2438df` on `KaspaSilve
 > deploying: K gets fees from Kaspalytics, so `/network/fees`, the fee ingest changes, `last30d`,
 > `activeAddresses` and `feesSompi` aren't needed).
 > Also `REPORT_BUGS_ROOM.md` (track the new default room
-> `report-bugs`, which replaces `kachat-bugs` in K; add it to `broadcast_channels` in the panel now).
+> `report-bugs`, beside `kachat-bugs`, which stays tracked for good; add `report-bugs` to
+> `broadcast_channels` in the panel now).
 
 > **From the K iOS app (2026-11-24), done:** `KPLAY_ARCADE_LEADERBOARD.md` (the arcade boards),
 > `ROOM_MENTION_PUSHES.md` (push for @mentions in rooms) and `K_NOTIFICATION_SWITCHES.md`
