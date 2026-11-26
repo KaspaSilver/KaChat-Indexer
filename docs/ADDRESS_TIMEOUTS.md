@@ -1,12 +1,13 @@
 # Address timeouts
 
-A 24-hour block on one address. The owner asked for it on 2026-11-25.
+A 24-hour block on one address's public posts. The owner asked for it on 2026-11-25.
 
 **While the timeout runs:**
-- Nothing the address sends is stored, exactly as for an address on the
-  [blocklist](ADDRESS_BLOCKLIST.md): KaPosts, public chats, game stamps, profiles, and the chat
-  indexer's direct chats, handshakes, payments and group messages.
-- What it sends during the timeout is never stored, even after the timeout ends.
+- Nothing the address posts publicly is stored, as for an address on the
+  [blocklist](ADDRESS_BLOCKLIST.md): KaPosts, public chats, game stamps and profiles.
+- **Its private conversations are not limited** (owner's call): direct chats, handshakes,
+  payments and group messages are indexed as usual. The chat indexer never sees timeouts.
+- What it posts publicly during the timeout is never stored, even after the timeout ends.
 - Messages sent *to* the address are not affected.
 
 **When the timeout starts**, what the address posted publicly in the last 24 hours (by block
@@ -58,5 +59,4 @@ POST /api/timeouts/remove  { "address": "kaspa:q…" }
 - The list is the `kachat_address_timeouts` table.
 - The processor and the profiles follower read it together with the blocklist every 15 s, and
   only use rows whose `expires_at` is still in the future.
-- The chat indexer's `blocked_addresses.txt` lists running timeouts next to the blocklist. Admin
-  rewrites it on add, on remove, and when a timeout ends.
+- The chat indexer's `blocked_addresses.txt` holds the blocklist only, never timeouts.

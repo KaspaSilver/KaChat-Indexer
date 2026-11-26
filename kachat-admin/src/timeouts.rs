@@ -1,10 +1,10 @@
 //! /api/timeouts: addresses put in a 24-hour timeout (docs/ADDRESS_TIMEOUTS.md).
 //!
-//! While a timeout runs, nothing the address sends is stored, as if it were on the blocklist:
-//! the transaction processor and the profiles follower read `kachat_address_timeouts` with the
-//! blocklist, and the chat indexer's blocklist file lists the address until the timeout ends.
-//! Starting one also deletes what the address posted publicly in the last 24 hours. Removing
-//! one ends it early; what was deleted does not come back.
+//! While a timeout runs, nothing the address posts publicly is stored: the transaction processor
+//! and the profiles follower read `kachat_address_timeouts` with the blocklist. Its private chats
+//! are left alone (the chat indexer never sees timeouts). Starting one also deletes what the
+//! address posted publicly in the last 24 hours. Removing one ends it early; what was deleted
+//! does not come back.
 
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{info, warn};
 
-use crate::blocklist::{parse_address, write_file, xonly_key};
+use crate::blocklist::{parse_address, xonly_key};
 use crate::{ApiError, AppState, DeleteResult, is_testnet, now_ms};
 
 /// The transaction processor creates the same table (`ADDRESS_TIMEOUTS_TABLE`).
@@ -28,7 +28,7 @@ const TIMEOUT_MS: i64 = 24 * 60 * 60 * 1000;
 /// second pass this long after the first.
 const SECOND_PASS: Duration = Duration::from_secs(20);
 
-/// How often ended timeouts are cleared and the chat indexer's file rewritten without them.
+/// How often ended timeouts are cleared.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
 /// Longest note kept, in characters.
@@ -133,10 +133,6 @@ pub async fn post_timeout_add(
     .execute(&state.pool)
     .await
     .map_err(ApiError::db)?;
-    // The chat indexer stops storing from it too.
-    if let Err(e) = write_file(&state.pool, &state.blocklist_file).await {
-        return Err(ApiError::server(&format!("could not write {}: {e}", state.blocklist_file)));
-    }
 
     let since = started_at - TIMEOUT_MS;
     let xonly = xonly_key(&addr);
@@ -193,25 +189,17 @@ pub async fn post_timeout_remove(
         .await
         .map_err(ApiError::db)?
         .rows_affected();
-    if let Err(e) = write_file(&state.pool, &state.blocklist_file).await {
-        return Err(ApiError::server(&format!("could not write {}: {e}", state.blocklist_file)));
-    }
     if deleted > 0 {
         info!("kachat-admin ended the timeout of {address}");
     }
     Ok(Json(DeleteResult { deleted }))
 }
 
-/// Clear timeouts that have ended, and rewrite the chat indexer's file without them. The other
-/// processes stop honoring a timeout at `expires_at` on their own.
-pub async fn sweep(pool: &PgPool, blocklist_file: &str) {
+/// Clear timeouts that have ended. The processes stop honoring a timeout at `expires_at` on
+/// their own; this only keeps the table short.
+pub async fn sweep(pool: &PgPool) {
     match sqlx::query("DELETE FROM kachat_address_timeouts WHERE expires_at <= $1").bind(now_ms()).execute(pool).await {
-        Ok(done) if done.rows_affected() > 0 => {
-            info!("kachat-admin: {} timeout(s) ended", done.rows_affected());
-            if let Err(e) = write_file(pool, blocklist_file).await {
-                warn!("could not write the address blocklist file {blocklist_file}: {e}");
-            }
-        }
+        Ok(done) if done.rows_affected() > 0 => info!("kachat-admin: {} timeout(s) ended", done.rows_affected()),
         Ok(_) => {}
         Err(e) => warn!("timeouts: could not clear ended timeouts: {e}"),
     }

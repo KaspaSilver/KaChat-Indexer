@@ -47,20 +47,16 @@ pub(crate) fn xonly_key(addr: &kaspa_addresses::Address) -> Option<Vec<u8>> {
     }
 }
 
-/// Rewrite the chat indexer's copy of the list (one address per line), with the addresses in a
-/// running timeout (`timeouts`). Written to a temporary file and renamed, so the indexer never
-/// reads half a list.
+/// Rewrite the chat indexer's copy of the list (one address per line). Written to a temporary
+/// file and renamed, so the indexer never reads half a list. Timeouts are not in it: they leave
+/// private chats alone.
 pub async fn write_file(pool: &PgPool, path: &str) -> anyhow::Result<()> {
     // One writer at a time, so two changes can't interleave their temporary files.
     static WRITING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _writing = WRITING.lock().await;
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT address FROM kachat_address_blocklist UNION \
-         SELECT address FROM kachat_address_timeouts WHERE expires_at > $1 ORDER BY address",
-    )
-    .bind(now_ms())
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<String> = sqlx::query_scalar("SELECT address FROM kachat_address_blocklist ORDER BY address")
+        .fetch_all(pool)
+        .await?;
     let mut text = rows.join("\n");
     if !text.is_empty() {
         text.push('\n');

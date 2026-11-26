@@ -212,18 +212,18 @@ async fn main() -> anyhow::Result<()> {
 
     // The address blocklist (the processor creates it too), and the chat indexer's copy of it.
     let _ = sqlx::query(blocklist::CREATE_TABLE).execute(&pool).await;
-    // Address timeouts: blocked until they end, so the file lists them until then.
-    let _ = sqlx::query(timeouts::CREATE_TABLE).execute(&pool).await;
     if let Err(e) = blocklist::write_file(&pool, &args.blocklist_file).await {
         tracing::warn!("could not write the address blocklist file {}: {e}", args.blocklist_file);
     }
+    // Address timeouts (public posts only; the chat indexer never sees them), and the sweep that
+    // clears ended ones.
+    let _ = sqlx::query(timeouts::CREATE_TABLE).execute(&pool).await;
     {
         let pool = pool.clone();
-        let file = args.blocklist_file.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(timeouts::SWEEP_EVERY).await;
-                timeouts::sweep(&pool, &file).await;
+                timeouts::sweep(&pool).await;
             }
         });
     }
