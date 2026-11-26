@@ -38,3 +38,10 @@ shows only what the phone catches live.
 5. **Stats:** if `/stats` names rooms anywhere, count `report-bugs` with the public chats.
 
 Add a Status note here with the commit when done.
+
+## Update (2026-11-25, later)
+
+K no longer retires `kachat-bugs`: it doesn't move accounts off it or redirect its name any more.
+It shows as an ordinary room under More Rooms in Edit Default Public Chats, because
+`/broadcast-channels` still lists it. **Keep `kachat-bugs` in `broadcast_channels` for good**, next
+to `report-bugs`. Nothing else changes.
