@@ -128,7 +128,7 @@ fn blocked_address_xonly(address: &str) -> Option<String> {
 /// One refresh of what the admin dashboard controls: the `feature_kaposts` /
 /// `feature_broadcasts` / `feature_kaplay` / `feature_word_filter` keys from k_vars (absent key =
 /// default ON), the KaPosts operator addresses and tracked rooms, the personal-mode denylist, the
-/// address blocklist and the word filter's list.
+/// address blocklist with the running timeouts, and the word filter's list.
 /// Flips the runtime switches and lists the processor consults per transaction. A failed read
 /// keeps what was there.
 async fn refresh_flags(flags_pool: &database::DbPool) {
@@ -193,8 +193,8 @@ async fn refresh_flags(flags_pool: &database::DbPool) {
             .collect();
         k_protocol::set_kaposts_denylist(list);
     }
-    // Address blocklist: addresses nothing is stored from.
-    if let Ok(rows) = sqlx::query("SELECT address FROM kachat_address_blocklist")
+    // Address blocklist and timeouts: addresses nothing is stored from.
+    if let Ok(rows) = sqlx::query(database::BLOCKED_ADDRESSES_SQL)
         .fetch_all(flags_pool)
         .await
     {

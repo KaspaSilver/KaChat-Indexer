@@ -1,7 +1,8 @@
 # Address blocklist
 
 The panel's **Indexer > Manage > Block**. Nothing a blocked address sends is stored, and adding an
-address purges what is already stored from it.
+address purges what is already stored from it. For a 24-hour block, see
+[ADDRESS_TIMEOUTS.md](ADDRESS_TIMEOUTS.md).
 
 ## Admin API (kachat-admin, behind the panel's `/kachat/api` proxy)
 

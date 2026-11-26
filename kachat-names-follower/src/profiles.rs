@@ -28,7 +28,8 @@ const SETTINGS_REFRESH: Duration = Duration::from_secs(15);
 
 /// What the operator lets this follower store, reread every `SETTINGS_REFRESH`:
 /// `k_vars['feature_profiles']` (`off` stops saving new profiles; default on) and the address
-/// blocklist (`kachat_address_blocklist`, kept by the admin API; no profile is saved for these).
+/// blocklist (`kachat_address_blocklist`, kept by the admin API; no profile is saved for these),
+/// with the addresses in a timeout (`kachat_address_timeouts`) until it ends.
 /// A read that fails keeps what was read last.
 struct Settings {
     profiles_on: bool,
@@ -61,7 +62,15 @@ impl Settings {
             }
             Err(e) => warn!("[profiles] could not read feature_profiles ({e})"),
         }
-        match sqlx::query_scalar::<_, String>("SELECT address FROM kachat_address_blocklist").fetch_all(pool).await {
+        // The blocklist and the timeouts still running (docs/ADDRESS_TIMEOUTS.md). Both tables are
+        // created by the transaction processor and the admin; until then the read fails and is retried.
+        match sqlx::query_scalar::<_, String>(
+            "SELECT address FROM kachat_address_blocklist UNION SELECT address FROM kachat_address_timeouts \
+             WHERE expires_at > (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT",
+        )
+        .fetch_all(pool)
+        .await
+        {
             Ok(rows) => self.blocked = rows.into_iter().map(|a| a.trim().to_ascii_lowercase()).collect(),
             Err(e) => warn!("[profiles] could not read the address blocklist ({e})"),
         }

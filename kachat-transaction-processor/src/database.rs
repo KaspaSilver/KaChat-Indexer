@@ -8,6 +8,16 @@ pub type DbPool = PgPool;
 // Schema version management
 const SCHEMA_VERSION: i32 = 3;
 
+/// Address timeouts (docs/ADDRESS_TIMEOUTS.md). kachat-admin creates the same table.
+pub const ADDRESS_TIMEOUTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS kachat_address_timeouts (\
+     address TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '', started_at BIGINT NOT NULL, \
+     expires_at BIGINT NOT NULL, purged BIGINT NOT NULL DEFAULT 0)";
+
+/// Every address nothing is stored from right now: the blocklist and the timeouts not yet over.
+pub const BLOCKED_ADDRESSES_SQL: &str = "SELECT address FROM kachat_address_blocklist UNION \
+     SELECT address FROM kachat_address_timeouts \
+     WHERE expires_at > (extract(epoch FROM clock_timestamp()) * 1000)::BIGINT";
+
 /// kachat-transaction-processor Database Client
 /// Similar to KaspaDbClient in Simply Kaspa Indexer
 pub struct KDbClient {
@@ -176,6 +186,7 @@ impl KDbClient {
         // Step 1c: idempotently ensure the KaPosts personal-mode block/mute denylist exists.
         self.create_denylist_schema().await?;
         self.create_address_blocklist_schema().await?;
+        self.create_address_timeouts_schema().await?;
         self.create_word_filter_schema().await?;
 
         // Step 1c': safe nickname decode + one-off cleanup of undecodable nicknames (IDX-005).
@@ -737,6 +748,13 @@ impl KDbClient {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Address timeouts (docs/ADDRESS_TIMEOUTS.md): addresses nothing is stored from until
+    /// `expires_at` (ms). Read with the blocklist; the admin API adds them and deletes expired rows.
+    async fn create_address_timeouts_schema(&self) -> Result<()> {
+        sqlx::query(ADDRESS_TIMEOUTS_TABLE).execute(&self.pool).await?;
         Ok(())
     }
 

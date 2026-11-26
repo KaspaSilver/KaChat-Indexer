@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 
 mod blocklist;
+mod timeouts;
 /// The processor's matcher, shared so a purge finds exactly what the processor would drop.
 #[path = "../../kachat-transaction-processor/src/word_filter.rs"]
 #[allow(dead_code)] // `blocks` is the processor's
@@ -211,8 +212,20 @@ async fn main() -> anyhow::Result<()> {
 
     // The address blocklist (the processor creates it too), and the chat indexer's copy of it.
     let _ = sqlx::query(blocklist::CREATE_TABLE).execute(&pool).await;
+    // Address timeouts: blocked until they end, so the file lists them until then.
+    let _ = sqlx::query(timeouts::CREATE_TABLE).execute(&pool).await;
     if let Err(e) = blocklist::write_file(&pool, &args.blocklist_file).await {
         tracing::warn!("could not write the address blocklist file {}: {e}", args.blocklist_file);
+    }
+    {
+        let pool = pool.clone();
+        let file = args.blocklist_file.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(timeouts::SWEEP_EVERY).await;
+                timeouts::sweep(&pool, &file).await;
+            }
+        });
     }
 
     let admin_token: Option<std::sync::Arc<str>> = args
@@ -269,6 +282,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/blocklist", get(blocklist::get_blocklist))
         .route("/api/blocklist/add", post(blocklist::post_blocklist_add))
         .route("/api/blocklist/remove", post(blocklist::post_blocklist_remove))
+        .route("/api/timeouts", get(timeouts::get_timeouts))
+        .route("/api/timeouts/add", post(timeouts::post_timeout_add))
+        .route("/api/timeouts/remove", post(timeouts::post_timeout_remove))
         .route("/api/word-filter", get(words::get_word_filter))
         .route("/api/word-filter/add", post(words::post_word_filter_add))
         .route("/api/word-filter/remove", post(words::post_word_filter_remove))
