@@ -44,3 +44,16 @@ K no longer retires `kachat-bugs`: it doesn't move accounts off it or redirect i
 It shows as an ordinary room under More Rooms in Edit Default Public Chats, because
 `/broadcast-channels` still lists it. **Keep `kachat-bugs` in `broadcast_channels` for good**, next
 to `report-bugs`. Nothing else changes.
+
+## Update (2026-11-26): kachat-bugs out of the defaults
+
+The owner, relayed by the Kaspa Quick Start session: "Don't have the indexer come with
+kachat-bugs anymore." This replaces "keep it for good" above.
+
+> **Status (2026-11-26): done.** `kachat-bugs` is out of the three `DEFAULT_BROADCAST_CHANNELS`
+> (processor, webserver, admin); `report-bugs` and every other room stay.
+> - Fresh installs, and any server with no saved `broadcast_channels`, don't track it, don't list
+>   it in `/broadcast-channels` (K's More Rooms), and the panel no longer suggests it.
+> - A server with a saved list keeps what is on it. The live one still lists `kachat-bugs`, so
+>   it is still tracked and shown there until the owner removes it from the panel's list.
+> - Its stored messages are not deleted: once untracked, they age out with the 30-day retention.

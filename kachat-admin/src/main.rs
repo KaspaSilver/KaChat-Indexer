@@ -1516,10 +1516,9 @@ fn chat_indexer_running() -> bool {
 /// `kachat-transaction-processor/src/k_protocol.rs` (separate crate, so duplicated here). Exposed to
 /// the dashboard/panel as `available_broadcast_channels` so the UI shows suggestions without
 /// hardcoding them.
-const DEFAULT_BROADCAST_CHANNELS: [&str; 18] = [
+const DEFAULT_BROADCAST_CHANNELS: [&str; 17] = [
     "kaspa",
     "report-bugs",
-    "kachat-bugs",
     "kaspa-indonesia",
     "kaspa-czech",
     "kaspa-german",
